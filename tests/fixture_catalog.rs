@@ -7,6 +7,77 @@ pub const ORIGINAL_JPEG_ID: &str = "20000000-0000-4000-8000-000000000001";
 pub const GENERATED_JPEG_ID: &str = "20000000-0000-4000-8000-000000000002";
 pub const VIDEO_ID: &str = "20000000-0000-4000-8000-000000000003";
 
+const ALBUM_ART_CASES: [(&str, &str, &str); 2] = [
+    (
+        "album:10000000-0000-4000-8000-000000000201",
+        "20000000-0000-4000-8000-000000000201",
+        "A - Art URI Only",
+    ),
+    (
+        "album:10000000-0000-4000-8000-000000000202",
+        "20000000-0000-4000-8000-000000000202",
+        "B - Art URI Plus Resource",
+    ),
+];
+
+pub fn album_art_objects(address: SocketAddrV4) -> Vec<Object> {
+    let baseline = objects(address);
+    let mut objects = vec![baseline[0].clone()];
+    objects[0].title = "DLNA Album Art A-B".into();
+    objects[0].child_count = Some(2);
+
+    for (index, (album_id, alias, title)) in ALBUM_ART_CASES.into_iter().enumerate() {
+        let cover = format!("http://{address}/media/assets/{alias}/preview");
+        let mut album = baseline[1].clone();
+        album.id = album_id.into();
+        album.title = title.into();
+        album.art = Some(cover.clone());
+
+        if index == 1 {
+            album.resources.push(Resource {
+                uri: cover,
+                mime: "image/jpeg".into(),
+                duration: None,
+                byte_seek: false,
+            });
+        }
+
+        objects.push(album);
+
+        for mut child in baseline[2..].iter().cloned() {
+            child.id = child
+                .id
+                .replace(ALBUM_ID, album_id)
+                .replace(GENERATED_JPEG_ID, alias);
+
+            child.parent_id = album_id.into();
+            child.art = child.art.map(|uri| uri.replace(GENERATED_JPEG_ID, alias));
+
+            for resource in &mut child.resources {
+                resource.uri = resource.uri.replace(GENERATED_JPEG_ID, alias);
+            }
+
+            objects.push(child);
+        }
+    }
+
+    objects
+}
+
+pub fn album_art_media_file(
+    asset: &str,
+    endpoint: &str,
+    query: Option<&str>,
+) -> Option<(&'static str, &'static str)> {
+    let asset = if ALBUM_ART_CASES.iter().any(|(_, alias, _)| *alias == asset) {
+        GENERATED_JPEG_ID
+    } else {
+        asset
+    };
+
+    media_file(asset, endpoint, query)
+}
+
 pub const JPEG_LABEL_FILES: [&str; 2] = ["image-1.jpg", "image-2.jpg"];
 const JPEG_LABEL_CASES: [(&str, &str, &str, &str); 4] = [
     (
@@ -206,6 +277,230 @@ pub fn media_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn album_art_cases_preserve_baseline_with_only_the_controlled_differences() {
+        let address = "192.0.2.10:8500".parse().unwrap();
+        let baseline = objects(address);
+        let catalog = album_art_objects(address);
+        assert_eq!(catalog.len(), 11);
+        let mut root = baseline[0].clone();
+        root.title = "DLNA Album Art A-B".into();
+        root.child_count = Some(2);
+        assert_eq!(catalog[0], root);
+        let ids: std::collections::HashSet<_> = catalog.iter().map(|object| &object.id).collect();
+        assert_eq!(ids.len(), catalog.len());
+        assert_ne!(catalog[1].art, catalog[6].art);
+
+        for (case, (album_id, alias, title, resource_count)) in catalog[1..].chunks_exact(5).zip([
+            (
+                "album:10000000-0000-4000-8000-000000000201",
+                "20000000-0000-4000-8000-000000000201",
+                "A - Art URI Only",
+                0,
+            ),
+            (
+                "album:10000000-0000-4000-8000-000000000202",
+                "20000000-0000-4000-8000-000000000202",
+                "B - Art URI Plus Resource",
+                1,
+            ),
+        ]) {
+            let cover = format!("http://{address}/media/assets/{alias}/preview");
+            let mut album = baseline[1].clone();
+            album.id = album_id.into();
+            album.title = title.into();
+            album.art = Some(cover.clone());
+
+            if resource_count == 1 {
+                album.resources.push(Resource {
+                    uri: cover.clone(),
+                    mime: "image/jpeg".into(),
+                    duration: None,
+                    byte_seek: false,
+                });
+            }
+
+            assert_eq!(case[0], album);
+
+            assert_eq!(
+                catalog
+                    .iter()
+                    .filter(|item| item.parent_id == album_id)
+                    .count(),
+                4
+            );
+
+            assert_eq!(case[2].id, format!("{album_id}:asset:{alias}"));
+            assert_eq!(case[2].art.as_deref(), Some(cover.as_str()));
+            assert_eq!(case[2].resources[1].uri, cover);
+            assert_ne!(case[1].art, case[0].art);
+
+            assert!(
+                case[1]
+                    .resources
+                    .iter()
+                    .all(|resource| resource.uri != cover)
+            );
+
+            for (index, (item, original)) in case[1..].iter().zip(&baseline[2..]).enumerate() {
+                let asset = if index == 1 {
+                    alias
+                } else {
+                    original.id.rsplit(':').next().unwrap()
+                };
+
+                assert_eq!(item.id, format!("{album_id}:asset:{asset}"));
+                assert_eq!(item.parent_id, album_id);
+                let mut normalized = item.clone();
+                normalized.id.clone_from(&original.id);
+                normalized.parent_id.clone_from(&original.parent_id);
+
+                if index == 1 {
+                    assert_eq!(
+                        item.resources[0].uri,
+                        format!("http://{address}/media/assets/{alias}/display")
+                    );
+
+                    normalized.art = normalized
+                        .art
+                        .map(|uri| uri.replace(alias, GENERATED_JPEG_ID));
+
+                    for resource in &mut normalized.resources {
+                        resource.uri = resource.uri.replace(alias, GENERATED_JPEG_ID);
+                    }
+                }
+
+                assert_eq!(&normalized, original);
+            }
+        }
+    }
+
+    #[test]
+    fn album_art_aliases_map_to_existing_generated_files_with_strict_queries() {
+        for alias in [
+            "20000000-0000-4000-8000-000000000201",
+            "20000000-0000-4000-8000-000000000202",
+        ] {
+            for (query, file) in [
+                ("size=fullsize&edited=true", "generated-display.jpg"),
+                ("edited=true&size=fullsize", "generated-display.jpg"),
+                ("size=preview&edited=true", "generated-preview.jpg"),
+                ("edited=true&size=preview", "generated-preview.jpg"),
+            ] {
+                assert_eq!(
+                    album_art_media_file(alias, "thumbnail", Some(query)),
+                    Some((file, "image/jpeg"))
+                );
+
+                assert_eq!(media_file(alias, "thumbnail", Some(query)), None);
+            }
+        }
+
+        for asset in [
+            ORIGINAL_JPEG_ID,
+            GENERATED_JPEG_ID,
+            VIDEO_ID,
+            "20000000-0000-4000-8000-000000000201",
+            "20000000-0000-4000-8000-000000000202",
+            "20000000-0000-4000-8000-000000000203",
+            "20000000-0000-4000-8000-000000000008",
+            "../generated-preview.jpg",
+        ] {
+            let mapped = match asset {
+                "20000000-0000-4000-8000-000000000201" | "20000000-0000-4000-8000-000000000202" => {
+                    GENERATED_JPEG_ID
+                }
+
+                _ => asset,
+            };
+
+            for endpoint in [
+                "original",
+                "thumbnail",
+                "video/playback",
+                "display",
+                "preview",
+                "playback",
+                "../original",
+            ] {
+                for query in [
+                    None,
+                    Some(""),
+                    Some("size=fullsize&edited=true"),
+                    Some("size=preview&edited=true"),
+                    Some("edited=true"),
+                    Some("size=preview"),
+                    Some("size=fullsize&edited=false"),
+                    Some("size=preview&edited=false"),
+                    Some("size=preview&edited=true&edited=false"),
+                    Some("size=preview&edited=true&extra=1"),
+                    Some("size=preview&edited=true&edited=true"),
+                ] {
+                    assert_eq!(
+                        album_art_media_file(asset, endpoint, query),
+                        media_file(mapped, endpoint, query),
+                        "{asset}/{endpoint}?{query:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn album_art_didl_resource_is_generic_and_obeys_filters() {
+        let catalog = album_art_objects("192.0.2.10:8500".parse().unwrap());
+        assert_eq!(catalog.len(), 11);
+
+        for (filter, art_count, resource_count) in [
+            ("*", 1, 1),
+            ("", 0, 0),
+            ("upnp:albumArtURI", 1, 0),
+            ("res", 0, 1),
+            ("res@duration,res@size,res@resolution", 0, 1),
+        ] {
+            for (album, has_resource) in [(&catalog[1], false), (&catalog[6], true)] {
+                let xml = immich_dlna_proxy::protocol::didl(
+                    std::slice::from_ref(album),
+                    &immich_dlna_proxy::protocol::Filter::parse(filter).unwrap(),
+                )
+                .unwrap();
+
+                assert_eq!(xml.matches("<container ").count(), 1);
+                assert!(xml.contains("<upnp:class>object.container.album</upnp:class>"));
+                assert_eq!(xml.matches("<upnp:albumArtURI>").count(), art_count);
+
+                assert_eq!(
+                    xml.matches("<res ").count(),
+                    if has_resource { resource_count } else { 0 }
+                );
+
+                if art_count == 1 {
+                    assert!(xml.contains(&format!(
+                        "<upnp:albumArtURI>{}</upnp:albumArtURI>",
+                        album.art.as_deref().unwrap()
+                    )));
+                }
+
+                if has_resource && resource_count == 1 {
+                    assert!(xml.contains(&format!(
+                        "<res protocolInfo=\"http-get:*:image/jpeg:*\">{}</res>",
+                        album.art.as_deref().unwrap()
+                    )));
+                }
+
+                for absent in [
+                    "DLNA.ORG_",
+                    "duration=",
+                    "size=",
+                    "resolution=",
+                    "childCount=",
+                ] {
+                    assert!(!xml.contains(absent), "{filter}: {xml}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn jpeg_label_pairs_share_bytes_without_artwork_or_alternative_resources() {

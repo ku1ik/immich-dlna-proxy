@@ -48,6 +48,7 @@ use uuid::Uuid;
 const SERVER_UUID: Uuid = Uuid::from_u128(0x30000000_0000_4000_8000_000000000001);
 const SEEK_UUID: Uuid = Uuid::from_u128(0x30000000_0000_4000_8000_000000000003);
 const JPEG_LABEL_UUID: Uuid = Uuid::from_u128(0x30000000_0000_4000_8000_000000000005);
+const ALBUM_ART_UUID: Uuid = Uuid::from_u128(0x30000000_0000_4000_8000_000000000006);
 const API_KEY: &str = "synthetic-fixture-only";
 const FILES: [&str; 6] = [
     "original.jpg",
@@ -71,6 +72,9 @@ pub struct Arguments {
     /// Compare identical JPEG bytes labeled PNG versus JPEG in DIDL and HTTP.
     #[arg(long, conflicts_with = "seek_test")]
     pub jpeg_label_test: bool,
+    /// Compare album artwork alone versus artwork plus a generic JPEG resource.
+    #[arg(long, conflicts_with_all = ["seek_test", "jpeg_label_test"])]
+    pub album_art_test: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,6 +82,7 @@ enum FixtureMode {
     Baseline,
     Seek,
     JpegLabels,
+    AlbumArt,
 }
 
 fn listen_address(value: &str) -> anyhow::Result<SocketAddrV4> {
@@ -97,11 +102,16 @@ pub async fn run(arguments: Arguments) -> anyhow::Result<()> {
     let interface = resolve_interface(*arguments.listen.ip())?;
     let shutdown = lifecycle::shutdown_signal()?;
 
-    let mode = match (arguments.seek_test, arguments.jpeg_label_test) {
-        (false, false) => FixtureMode::Baseline,
-        (true, false) => FixtureMode::Seek,
-        (false, true) => FixtureMode::JpegLabels,
-        (true, true) => anyhow::bail!("select only one fixture experiment"),
+    let mode = match (
+        arguments.seek_test,
+        arguments.jpeg_label_test,
+        arguments.album_art_test,
+    ) {
+        (false, false, false) => FixtureMode::Baseline,
+        (true, false, false) => FixtureMode::Seek,
+        (false, true, false) => FixtureMode::JpegLabels,
+        (false, false, true) => FixtureMode::AlbumArt,
+        _ => anyhow::bail!("select only one fixture experiment"),
     };
 
     let bound = Bound::bind(arguments.listen, arguments.fixtures, mode).await?;
@@ -206,6 +216,7 @@ impl Catalog for FixtureCatalog {
             object = %id,
             metadata = args["BrowseFlag"] == "BrowseMetadata",
             resources_selected = filter.res(),
+            artwork_selected = filter.art(),
             duration_selected = filter.duration(),
             "fixture Browse selection"
         );
@@ -365,6 +376,8 @@ async fn upstream_request(
 
     let mapping = if mode == FixtureMode::JpegLabels {
         fixture_catalog::jpeg_label_media_file(asset, endpoint, parts.uri.query())
+    } else if mode == FixtureMode::AlbumArt {
+        fixture_catalog::album_art_media_file(asset, endpoint, parts.uri.query())
     } else {
         fixture_catalog::media_file(asset, endpoint, parts.uri.query())
     };
@@ -536,6 +549,13 @@ impl Bound {
                 "DLNA JPEG Label Test",
                 JPEG_LABEL_UUID,
                 fixture_catalog::jpeg_label_objects(address),
+                None,
+            )
+        } else if mode == FixtureMode::AlbumArt {
+            (
+                "DLNA Album Art A-B",
+                ALBUM_ART_UUID,
+                fixture_catalog::album_art_objects(address),
                 None,
             )
         } else {
@@ -945,6 +965,128 @@ mod tests {
         (0..150_000 + index)
             .map(|offset| ((offset + index * 37) % 251) as u8)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn album_art_experiment_serves_identical_covers_before_entering_albums() {
+        let harness = Harness::start_mode(FixtureMode::AlbumArt).await;
+        let objects = fixture_catalog::album_art_objects(harness.address);
+        let albums = [objects[1].clone(), objects[6].clone()];
+
+        let description = harness
+            .client
+            .get(harness.url("/device.xml"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert!(description.contains("DLNA Album Art A-B"));
+        assert!(description.contains(&ALBUM_ART_UUID.to_string()));
+        assert_ne!(ALBUM_ART_UUID, SERVER_UUID);
+        assert_ne!(ALBUM_ART_UUID, SEEK_UUID);
+        assert_ne!(ALBUM_ART_UUID, JPEG_LABEL_UUID);
+
+        for filter in [
+            "",
+            "upnp:albumArtURI",
+            "res",
+            "*",
+            "res@resolution,res@nrAudioChannels,res@sampleFrequency,res@bitrate,dc:creator,res@dlna:cleartextSize,dc:date,upnp:genre,res,res@duration,res@size,upnp:albumArtURI,upnp:originalTrackNumber,upnp:album,upnp:artist,upnp:author",
+        ] {
+            assert_browse(
+                harness
+                    .browse("0", "BrowseDirectChildren", filter, 0, 100, "")
+                    .await,
+                &albums,
+                2,
+                filter,
+            );
+        }
+
+        // Neither cover request depends on first browsing the album's children.
+        for album in &albums {
+            let uri = album.art.as_ref().unwrap();
+            let response = harness.client.get(uri).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+            assert!(!response.headers().contains_key("contentfeatures.dlna.org"));
+            assert_eq!(response.bytes().await.unwrap().as_ref(), bytes(3));
+
+            let response = harness.client.head(uri).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], "150003");
+            assert!(response.bytes().await.unwrap().is_empty());
+
+            let response = harness
+                .client
+                .get(uri)
+                .header(header::RANGE, "bytes=17-48")
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(
+                response.headers()[header::CONTENT_RANGE],
+                "bytes 17-48/150003"
+            );
+            assert_eq!(response.bytes().await.unwrap().as_ref(), &bytes(3)[17..49]);
+        }
+
+        for group in objects[1..].chunks_exact(5) {
+            assert_browse(
+                harness
+                    .browse(&group[0].id, "BrowseMetadata", "*", 0, 0, "")
+                    .await,
+                &group[..1],
+                1,
+                "*",
+            );
+
+            assert_browse(
+                harness
+                    .browse(&group[0].id, "BrowseDirectChildren", "*", 0, 0, "")
+                    .await,
+                &group[1..],
+                4,
+                "*",
+            );
+
+            let response = harness
+                .client
+                .get(&group[2].resources[0].uri)
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.bytes().await.unwrap().as_ref(), bytes(2));
+        }
+
+        harness.finish().await;
+    }
+
+    #[test]
+    fn album_art_experiment_excludes_other_modes() {
+        let args = [
+            "fixture-server",
+            "--listen",
+            "192.0.2.10:8400",
+            "--fixtures",
+            "/tmp/images",
+            "--album-art-test",
+        ];
+
+        let parsed = Arguments::try_parse_from(args).unwrap();
+        assert!(parsed.album_art_test && !parsed.seek_test && !parsed.jpeg_label_test);
+
+        for flag in ["--seek-test", "--jpeg-label-test"] {
+            assert!(Arguments::try_parse_from(args.into_iter().chain([flag])).is_err());
+        }
     }
 
     #[tokio::test]

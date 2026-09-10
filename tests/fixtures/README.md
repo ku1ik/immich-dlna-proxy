@@ -241,8 +241,44 @@ has cached the earlier three-item album.
 The example enables debug diagnostics. Media logs distinguish incoming Range
 headers from forwarded ranges and report whether DLNA capability or time-seek
 headers were present, without dumping their arbitrary values. Browse logs report
-whether the requested Filter selects resources and duration. These observations
+whether the requested Filter selects resources, artwork, and duration. These observations
 do not add seek capabilities or change the response metadata.
+
+## Album-Art Signaling Comparison
+
+```sh
+nix develop --command cargo run --example fixture-server -- \
+  --listen 192.168.1.10:8400 --fixtures /tmp/immich-dlna-fixtures --album-art-test
+```
+
+This mode is mutually exclusive with the other experiments. It reuses the six
+baseline files and advertises **DLNA Album Art A-B**, device UUID ending in `0006`.
+Its two generic mixed-media albums contain the same four baseline items:
+
+| Album | Artwork Signaling |
+| --- | --- |
+| A - Art URI Only | Plain `upnp:albumArtURI` |
+| B - Art URI Plus Resource | The same property plus a cover `<res protocolInfo="http-get:*:image/jpeg:*">` |
+
+Album UUIDs end in `0201`/`0202`. Cover asset aliases also end in `0201`/`0202`;
+both serve the identical `generated-preview.jpg`. Within each album its cover
+URL equals the second image's preview; between albums the URLs differ to avoid
+cross-populating their cover caches. The expected cover reads **GENERATED PREVIEW**.
+Only B adds the album resource. Neither cover claims a DLNA profile, dimensions,
+duration, or size. This is an interoperability experiment, not production policy.
+
+On first opening the device, wait on the album list before entering either album.
+Record whether each cover appears and whether either cover URL is requested.
+Then enter A, return, and record both tiles; repeat for B. Confirm both albums
+still open normally, contain four items, and allow image viewing/video playback.
+Distinguish early cover fetching from displaying an already-cached image. Repeated
+runs with these fixed IDs are warm-cache observations, not fresh comparisons.
+
+On LG OLED77C45LA.DEUQLJP, webOS25/platform10.3.1/firmware33.31.68, neither
+album displayed a cover before entry. Each cover was requested only after entering
+its album and appeared on return. Both remained folders with four items, and
+sampled photo/video playback worked. The added album resource did not improve
+initial cover loading in this comparison; it is not a production workaround.
 
 ## Byte-Seek Signaling Matrix
 
