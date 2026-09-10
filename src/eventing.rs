@@ -277,7 +277,25 @@ impl Subscriptions {
             }
         };
 
-        (response.body(Body::empty()).unwrap(), token)
+        let response = response.body(Body::empty()).unwrap();
+
+        let method = match method.as_str() {
+            "SUBSCRIBE" => "SUBSCRIBE",
+            "UNSUBSCRIBE" => "UNSUBSCRIBE",
+            _ => "unsupported",
+        };
+
+        tracing::debug!(
+            %peer, ?service, method,
+            sid_supplied = headers.contains_key("sid"),
+            status = response.status().as_u16(),
+            sid = ?response.headers().get("sid"),
+            lease = ?response.headers().get("timeout"),
+            initial_response_pending = token.is_some(),
+            "subscription response"
+        );
+
+        (response, token)
     }
 
     /// Call exactly after the full response and TCP FIN complete, not body exhaustion.
