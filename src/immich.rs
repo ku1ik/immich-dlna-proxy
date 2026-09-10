@@ -61,6 +61,7 @@ pub struct Album {
     pub id: Uuid,
     pub object: Object,
     pub created_at: Option<DateTime<Utc>>,
+    pub end_date: Option<DateTime<Utc>>,
     #[serde(skip)]
     pub digest: String,
 }
@@ -191,6 +192,8 @@ struct AlbumDto {
     album_name: String,
     #[serde(default, deserialize_with = "optional_date")]
     created_at: Option<String>,
+    #[serde(default, deserialize_with = "optional_date")]
+    end_date: Option<String>,
     album_thumbnail_asset_id: Option<Uuid>,
 }
 
@@ -424,6 +427,7 @@ impl Immich {
                     resources: Vec::new(),
                 },
                 created_at,
+                end_date: parse_date(dto.end_date.as_deref(), &mut bad_dates),
                 digest: String::new(),
             };
 

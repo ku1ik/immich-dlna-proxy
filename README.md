@@ -59,8 +59,12 @@ and `/api/` appended when absent. Userinfo, queries, and fragments are forbidden
 on exactly one up, multicast-capable interface. It determines listening, SSDP, and
 advertised URLs, never HTTP `Host`; no wildcard, IPv6 discovery, or interface fallback.
 
-`sort_locale` is required; `pl` selects case-insensitive Polish ICU collation without
-installed OS locales. Albums default to title order, members to capture instant ascending.
+Albums default to latest asset date descending, using Immich's album `endDate`
+(photos and videos), with missing/invalid dates last. Ties use case-insensitive
+album-title order, then UUID. `sort_locale` is required; `pl` selects Polish ICU
+collation without installed OS locales. Members remain in capture-instant ascending
+order. Explicit `+dc:date` / `-dc:date` sorting uses advertised dates; album dates
+remain creation dates, independently of the default album ordering.
 Photo dates use Immich's local capture date, without TV/server timezone conversion.
 Defaults: `friendly_name = "Immich"` (1-128 XML-safe UTF-8 bytes), `log_level = "info"`
 (allowed: `error`, `warn`, `info`, `debug`, `trace`).

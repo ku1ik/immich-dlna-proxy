@@ -69,7 +69,7 @@ in
     sortLocale = lib.mkOption {
       type = lib.types.nonEmptyStr;
       example = "pl";
-      description = "Explicit ICU4X locale for case-insensitive album-title ordering; never inferred from the host.";
+      description = "Explicit ICU4X locale for case-insensitive album-title ties in latest-asset-date ordering; never inferred from the host.";
     };
 
     serverUuid = lib.mkOption {

@@ -738,11 +738,15 @@ impl Catalog for Library {
                 let mut rows: Vec<_> = root.albums.values().collect();
 
                 rows.sort_unstable_by(|a, b| match sort {
-                    None => self
-                        .inner
-                        .config
-                        .collator
-                        .compare(&a.object.title, &b.object.title)
+                    None => b
+                        .end_date
+                        .cmp(&a.end_date)
+                        .then_with(|| {
+                            self.inner
+                                .config
+                                .collator
+                                .compare(&a.object.title, &b.object.title)
+                        })
                         .then_with(|| a.id.cmp(&b.id)),
 
                     Some(descending) => immich::compare_dates(
@@ -1891,6 +1895,165 @@ mod tests {
         }
 
         assert!(fixture.fake.upstream.lock().unwrap().requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn albums_default_to_latest_date_with_title_ties_and_missing_dates_last() {
+        let fixture = Fixture::new(9).await;
+
+        {
+            let mut upstream = fixture.fake.upstream.lock().unwrap();
+
+            upstream.albums = vec![
+                album(1, "Z"),
+                album(2, "A"),
+                album(3, "C"),
+                album(4, "c"),
+                album(5, "\u{106}"),
+                album(6, "A missing"),
+                album(7, "B invalid"),
+                album(8, "C null"),
+                album(9, "D nonstring"),
+            ];
+
+            for album in &mut upstream.albums[..5] {
+                album["endDate"] = json!("2025-01-01T00:00:00.000Z");
+            }
+
+            upstream.albums[0]["createdAt"] = json!("2020-01-01T00:00:00Z");
+            upstream.albums[1]["createdAt"] = json!("2030-01-01T00:00:00Z");
+            upstream.albums[1]["endDate"] = json!("2024-12-31T00:00:00.000Z");
+            upstream.albums[6]["endDate"] = json!("2025-99-01T00:00:00Z");
+            upstream.albums[7]["endDate"] = Value::Null;
+            upstream.albums[8]["endDate"] = json!(123);
+            upstream.albums.reverse();
+        }
+
+        let task = fixture.run();
+
+        for (sort, expected) in [
+            ("", [3, 4, 5, 1, 2, 6, 7, 8, 9]),
+            ("+dc:date", [1, 3, 4, 5, 6, 7, 8, 9, 2]),
+            ("-dc:date", [2, 3, 4, 5, 6, 7, 8, 9, 1]),
+        ] {
+            let full = fixture
+                .library
+                .browse(action("0", false, 0, 0, sort))
+                .await
+                .unwrap();
+
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|id| format!("album:{}", Uuid::from_u128(id)))
+                .collect();
+
+            assert_eq!(full.total_matches, 9);
+
+            assert_eq!(
+                full.objects.iter().map(|o| &o.id).collect::<Vec<_>>(),
+                expected.iter().collect::<Vec<_>>()
+            );
+
+            for start in [0, 3, 6, 9] {
+                let page = fixture
+                    .library
+                    .browse(action("0", false, start, 3, sort))
+                    .await
+                    .unwrap();
+
+                assert_eq!(page.total_matches, 9);
+                assert_eq!(page.update_id, full.update_id);
+
+                assert_eq!(
+                    page.objects,
+                    full.objects[start as usize..(start as usize + 3).min(9)]
+                );
+            }
+
+            let oldest_created = full.objects.iter().find(|o| o.title == "Z").unwrap();
+            assert_eq!(oldest_created.date.as_deref(), Some("2020-01-01"));
+        }
+
+        assert_eq!(fixture.fake.calls("/api/albums"), 1);
+        assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
+        fixture.stop(task).await;
+    }
+
+    #[tokio::test]
+    async fn album_latest_date_refresh_reorders_and_publishes_without_loading_contents() {
+        let mut fixture = Fixture::new(2).await;
+
+        {
+            let mut upstream = fixture.fake.upstream.lock().unwrap();
+            upstream.albums = vec![album(1, "A"), album(2, "Z")];
+            upstream.albums[0]["endDate"] = json!("2020-01-01T00:00:00Z");
+            upstream.albums[1]["endDate"] = json!("2024-01-01T00:00:00Z");
+        }
+
+        let task = fixture.run();
+        let request = || action("0", false, 0, 0, "");
+        let before = fixture.library.browse(request()).await.unwrap();
+        assert_eq!(before.objects[0].title, "Z");
+        let disk = fixture.disk().1;
+        let events_stop = CancellationToken::new();
+
+        let events = tokio::spawn(
+            fixture
+                .library
+                .inner
+                .events
+                .clone()
+                .run(events_stop.clone()),
+        );
+
+        fixture.fake.subscribe(&fixture.library);
+        fixture.fake.event(before.update_id).await;
+
+        fixture.fake.upstream.lock().unwrap().albums[0]["endDate"] = json!("2025-01-01T00:00:00Z");
+
+        let cached = fixture.library.browse(request()).await.unwrap();
+        assert_eq!(cached.objects, before.objects);
+        assert_eq!(cached.update_id, before.update_id);
+        assert_eq!(fixture.fake.calls("/api/albums"), 1);
+        fixture.expire(Scope::Root);
+        let after = fixture.library.browse(request()).await.unwrap();
+        assert_eq!(after.objects[0].title, "A");
+        assert_eq!(after.objects[1], before.objects[0]);
+        assert_eq!(after.update_id, before.update_id + 1);
+        fixture.fake.event(after.update_id).await;
+        let changed = fixture.disk();
+        assert_eq!(changed.1.system_update_id, after.update_id);
+        let id = Uuid::from_u128(1);
+
+        assert_eq!(
+            changed.1.albums[&id].update_id,
+            disk.albums[&id].update_id + 1
+        );
+
+        assert_eq!(
+            changed.1.albums[&Uuid::from_u128(2)],
+            disk.albums[&Uuid::from_u128(2)]
+        );
+
+        assert!(
+            changed
+                .1
+                .albums
+                .values()
+                .all(|a| a.contents_digest.is_none())
+        );
+
+        fixture.fake.upstream.lock().unwrap().albums.reverse();
+        fixture.expire(Scope::Root);
+        let same = fixture.library.browse(request()).await.unwrap();
+        assert_eq!(same.objects, after.objects);
+        assert_eq!(same.update_id, after.update_id);
+        assert_eq!(fixture.disk(), changed);
+        assert_eq!(fixture.fake.calls("/api/albums"), 3);
+        assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
+        events_stop.cancel();
+        events.await.unwrap().unwrap();
+        fixture.stop(task).await;
     }
 
     #[tokio::test]
