@@ -848,83 +848,7 @@ fn encoded_size(value: &impl Serialize, limit: usize) -> Result<usize> {
 }
 
 fn media_type(value: &str) -> Option<String> {
-    fn token(byte: u8) -> bool {
-        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-    }
-
-    let (mime, mut rest) = value.split_once(';').unwrap_or((value, ""));
-    let mime = mime.trim_matches([' ', '\t']);
-    let (kind, subtype) = mime.split_once('/')?;
-
-    if kind.is_empty()
-        || subtype.is_empty()
-        || kind == "*"
-        || subtype == "*"
-        || !kind.bytes().chain(subtype.bytes()).all(token)
-        || (value.contains(';') && rest.trim().is_empty())
-    {
-        return None;
-    }
-
-    while !rest.is_empty() {
-        rest = rest.trim_start_matches([' ', '\t']);
-        let end = rest.bytes().take_while(|&byte| token(byte)).count();
-
-        if end == 0 {
-            return None;
-        }
-
-        rest = rest[end..].strip_prefix('=')?;
-
-        if let Some(quoted) = rest.strip_prefix('"') {
-            let mut bytes = quoted.bytes();
-            let mut consumed = 0;
-
-            loop {
-                let byte = bytes.next()?;
-                consumed += 1;
-
-                match byte {
-                    b'"' => break,
-
-                    b'\\' => {
-                        let escaped = bytes.next()?;
-                        consumed += 1;
-
-                        if escaped != b'\t' && !(32..=126).contains(&escaped) {
-                            return None;
-                        }
-                    }
-
-                    b'\t' | 32..=126 => {}
-
-                    _ => return None,
-                }
-            }
-
-            rest = &quoted[consumed..];
-        } else {
-            let end = rest.bytes().take_while(|&byte| token(byte)).count();
-
-            if end == 0 {
-                return None;
-            }
-
-            rest = &rest[end..];
-        }
-
-        rest = rest.trim_start_matches([' ', '\t']);
-
-        if !rest.is_empty() {
-            rest = rest.strip_prefix(';')?;
-
-            if rest.trim().is_empty() {
-                return None;
-            }
-        }
-    }
-
-    Some(mime.to_ascii_lowercase())
+    crate::mime::parse(value, false).map(str::to_ascii_lowercase)
 }
 
 #[cfg(test)]
@@ -2053,32 +1977,13 @@ mod tests {
     }
 
     #[test]
-    fn mime_parser_validates_parameters_and_never_invents_a_container() {
-        for value in [
-            "image/jpeg",
-            " IMAGE/JPEG ; q=90",
-            "image/jpeg; note=\"semi;colon\"",
-            "video/MP4; codecs=\"avc1\\\"test\"",
-        ] {
-            assert!(media_type(value).is_some(), "{value}");
-        }
+    fn mime_normalization_uses_strict_parameters() {
+        assert_eq!(
+            media_type(" IMAGE/JPEG ; q=90").as_deref(),
+            Some("image/jpeg")
+        );
 
-        for value in [
-            "",
-            "video",
-            "video/",
-            "*/mp4",
-            "video/*",
-            "video/mp4/extra",
-            "video/mp4\r\nsecret",
-            "image/jpeg;",
-            "image/jpeg; nope",
-            "image/jpeg; q=",
-            "image/jpeg; q=\"unclosed",
-            "image/jpeg; q=1;",
-            "image/jpeg; q=\"bad\nvalue\"",
-        ] {
-            assert!(media_type(value).is_none(), "{value}");
-        }
+        assert_eq!(media_type("image/jpeg; q =90"), None);
+        assert_eq!(media_type("image/jpeg; q= 90"), None);
     }
 }

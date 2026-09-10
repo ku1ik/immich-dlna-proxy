@@ -1,0 +1,180 @@
+/// Validate a concrete MIME type and its parameters, preserving type/subtype case.
+/// SOAP permits whitespace around parameter `=`; catalog and media values do not.
+pub(crate) fn parse(value: &str, allow_parameter_whitespace: bool) -> Option<&str> {
+    fn token(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+    }
+
+    let (mime, mut rest) = value.split_once(';').unwrap_or((value, ""));
+    let mime = mime.trim_matches([' ', '\t']);
+    let (kind, subtype) = mime.split_once('/')?;
+
+    if kind.is_empty()
+        || subtype.is_empty()
+        || kind == "*"
+        || subtype == "*"
+        || !kind.bytes().chain(subtype.bytes()).all(token)
+        || (value.contains(';') && rest.trim().is_empty())
+    {
+        return None;
+    }
+
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches([' ', '\t']);
+        let end = rest.bytes().take_while(|&byte| token(byte)).count();
+
+        if end == 0 {
+            return None;
+        }
+
+        rest = &rest[end..];
+
+        if allow_parameter_whitespace {
+            rest = rest.trim_start_matches([' ', '\t']);
+        }
+
+        rest = rest.strip_prefix('=')?;
+
+        if allow_parameter_whitespace {
+            rest = rest.trim_start_matches([' ', '\t']);
+        }
+
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let mut bytes = quoted.bytes();
+            let mut consumed = 0;
+
+            loop {
+                let byte = bytes.next()?;
+                consumed += 1;
+
+                match byte {
+                    b'"' => break,
+
+                    b'\\' => {
+                        let escaped = bytes.next()?;
+                        consumed += 1;
+
+                        if escaped != b'\t' && !(32..=126).contains(&escaped) {
+                            return None;
+                        }
+                    }
+
+                    b'\t' | 32..=126 => {}
+                    _ => return None,
+                }
+            }
+
+            rest = &quoted[consumed..];
+        } else {
+            let end = rest.bytes().take_while(|&byte| token(byte)).count();
+
+            if end == 0 {
+                return None;
+            }
+
+            rest = &rest[end..];
+        }
+
+        rest = rest.trim_start_matches([' ', '\t']);
+
+        if !rest.is_empty() {
+            rest = rest.strip_prefix(';')?;
+
+            if rest.trim().is_empty() {
+                return None;
+            }
+        }
+    }
+
+    Some(mime)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    #[test]
+    fn mime_grammar_preserves_case_and_consumes_all_parameters() {
+        for (value, expected) in [
+            ("image/jpeg", "image/jpeg"),
+            (" IMAGE/JPEG \t", "IMAGE/JPEG"),
+            (" IMAGE/JPEG ; q=90", "IMAGE/JPEG"),
+            ("video/mp4; codecs=avc1", "video/mp4"),
+            ("image/jpeg; note=\"semi;colon\"", "image/jpeg"),
+            ("image/jpeg; note=\"a;\\\"b\"; x=y", "image/jpeg"),
+            ("video/MP4; codecs=\"avc1\\\"test\"", "video/MP4"),
+            ("TEXT/XML; Charset=utf-8", "TEXT/XML"),
+            ("text/xml; a=\"with;semicolon\"; b=token", "text/xml"),
+            ("text/xml; a=\"escaped\\\"quote\"", "text/xml"),
+            ("text/xml; a=\"\"; a=\"\\\\\t\\\t ~\" \t", "text/xml"),
+            (
+                "application/vnd.a+b; !#$%&'*+-.^_`|~=token",
+                "application/vnd.a+b",
+            ),
+        ] {
+            for whitespace in [false, true] {
+                assert_eq!(parse(value, whitespace), Some(expected), "{value:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mime_grammar_rejects_malformed_types_parameters_and_controls() {
+        for value in [
+            "",
+            "image",
+            "image/",
+            "/jpeg",
+            "*/mp4",
+            "video/*",
+            "*/*",
+            "image/jpeg/extra",
+            "image/jpeg, image/png",
+            "image /jpeg",
+            "image/jpeg;",
+            "image/jpeg; \t",
+            "image/jpeg; x",
+            "image/jpeg; x=",
+            "image/jpeg; x=\"unterminated",
+            "image/jpeg; x=\"v\"oops",
+            "image/jpeg; x=1;",
+            "image/jpeg; x=1; \t",
+            "image/jpeg;;x=1",
+            "image/jpeg; =x",
+            "image/jpeg; x=a b",
+            "image/jpeg; x=\"dangling\\",
+            "video/mp4\r\nsecret",
+            "\nimage/jpeg",
+            "image/jpeg\n",
+            "image/jpeg; x=\"bad\nvalue\"",
+            "image/jpeg; x=\"bad\rvalue\"",
+            "image/jpeg; x=\"\0\"",
+            "image/jpeg; x=\"\u{7f}\"",
+            "image/jpeg; x=\"\\\n\"",
+            "image/jpeg; x=\"\\\u{7f}\"",
+            "image/jpeg; x=\"\u{80}\"",
+            "image/jpeg; x=\"\\\u{80}\"",
+            "image/jpeg;\nx=1",
+            "image/jpeg; x=1\n",
+            "image/jpeg; x\n=1",
+            "image/jpeg; x=\n1",
+            "image/jpeg; x=\u{a0}1",
+        ] {
+            for whitespace in [false, true] {
+                assert_eq!(parse(value, whitespace), None, "{value:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mime_parameter_whitespace_is_an_explicit_caller_policy() {
+        for value in [
+            "text/xml; charset =utf-8",
+            "text/xml; charset= utf-8",
+            "text/xml; charset \t=\t \"utf-8\"; a = b",
+        ] {
+            assert_eq!(parse(value, false), None, "{value:?}");
+            assert_eq!(parse(value, true), Some("text/xml"), "{value:?}");
+        }
+    }
+}

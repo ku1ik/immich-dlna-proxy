@@ -364,7 +364,7 @@ impl MediaProxy {
         }
 
         let mime = single(&safe, header::CONTENT_TYPE)
-            .and_then(media_type)
+            .and_then(|value| crate::mime::parse(value, false))
             .ok_or(Failure::Upstream("missing or invalid media MIME"))?;
 
         if mime.eq_ignore_ascii_case("multipart/byteranges")
@@ -593,88 +593,6 @@ fn partial_span(value: &str, requested: ByteRange) -> Option<u64> {
     };
 
     compatible.then_some(span)
-}
-
-fn token(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-}
-
-fn media_type(value: &str) -> Option<&str> {
-    let (mime, mut parameters) = value.split_once(';').unwrap_or((value, ""));
-    let mime = mime.trim();
-    let (kind, subtype) = mime.split_once('/')?;
-
-    if kind.is_empty()
-        || subtype.is_empty()
-        || kind == "*"
-        || subtype == "*"
-        || !kind.bytes().chain(subtype.bytes()).all(token)
-    {
-        return None;
-    }
-
-    if value.contains(';') && parameters.trim().is_empty() {
-        return None;
-    }
-
-    while !parameters.is_empty() {
-        parameters = parameters.trim_start_matches([' ', '\t']);
-        let name_end = parameters.bytes().take_while(|&byte| token(byte)).count();
-
-        if name_end == 0 {
-            return None;
-        }
-
-        parameters = parameters[name_end..].strip_prefix('=')?;
-
-        if let Some(quoted) = parameters.strip_prefix('"') {
-            let mut bytes = quoted.bytes();
-            let mut consumed = 0;
-
-            loop {
-                let byte = bytes.next()?;
-                consumed += 1;
-
-                match byte {
-                    b'"' => break,
-
-                    b'\\' => {
-                        let escaped = bytes.next()?;
-                        consumed += 1;
-
-                        if escaped != b'\t' && !(32..=126).contains(&escaped) {
-                            return None;
-                        }
-                    }
-
-                    b'\t' | 32..=126 => {}
-                    _ => return None,
-                }
-            }
-
-            parameters = &quoted[consumed..];
-        } else {
-            let end = parameters.bytes().take_while(|&byte| token(byte)).count();
-
-            if end == 0 {
-                return None;
-            }
-
-            parameters = &parameters[end..];
-        }
-
-        parameters = parameters.trim_start_matches([' ', '\t']);
-
-        if !parameters.is_empty() {
-            parameters = parameters.strip_prefix(';')?;
-
-            if parameters.trim().is_empty() {
-                return None;
-            }
-        }
-    }
-
-    Some(mime)
 }
 
 #[cfg(test)]
@@ -1232,6 +1150,16 @@ mod tests {
             ("original", "Content-Type: image/heic\r\n", 200),
             ("original", "Content-Type: video/x-matroska\r\n", 200),
             ("preview", "Content-Type: IMAGE/JPEG; quality=high\r\n", 200),
+            (
+                "preview",
+                "Content-Type: image/jpeg; quality =high\r\n",
+                502,
+            ),
+            (
+                "preview",
+                "Content-Type: image/jpeg; quality= high\r\n",
+                502,
+            ),
             ("playback", "Content-Type: Video/MP4\r\n", 200),
             ("playback", "Content-Type: video/quicktime\r\n", 502),
             ("display", "Content-Type: image/webp\r\n", 502),
@@ -1954,7 +1882,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_numeric_and_mime_parsing() {
+    fn strict_numeric_parsing() {
         assert_eq!(
             ByteRange::parse("bytes=0-18446744073709551615"),
             Some(ByteRange::From(0, Some(u64::MAX)))
@@ -1969,29 +1897,5 @@ mod tests {
         );
         assert_eq!(partial_span("bytes 0-2/3", requested), Some(3));
         assert_eq!(partial_span("bytes 0-2/2", requested), None);
-
-        for valid in [
-            "image/jpeg",
-            " IMAGE/JPEG ",
-            "video/mp4; codecs=avc1",
-            "image/jpeg; note=\"a;\\\"b\"; x=y",
-        ] {
-            assert!(media_type(valid).is_some(), "{valid}");
-        }
-
-        for invalid in [
-            "image",
-            "image/",
-            "/jpeg",
-            "image/jpeg/extra",
-            "image/jpeg;",
-            "image/jpeg; x",
-            "image/jpeg; x=",
-            "image/jpeg; x=\"unterminated",
-            "image/jpeg; x=\"v\"oops",
-            "image/jpeg, image/png",
-        ] {
-            assert!(media_type(invalid).is_none(), "{invalid}");
-        }
     }
 }
