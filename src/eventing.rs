@@ -563,6 +563,10 @@ async fn deliver(
     body: String,
 ) -> (Uuid, bool) {
     for url in callbacks {
+        let started = Instant::now();
+        let header_deadline = started + limits::UPSTREAM_HEADER_TIMEOUT;
+        let deadline = started + limits::CALLBACK_TIMEOUT;
+
         let attempt = async {
             let request = client
                 .request(Method::from_bytes(b"NOTIFY").unwrap(), url)
@@ -575,11 +579,15 @@ async fn deliver(
                 .header(header::ACCEPT_ENCODING, "identity")
                 .body(body.clone());
 
-            let mut response =
-                tokio::time::timeout(limits::UPSTREAM_HEADER_TIMEOUT, request.send())
-                    .await
-                    .ok()?
-                    .ok()?;
+            let mut response = tokio::time::timeout_at(header_deadline, request.send())
+                .await
+                .ok()?
+                .ok()?;
+
+            // Timeout polls the response first, so a ready result can already be late.
+            if Instant::now() >= header_deadline {
+                return None;
+            }
 
             let status = response.status();
 
@@ -607,7 +615,13 @@ async fn deliver(
             Some(status)
         };
 
-        match tokio::time::timeout(limits::CALLBACK_TIMEOUT, attempt).await {
+        let result = tokio::time::timeout_at(deadline, attempt).await;
+
+        if Instant::now() >= deadline {
+            continue;
+        }
+
+        match result {
             Ok(Some(StatusCode::OK)) => {
                 tracing::debug!(%sid, seq, "event delivered");
 
@@ -2092,6 +2106,213 @@ mod tests {
             shutdown.cancel();
             task.await.unwrap().unwrap();
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn callback_ready_at_deadline_obeys_header_and_total_limits() {
+        use std::{future::Future, task::Wake};
+
+        use futures_util::FutureExt;
+
+        struct CallbackWake(Notify);
+
+        impl Wake for CallbackWake {
+            fn wake(self: Arc<Self>) {
+                self.0.notify_one();
+            }
+        }
+
+        // Keep loopback I/O from auto-advancing the paused clock to a timeout.
+        let clock_guard = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+
+        for (body_pending, status, limit) in [
+            (false, 412, limits::UPSTREAM_HEADER_TIMEOUT),
+            (false, 200, limits::UPSTREAM_HEADER_TIMEOUT),
+            (true, 200, limits::CALLBACK_TIMEOUT),
+        ] {
+            for elapsed in [
+                limit - Duration::from_secs(1),
+                limit,
+                limit + Duration::from_secs(1),
+            ] {
+                let mut subscriptions = Subscriptions::new().unwrap();
+
+                if body_pending {
+                    // Exercise our total deadline without reqwest's own timer masking it.
+                    subscriptions.client = reqwest::Client::builder()
+                        .no_proxy()
+                        .pool_max_idle_per_host(0)
+                        .build()
+                        .unwrap();
+                }
+
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                let mut callback = Callback::new().await;
+
+                let urls = format!(
+                    "<http://{}/first>{}{}",
+                    listener.local_addr().unwrap(),
+                    callback.url("/ok"),
+                    callback.url("/unused")
+                );
+
+                let (response, token) = subscriptions.request(
+                    SERVICE,
+                    Ipv4Addr::LOCALHOST,
+                    &Method::from_bytes(b"SUBSCRIBE").unwrap(),
+                    &headers(&[("nt", "upnp:event"), ("callback", &urls)]),
+                );
+
+                assert_eq!(response.status(), StatusCode::OK);
+                let sid = token.unwrap();
+                subscriptions.response_complete(sid, true);
+                let shutdown = CancellationToken::new();
+                let scheduler = subscriptions.clone().run(shutdown.clone());
+                tokio::pin!(scheduler);
+                let wake = Arc::new(CallbackWake(Notify::new()));
+                let waker = std::task::Waker::from(wake.clone());
+                let mut context = std::task::Context::from_waker(&waker);
+
+                for (seq, id) in [(0, 0), (1, 7)] {
+                    if seq != 0 {
+                        subscriptions.publish(id);
+                    }
+
+                    let started = Instant::now();
+
+                    let socket = tokio::select! {
+                        _ = &mut scheduler => panic!("scheduler ended"),
+                        accepted = listener.accept() => accepted.unwrap().0,
+                    };
+
+                    let mut socket = BufReader::new(socket);
+                    let expected_body = event_body(SERVICE, id);
+
+                    let read_request = async {
+                        let mut request = String::new();
+
+                        loop {
+                            assert_ne!(socket.read_line(&mut request).await.unwrap(), 0);
+
+                            if request.ends_with("\r\n\r\n") {
+                                break;
+                            }
+                        }
+
+                        assert!(request.starts_with("NOTIFY /first HTTP/1.1\r\n"));
+                        assert!(request.contains(&format!("\r\nseq: {seq}\r\n")));
+                        assert!(request.contains(&format!("\r\nsid: uuid:{sid}\r\n")));
+                        let mut body = vec![0; expected_body.len()];
+                        socket.read_exact(&mut body).await.unwrap();
+                        assert_eq!(body, expected_body.as_bytes());
+                    };
+
+                    tokio::select! {
+                        _ = &mut scheduler => panic!("scheduler ended"),
+                        _ = read_request => {}
+                    }
+
+                    assert!(scheduler.as_mut().poll(&mut context).is_pending());
+                    let _ = wake.0.notified().now_or_never();
+
+                    let response = format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\n\r\n",
+                        usize::from(body_pending)
+                    );
+
+                    socket
+                        .get_mut()
+                        .write_all(response.as_bytes())
+                        .await
+                        .unwrap();
+
+                    wake.0.notified().await;
+
+                    if body_pending {
+                        // Observe headers on time, then stop polling while the body becomes ready.
+                        assert!(scheduler.as_mut().poll(&mut context).is_pending());
+                        let _ = wake.0.notified().now_or_never();
+                        socket.get_mut().write_all(b"x").await.unwrap();
+                        wake.0.notified().await;
+                    }
+
+                    // The response has woken the scheduler, but only poll it at the chosen boundary.
+                    assert_eq!(Instant::now(), started);
+                    tokio::time::advance(elapsed).await;
+                    assert!(scheduler.as_mut().poll(&mut context).is_pending());
+                    let expired = elapsed >= limit;
+                    let rejected = !expired && status == 412;
+
+                    let entry = subscriptions
+                        .state
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .first()
+                        .map(|entry| (entry.active, entry.delivering, entry.next_seq));
+
+                    assert_eq!(
+                        entry,
+                        (!rejected).then_some((true, expired, seq + 1)),
+                        "body_pending={body_pending}, status={status}, elapsed={elapsed:?}, seq={seq}"
+                    );
+
+                    if rejected {
+                        assert!(callback.received.try_recv().is_err());
+                        break;
+                    }
+
+                    if expired {
+                        let (alternative, body) = tokio::select! {
+                            _ = &mut scheduler => panic!("scheduler ended"),
+                            request = callback.next() => request,
+                        };
+
+                        assert_eq!(alternative.uri.path(), "/ok");
+                        assert_eq!(alternative.headers["sid"], format!("uuid:{sid}"));
+                        assert_eq!(alternative.headers["seq"], seq.to_string());
+                        assert_eq!(body, expected_body);
+
+                        while subscriptions.state.lock().unwrap().entries[0].delivering {
+                            assert!(scheduler.as_mut().poll(&mut context).is_pending());
+                            tokio::task::yield_now().await;
+                        }
+                    }
+
+                    assert!(callback.received.try_recv().is_err());
+
+                    assert_eq!(
+                        sid_request(
+                            &subscriptions,
+                            sid,
+                            "SUBSCRIBE",
+                            SERVICE,
+                            Ipv4Addr::LOCALHOST,
+                            None
+                        )
+                        .status(),
+                        StatusCode::OK
+                    );
+
+                    let state = subscriptions.state.lock().unwrap();
+                    let entry = &state.entries[0];
+                    assert!(entry.active);
+                    assert!(entry.initial == Initial::Finished);
+                    assert_eq!(entry.next_seq, seq + 1);
+                    assert_eq!(entry.pending, None);
+                }
+
+                shutdown.cancel();
+                scheduler.await.unwrap();
+            }
+        }
+
+        clock_guard.abort();
+        clock_guard.await.unwrap_err();
     }
 
     #[tokio::test]
