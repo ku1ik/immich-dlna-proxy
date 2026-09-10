@@ -18,7 +18,7 @@ use hyper_util::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener,
-    sync::{Semaphore, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, oneshot},
     task::JoinSet,
     time::{Instant, Sleep, timeout_at},
 };
@@ -52,7 +52,7 @@ pub struct Server<C> {
     media: MediaProxy,
     subscriptions: Subscriptions,
     device: String,
-    browses: Semaphore,
+    browses: Arc<Semaphore>,
     timing: Timing,
 }
 
@@ -92,7 +92,7 @@ impl<C: Catalog> Server<C> {
             media,
             subscriptions,
             device: protocol::device_description(&friendly_name, uuid),
-            browses: Semaphore::new(limits::BROWSES),
+            browses: Arc::new(Semaphore::new(limits::BROWSES)),
             timing: Timing::default(),
         }
     }
@@ -378,7 +378,7 @@ impl<C: Catalog> Server<C> {
         let result = async {
             let args = match action.name.as_str() {
                 "Browse" => {
-                    let Ok(_permit) = self.browses.try_acquire() else {
+                    let Ok(permit) = self.browses.clone().try_acquire_owned() else {
                         return Ok(empty(StatusCode::SERVICE_UNAVAILABLE));
                     };
 
@@ -411,7 +411,10 @@ impl<C: Catalog> Server<C> {
 
                     tracing::debug!(%peer, ?object, returned = result.objects.len(), total = result.total_matches, update_id = result.update_id, "Browse response");
 
-                    return Ok(soap(Ok(envelope)));
+                    let mut response = soap(Ok(envelope));
+                    response.extensions_mut().insert(Arc::new(permit));
+
+                    return Ok(response);
                 }
 
                 "GetSearchCapabilities" => vec![("SearchCaps", String::new())],
@@ -502,11 +505,14 @@ async fn connection<C: Catalog, T: AsyncRead + AsyncWrite + Unpin + Send + 'stat
     let token = completion.token.clone();
     let (start_tx, mut start_rx) = oneshot::channel();
     let start_tx = Arc::new(Mutex::new(Some(start_tx)));
+    let browse = Arc::new(Mutex::new(None));
+    let admitted = browse.clone();
 
     let router = Router::new().fallback(move |request: Request| {
         let server = server.clone();
         let token = token.clone();
         let shutdown = shutdown.clone();
+        let admitted = admitted.clone();
         let started = Instant::now();
         let media = request.uri().path().starts_with("/media/assets/");
 
@@ -518,6 +524,12 @@ async fn connection<C: Catalog, T: AsyncRead + AsyncWrite + Unpin + Send + 'stat
             let mut response = server
                 .handle(request, peer, &token, &shutdown, started)
                 .await;
+
+            // Hyper may consume a body frame while its bytes still await transmission.
+            // One request per connection lets admission cover the entire transport.
+            *admitted.lock().unwrap() = response
+                .extensions_mut()
+                .remove::<Arc<OwnedSemaphorePermit>>();
 
             response
                 .headers_mut()
@@ -1370,6 +1382,86 @@ mod tests {
             task.await.unwrap();
         }
 
+        assert_eq!(server.browses.available_permits(), limits::BROWSES);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn browse_admission_covers_buffered_transmission_and_cleanup() {
+        for finish in ["read", "disconnect", "deadline", "cancel"] {
+            let mut server = server(TestCatalog::default());
+            server.timing.response = Duration::from_secs(2);
+            let server = Arc::new(server);
+            let mut clients = Vec::new();
+
+            for _ in 0..limits::BROWSES {
+                let (mut client, task) = connect(server.clone(), 64);
+                client.write_all(browse("*").as_bytes()).await.unwrap();
+                status(&read_headers(&mut client).await, 200);
+                assert!(!task.is_finished());
+                clients.push((client, task));
+            }
+
+            assert_eq!(server.browses.available_permits(), 0, "{finish}");
+            status(&exchange(server.clone(), &browse("*")).await, 503);
+
+            status(
+                &exchange(server.clone(), &action(CDS, "GetSystemUpdateID", "")).await,
+                200,
+            );
+
+            if finish == "deadline" {
+                tokio::time::advance(Duration::from_secs(2)).await;
+            }
+
+            for (mut client, task) in clients {
+                match finish {
+                    "read" => {
+                        let mut body = String::new();
+                        client.read_to_string(&mut body).await.unwrap();
+                        assert!(body.ends_with("</s:Envelope>"));
+                    }
+
+                    "disconnect" => drop(client),
+
+                    "cancel" => task.abort(),
+
+                    "deadline" => {}
+
+                    _ => unreachable!(),
+                }
+
+                assert_eq!(task.await.is_err(), finish == "cancel");
+            }
+
+            assert_eq!(server.browses.available_permits(), limits::BROWSES);
+            status(&exchange(server.clone(), &browse("*")).await, 200);
+        }
+    }
+
+    #[tokio::test]
+    async fn browse_permit_survives_body_eof_until_transport_shutdown() {
+        let server = Arc::new(server(TestCatalog::default()));
+        let (mut client, io) = tokio::io::duplex(4096);
+        let entered = Arc::new(Notify::new());
+        let (release, gate) = oneshot::channel();
+
+        let task = tokio::spawn(connection(
+            GatedIo {
+                io,
+                shutdown_entered: entered.clone(),
+                allow_shutdown: gate,
+                shutdown_completed: Arc::new(AtomicBool::new(false)),
+            },
+            Ipv4Addr::LOCALHOST,
+            server.clone(),
+            CancellationToken::new(),
+        ));
+
+        client.write_all(browse("*").as_bytes()).await.unwrap();
+        entered.notified().await;
+        assert_eq!(server.browses.available_permits(), limits::BROWSES - 1);
+        release.send(true).unwrap();
+        task.await.unwrap();
         assert_eq!(server.browses.available_permits(), limits::BROWSES);
     }
 
