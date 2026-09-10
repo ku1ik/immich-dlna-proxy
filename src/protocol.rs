@@ -89,6 +89,84 @@ pub struct Action {
     pub arguments: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct BrowseArguments<'a> {
+    pub object_id: &'a str,
+    pub metadata: bool,
+    pub starting_index: u32,
+    pub requested_count: u32,
+    pub sort: &'a str,
+    pub filter: Filter,
+}
+
+/// Validate Browse inputs before catalog access; object identity belongs to the catalog.
+pub fn browse_arguments(action: &Action) -> Result<BrowseArguments<'_>, Fault> {
+    let invalid = Fault { code: 402 };
+
+    if action.name != "Browse" {
+        return Err(Fault { code: 401 });
+    }
+
+    let inputs = Service::ContentDirectory.inputs("Browse")?;
+
+    if action.arguments.len() != inputs.len() {
+        return Err(invalid);
+    }
+
+    let argument = |name: &str| {
+        action
+            .arguments
+            .get(name)
+            .map(String::as_str)
+            .ok_or(invalid)
+    };
+
+    // Check the complete shape before value validation, including sort faults.
+    for name in inputs {
+        argument(name)?;
+    }
+
+    let number = |name| {
+        let value = argument(name)?;
+
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(invalid);
+        }
+
+        value.parse::<u32>().map_err(|_| invalid)
+    };
+
+    let starting_index = number("StartingIndex")?;
+    let requested_count = number("RequestedCount")?;
+
+    let metadata = match argument("BrowseFlag")? {
+        "BrowseMetadata" => true,
+        "BrowseDirectChildren" => false,
+        _ => return Err(invalid),
+    };
+
+    if metadata && starting_index != 0 {
+        return Err(invalid);
+    }
+
+    let sort = argument("SortCriteria")?;
+
+    if !matches!(sort, "" | "+dc:date" | "-dc:date") {
+        return Err(Fault { code: 709 });
+    }
+
+    let filter = Filter::parse(argument("Filter")?)?;
+
+    Ok(BrowseArguments {
+        object_id: argument("ObjectID")?,
+        metadata,
+        starting_index,
+        requested_count,
+        sort,
+        filter,
+    })
+}
+
 fn xml_char(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
 }
@@ -392,7 +470,9 @@ pub fn parse_action(body: &[u8], soap_action: &str, service: Service) -> Result<
 
     let inputs = service.inputs(requested)?;
 
-    if action.arguments.len() != inputs.len()
+    if requested == "Browse" {
+        browse_arguments(&action)?;
+    } else if action.arguments.len() != inputs.len()
         || inputs
             .iter()
             .any(|name| !action.arguments.contains_key(*name))
@@ -400,38 +480,13 @@ pub fn parse_action(body: &[u8], soap_action: &str, service: Service) -> Result<
         return Err(invalid);
     }
 
-    if requested == "Browse" {
-        let args = &action.arguments;
-
-        for name in ["StartingIndex", "RequestedCount"] {
-            let value = &args[name];
-
-            if value.is_empty()
-                || !value.bytes().all(|c| c.is_ascii_digit())
-                || value.parse::<u32>().is_err()
-            {
-                return Err(invalid);
-            }
-        }
-
-        if !matches!(
-            args["BrowseFlag"].as_str(),
-            "BrowseMetadata" | "BrowseDirectChildren"
-        ) || (args["BrowseFlag"] == "BrowseMetadata"
-            && args["StartingIndex"].parse::<u32>() != Ok(0))
-        {
-            return Err(invalid);
-        }
-
-        if !matches!(args["SortCriteria"].as_str(), "" | "+dc:date" | "-dc:date") {
-            return Err(Fault { code: 709 });
-        }
-
-        Filter::parse(&args["Filter"])?;
-    }
-
     if requested == "GetCurrentConnectionInfo"
-        && action.arguments["ConnectionID"].parse::<i32>().is_err()
+        && action
+            .arguments
+            .get("ConnectionID")
+            .ok_or(invalid)?
+            .parse::<i32>()
+            .is_err()
     {
         return Err(invalid);
     }
@@ -1249,6 +1304,62 @@ mod tests {
         );
 
         assert!(browse(&args).is_err());
+    }
+
+    #[test]
+    fn browse_arguments_validates_direct_calls_and_fault_precedence() {
+        let valid = browse(BROWSE_ARGS).unwrap();
+        let arguments = browse_arguments(&valid).unwrap();
+        assert_eq!(arguments.object_id, "0");
+        assert!(!arguments.metadata);
+        assert_eq!(arguments.starting_index, 0);
+        assert_eq!(arguments.requested_count, 0);
+        assert_eq!(arguments.sort, "");
+        assert_eq!(arguments.filter, Filter::parse("*").unwrap());
+
+        for name in valid.arguments.keys() {
+            let mut action = browse(BROWSE_ARGS).unwrap();
+            action.arguments.insert("SortCriteria".into(), "bad".into());
+            action.arguments.remove(name);
+            assert_eq!(browse_arguments(&action), Err(Fault { code: 402 }));
+            action.arguments.insert("Extra".into(), String::new());
+            assert_eq!(browse_arguments(&action), Err(Fault { code: 402 }));
+        }
+
+        let mut action = valid;
+        action.arguments.insert("Filter".into(), "res,,".into());
+        assert_eq!(browse_arguments(&action), Err(Fault { code: 402 }));
+        action.arguments.insert("SortCriteria".into(), "bad".into());
+        assert_eq!(browse_arguments(&action), Err(Fault { code: 709 }));
+        action.arguments.insert("StartingIndex".into(), "1".into());
+
+        action
+            .arguments
+            .insert("BrowseFlag".into(), "BrowseMetadata".into());
+
+        assert_eq!(browse_arguments(&action), Err(Fault { code: 402 }));
+        action.arguments.insert("Extra".into(), String::new());
+        action.name = "GetSystemUpdateID".into();
+        assert_eq!(browse_arguments(&action), Err(Fault { code: 401 }));
+
+        let mut action = browse(BROWSE_ARGS).unwrap();
+
+        action
+            .arguments
+            .insert("ObjectID".into(), "not-an-id".into());
+
+        action
+            .arguments
+            .insert("StartingIndex".into(), u32::MAX.to_string());
+
+        action
+            .arguments
+            .insert("RequestedCount".into(), u32::MAX.to_string());
+
+        let arguments = browse_arguments(&action).unwrap();
+        assert_eq!(arguments.object_id, "not-an-id");
+        assert_eq!(arguments.starting_index, u32::MAX);
+        assert_eq!(arguments.requested_count, u32::MAX);
     }
 
     #[test]

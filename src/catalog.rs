@@ -21,7 +21,7 @@ use crate::{
     eventing::Subscriptions,
     immich::{self, Contents, FetchBudget, Immich, ObjectId, Root},
     limits,
-    protocol::{Action, Fault, Object},
+    protocol::{Action, Fault, Object, browse_arguments},
     revisions::{AlbumRevision, Ledger, Store},
     server::{BrowseResult, Catalog},
 };
@@ -624,53 +624,12 @@ impl Catalog for Library {
     }
 
     async fn browse(&self, action: Action) -> Result<BrowseResult, Fault> {
-        let invalid = Fault { code: 402 };
-
-        if action.name != "Browse" {
-            return Err(Fault { code: 401 });
-        }
-
-        let argument = |name: &str| {
-            action
-                .arguments
-                .get(name)
-                .map(String::as_str)
-                .ok_or(invalid)
-        };
-
-        let id = immich::parse_id(argument("ObjectID")?)?;
-
-        let metadata = match argument("BrowseFlag")? {
-            "BrowseMetadata" => true,
-            "BrowseDirectChildren" => false,
-            _ => return Err(invalid),
-        };
-
-        let number = |name| {
-            let value = argument(name)?;
-
-            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(invalid);
-            }
-
-            value.parse::<u32>().map_err(|_| invalid)
-        };
-
-        let start = number("StartingIndex")? as usize;
-        let count = number("RequestedCount")? as usize;
-        argument("Filter")?;
-
-        let sort = match argument("SortCriteria")? {
-            "" => None,
-            "+dc:date" => Some(false),
-            "-dc:date" => Some(true),
-            _ => return Err(Fault { code: 709 }),
-        };
-
-        if metadata && start != 0 {
-            return Err(invalid);
-        }
-
+        let arguments = browse_arguments(&action)?;
+        let id = immich::parse_id(arguments.object_id)?;
+        let metadata = arguments.metadata;
+        let start = arguments.starting_index as usize;
+        let count = arguments.requested_count as usize;
+        let sort = (!arguments.sort.is_empty()).then_some(arguments.sort == "-dc:date");
         let mut view = self.fresh(Scope::Root).await?;
 
         match id {
@@ -1867,6 +1826,8 @@ mod tests {
             ("StartingIndex", "+0", 402),
             ("RequestedCount", "4294967296", 402),
             ("RequestedCount", "", 402),
+            ("Filter", "res,,dc:date", 402),
+            ("Extra", "", 402),
         ] {
             let mut request = action("0", true, 0, 0, "");
             request.arguments.insert(key.into(), value.into());
@@ -1893,6 +1854,14 @@ mod tests {
                 Some(Fault { code: 402 })
             );
         }
+
+        let mut request = action("0", true, 0, 0, "");
+        request.name = "GetSystemUpdateID".into();
+
+        assert_eq!(
+            fixture.library.browse(request).await.err(),
+            Some(Fault { code: 401 })
+        );
 
         assert!(fixture.fake.upstream.lock().unwrap().requests.is_empty());
     }

@@ -382,15 +382,16 @@ impl<C: Catalog> Server<C> {
                         return Ok(empty(StatusCode::SERVICE_UNAVAILABLE));
                     };
 
-                    let filter = protocol::Filter::parse(&action.arguments["Filter"])?;
-                    let object = crate::immich::parse_id(&action.arguments["ObjectID"]).ok();
+                    let args = protocol::browse_arguments(&action)?;
+                    let filter = args.filter;
+                    let object = crate::immich::parse_id(args.object_id).ok();
 
                     tracing::debug!(
                         %peer, ?object,
-                        metadata = action.arguments["BrowseFlag"] == "BrowseMetadata",
-                        starting_index = ?action.arguments["StartingIndex"].parse::<u32>().ok(),
-                        requested_count = ?action.arguments["RequestedCount"].parse::<u32>().ok(),
-                        sort = %action.arguments["SortCriteria"],
+                        metadata = args.metadata,
+                        starting_index = ?Some(args.starting_index),
+                        requested_count = ?Some(args.requested_count),
+                        sort = args.sort,
                         resources_selected = filter.res(),
                         "Browse request"
                     );
