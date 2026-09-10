@@ -29,9 +29,10 @@ use http::{HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
     config::{is_unicast, resolve_interface},
     eventing::Subscriptions,
+    immich::{ObjectId, parse_id},
     lifecycle, limits,
     media::MediaProxy,
-    protocol::{Action, Fault, Object},
+    protocol::{Action, Fault, Object, browse_arguments},
     server::{BrowseResult, Catalog, Server},
     ssdp::Discovery,
 };
@@ -177,30 +178,13 @@ impl Catalog for FixtureCatalog {
     }
 
     async fn browse(&self, action: Action) -> Result<BrowseResult, Fault> {
-        // The production SOAP parser has already validated flags, ui4s and sort syntax.
-        let args = &action.arguments;
-        let raw = &args["ObjectID"];
+        let args = browse_arguments(&action)?;
         let missing = Fault { code: 701 };
 
-        let id = if raw == "0" {
-            "0".to_owned()
-        } else {
-            let rest = raw.strip_prefix("album:").ok_or(missing)?;
-
-            let (album, asset) = match rest.split_once(":asset:") {
-                Some((album, asset)) => (album, Some(asset)),
-                None => (rest, None),
-            };
-
-            let album = Uuid::parse_str(album).map_err(|_| missing)?;
-            let mut id = format!("album:{album}");
-
-            if let Some(asset) = asset {
-                let asset = Uuid::parse_str(asset).map_err(|_| missing)?;
-                id.push_str(&format!(":asset:{asset}"));
-            }
-
-            id
+        let id = match parse_id(args.object_id)? {
+            ObjectId::Root => "0".to_owned(),
+            ObjectId::Album(album) => format!("album:{album}"),
+            ObjectId::Item { album, asset } => format!("album:{album}:asset:{asset}"),
         };
 
         // Full appearance lookup checks album membership as well as both UUIDs.
@@ -210,18 +194,16 @@ impl Catalog for FixtureCatalog {
             .find(|object| object.id == id)
             .ok_or(missing)?;
 
-        let filter = immich_dlna_proxy::protocol::Filter::parse(&args["Filter"])?;
-
         tracing::info!(
             object = %id,
-            metadata = args["BrowseFlag"] == "BrowseMetadata",
-            resources_selected = filter.res(),
-            artwork_selected = filter.art(),
-            duration_selected = filter.duration(),
+            metadata = args.metadata,
+            resources_selected = args.filter.res(),
+            artwork_selected = args.filter.art(),
+            duration_selected = args.filter.duration(),
             "fixture Browse selection"
         );
 
-        if args["BrowseFlag"] == "BrowseMetadata" {
+        if args.metadata {
             return Ok(BrowseResult {
                 objects: vec![object.clone()],
                 total_matches: 1,
@@ -243,7 +225,7 @@ impl Catalog for FixtureCatalog {
         children.sort_by(|a, b| {
             let dates = a.date.cmp(&b.date);
 
-            let dates = if args["SortCriteria"] == "-dc:date" {
+            let dates = if args.sort == "-dc:date" {
                 dates.reverse()
             } else {
                 dates
@@ -254,23 +236,15 @@ impl Catalog for FixtureCatalog {
 
         let total_matches = children.len() as u32;
 
-        let start = args["StartingIndex"]
-            .parse::<u32>()
-            .map_err(|_| Fault { code: 402 })?;
-
-        let count = args["RequestedCount"]
-            .parse::<u32>()
-            .map_err(|_| Fault { code: 402 })?;
-
-        let count = if count == 0 {
+        let count = if args.requested_count == 0 {
             usize::MAX
         } else {
-            count as usize
+            args.requested_count as usize
         };
 
         let objects = children
             .into_iter()
-            .skip(start as usize)
+            .skip(args.starting_index as usize)
             .take(count)
             .cloned()
             .collect();
@@ -1301,6 +1275,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixture_object_ids_follow_production_grammar_and_normalize_aliases() {
+        let album = Uuid::parse_str("abcdef01-2345-4678-9abc-def012345678").unwrap();
+        let asset = Uuid::parse_str("fedcba98-7654-4321-8abc-def012345678").unwrap();
+        let album_id = format!("album:{album}");
+        let item_id = format!("{album_id}:asset:{asset}");
+        let mut objects = fixture_catalog::objects("127.0.0.1:8200".parse().unwrap());
+        objects.truncate(3);
+        objects[1].id = album_id.clone();
+        objects[2].id = item_id.clone();
+        objects[2].parent_id = album_id.clone();
+        let catalog = FixtureCatalog(objects);
+
+        let browse = |id: String| Action {
+            name: "Browse".into(),
+            arguments: [
+                ("ObjectID", id),
+                ("BrowseFlag", "BrowseMetadata".into()),
+                ("Filter", "*".into()),
+                ("StartingIndex", "0".into()),
+                ("RequestedCount", "0".into()),
+                ("SortCriteria", "".into()),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.into(), value))
+            .collect(),
+        };
+
+        for (name, value, code) in [
+            ("ObjectID", None, 402),
+            ("Filter", None, 402),
+            ("BrowseFlag", Some("Unknown"), 402),
+            ("StartingIndex", Some("1"), 402),
+            ("RequestedCount", Some("+1"), 402),
+            ("SortCriteria", Some("+dc:title"), 709),
+            ("Filter", Some("res@@size"), 402),
+        ] {
+            let mut action = browse("0".into());
+
+            if let Some(value) = value {
+                action.arguments.insert(name.into(), value.into());
+            } else {
+                action.arguments.remove(name);
+            }
+
+            assert_eq!(
+                catalog.browse(action).await.err(),
+                Some(Fault { code }),
+                "{name}"
+            );
+        }
+
+        for id in [
+            format!("album:{}", album.urn()),
+            format!("{album_id}:asset:{}", asset.urn()),
+            format!("album:{}:asset:{asset}", album.urn()),
+            format!("ALBUM:{album}"),
+            format!("asset:{asset}"),
+            format!("{album_id}:ASSET:{asset}"),
+            format!("{album_id}:extra"),
+            format!("{item_id}:extra"),
+            format!("{album_id}:asset:"),
+            format!("album::asset:{asset}"),
+            format!(" {album_id}"),
+            format!("{item_id} "),
+            "album:broken".into(),
+            "0:extra".into(),
+            "".into(),
+        ] {
+            assert_eq!(parse_id(&id), Err(Fault { code: 701 }), "{id}");
+
+            assert_eq!(
+                catalog.browse(browse(id.clone())).await.err(),
+                Some(Fault { code: 701 }),
+                "{id}"
+            );
+        }
+
+        for (id, parsed, canonical) in [
+            ("0".into(), ObjectId::Root, "0"),
+            (album_id.clone(), ObjectId::Album(album), album_id.as_str()),
+            (
+                format!("album:{}", album.simple()),
+                ObjectId::Album(album),
+                album_id.as_str(),
+            ),
+            (
+                format!("album:{{{}}}", album.to_string().to_uppercase()),
+                ObjectId::Album(album),
+                album_id.as_str(),
+            ),
+            (
+                item_id.clone(),
+                ObjectId::Item { album, asset },
+                item_id.as_str(),
+            ),
+            (
+                format!("album:{}:asset:{}", album.simple(), asset.simple()),
+                ObjectId::Item { album, asset },
+                item_id.as_str(),
+            ),
+            (
+                format!(
+                    "album:{}:asset:{{{}}}",
+                    album.to_string().to_uppercase(),
+                    asset.to_string().to_uppercase()
+                ),
+                ObjectId::Item { album, asset },
+                item_id.as_str(),
+            ),
+        ] {
+            assert_eq!(parse_id(&id), Ok(parsed), "{id}");
+            let result = catalog.browse(browse(id.clone())).await.unwrap();
+            assert_eq!(result.objects.len(), 1, "{id}");
+            assert_eq!(result.objects[0].id, canonical, "{id}");
+            assert_eq!(result.total_matches, 1);
+        }
+    }
+
+    #[tokio::test]
     async fn descriptions_browse_hierarchy_sort_paging_and_real_filters() {
         let harness = Harness::start().await;
         let objects = fixture_catalog::objects(harness.address);
@@ -1422,6 +1515,22 @@ mod tests {
         for (id, flag, start, sort, filter, code) in [
             ("nonsense", "BrowseMetadata", 0, "", "*", 701),
             ("album:broken", "BrowseMetadata", 0, "", "*", 701),
+            (
+                "album:urn:uuid:10000000-0000-4000-8000-000000000001",
+                "BrowseMetadata",
+                0,
+                "",
+                "*",
+                701,
+            ),
+            (
+                "album:10000000-0000-4000-8000-000000000001:asset:urn:uuid:20000000-0000-4000-8000-000000000001",
+                "BrowseMetadata",
+                0,
+                "",
+                "*",
+                701,
+            ),
             (
                 "album:10000000-0000-4000-8000-000000000099:asset:20000000-0000-4000-8000-000000000001",
                 "BrowseMetadata",
