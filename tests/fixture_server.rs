@@ -802,6 +802,10 @@ mod tests {
         }
 
         async fn start_mode(mode: FixtureMode) -> Self {
+            Self::start_with_catalog(mode, None).await
+        }
+
+        async fn start_with_catalog(mode: FixtureMode, catalog: Option<FixtureCatalog>) -> Self {
             let directory = tempfile::tempdir().unwrap();
 
             let files: &[&str] = if mode == FixtureMode::JpegLabels {
@@ -822,7 +826,7 @@ mod tests {
                     .unwrap();
             }
 
-            let bound = Bound::bind(
+            let mut bound = Bound::bind(
                 SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
                 directory.path().into(),
                 mode,
@@ -834,6 +838,21 @@ mod tests {
                 SocketAddrV4::new(Ipv4Addr::LOCALHOST, bound.http.local_addr().unwrap().port());
 
             let upstream = format!("http://{}", bound.upstream.local_addr().unwrap());
+
+            if let Some(catalog) = catalog {
+                bound.server = Server::new(
+                    "Wire fixture".into(),
+                    bound.uuid,
+                    catalog,
+                    MediaProxy::new(
+                        format!("{upstream}/api/").parse().unwrap(),
+                        HeaderValue::from_static(API_KEY),
+                    )
+                    .unwrap(),
+                    bound.subscriptions.clone(),
+                );
+            }
+
             let stop = CancellationToken::new();
             let task = tokio::spawn(bound.run(None, stop.clone().cancelled_owned()));
 
@@ -1391,6 +1410,117 @@ mod tests {
             assert_eq!(result.objects[0].id, canonical, "{id}");
             assert_eq!(result.total_matches, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn browse_wire_decodes_soap_then_namespaced_didl_and_escape_layers() {
+        use quick_xml::{NsReader, events::BytesStart, events::Event, name::ResolveResult};
+
+        fn start(reader: &mut NsReader<&[u8]>, namespace: &str, name: &str) -> BytesStart<'static> {
+            loop {
+                match reader.read_resolved_event().unwrap() {
+                    (resolved, Event::Start(element)) => {
+                        let actual = match resolved {
+                            ResolveResult::Bound(namespace) => namespace.as_ref().to_vec(),
+                            ResolveResult::Unbound => Vec::new(),
+                            ResolveResult::Unknown(prefix) => panic!("unbound prefix: {prefix:?}"),
+                        };
+
+                        assert_eq!(actual, namespace.as_bytes());
+                        assert_eq!(element.local_name().as_ref(), name.as_bytes());
+
+                        return element.into_owned();
+                    }
+
+                    (_, Event::Decl(_) | Event::End(_)) => {}
+
+                    event => panic!("expected {name}, got {event:?}"),
+                }
+            }
+        }
+
+        fn text(reader: &mut NsReader<&[u8]>, namespace: &str, name: &str) -> String {
+            let element = start(reader, namespace, name);
+            let raw = reader.read_text(element.name()).unwrap();
+
+            quick_xml::escape::unescape(&raw).unwrap().into_owned()
+        }
+
+        const SOAP: &str = "http://schemas.xmlsoap.org/soap/envelope/";
+        const CD: &str = "urn:schemas-upnp-org:service:ContentDirectory:1";
+        const DIDL: &str = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/";
+        const DC: &str = "http://purl.org/dc/elements/1.1/";
+        const UPNP: &str = "urn:schemas-upnp-org:metadata-1-0/upnp/";
+        const TITLE: &str = "Rock & Roll <live> \"encore\" 'take 2' &amp;.jpg";
+        const ART: &str = "http://127.0.0.1:8200/cover?size=preview&label=rock%26roll";
+        const RESOURCE: &str = "http://127.0.0.1:8200/photo?edited=true&label=live%3C2%3E";
+
+        let id = format!("{ALBUM_ID}:asset:{ORIGINAL_JPEG_ID}");
+        let mut object = fixture_catalog::objects("127.0.0.1:8200".parse().unwrap()).remove(2);
+        object.title = TITLE.into();
+        object.art = Some(ART.into());
+        object.resources[0].uri = RESOURCE.into();
+        object.resources.truncate(1);
+
+        let harness =
+            Harness::start_with_catalog(FixtureMode::Baseline, Some(FixtureCatalog(vec![object])))
+                .await;
+
+        let (status, xml) = harness.browse(&id, "BrowseMetadata", "*", 0, 0, "").await;
+
+        assert_eq!(status, StatusCode::OK, "{xml}");
+        let mut soap = NsReader::from_str(&xml);
+        start(&mut soap, SOAP, "Envelope");
+        start(&mut soap, SOAP, "Body");
+        start(&mut soap, CD, "BrowseResponse");
+        let result = text(&mut soap, "", "Result");
+        assert_eq!(text(&mut soap, "", "NumberReturned"), "1");
+        assert_eq!(text(&mut soap, "", "TotalMatches"), "1");
+        assert_eq!(text(&mut soap, "", "UpdateID"), "0");
+
+        let mut didl = NsReader::from_str(&result);
+        start(&mut didl, DIDL, "DIDL-Lite");
+        let item = start(&mut didl, DIDL, "item");
+
+        for (name, expected) in [
+            ("id", id.as_str()),
+            ("parentID", ALBUM_ID),
+            ("restricted", "1"),
+        ] {
+            let attribute = item.try_get_attribute(name).unwrap().unwrap();
+            assert_eq!(attribute.unescape_value().unwrap(), expected);
+        }
+
+        assert_eq!(item.attributes().count(), 3);
+        assert_eq!(text(&mut didl, DC, "title"), TITLE);
+
+        assert_eq!(
+            text(&mut didl, UPNP, "class"),
+            "object.item.imageItem.photo"
+        );
+
+        assert_eq!(text(&mut didl, DC, "date"), "2024-01-01");
+        assert_eq!(text(&mut didl, UPNP, "albumArtURI"), ART);
+        let resource = start(&mut didl, DIDL, "res");
+        let info = resource.try_get_attribute("protocolInfo").unwrap().unwrap();
+        assert_eq!(info.unescape_value().unwrap(), "http-get:*:image/jpeg:*");
+        assert_eq!(resource.attributes().count(), 1);
+        let raw = didl.read_text(resource.name()).unwrap();
+        assert_eq!(quick_xml::escape::unescape(&raw).unwrap(), RESOURCE);
+
+        for reader in [&mut didl, &mut soap] {
+            loop {
+                match reader.read_event().unwrap() {
+                    Event::End(_) => {}
+
+                    Event::Eof => break,
+
+                    event => panic!("unexpected trailing XML: {event:?}"),
+                }
+            }
+        }
+
+        harness.finish().await;
     }
 
     #[tokio::test]
