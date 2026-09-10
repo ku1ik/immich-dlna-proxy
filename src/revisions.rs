@@ -506,7 +506,18 @@ impl Store {
 
         match tokio::time::timeout_at(deadline, worker).await {
             Ok(Ok(Ok(()))) if tokio::time::Instant::now() < deadline => std::mem::forget(guard),
-            Ok(Ok(Err(_))) => fail_stop("revision persistence failed"),
+
+            Ok(Ok(Err(error))) => {
+                tracing::error!(
+                    operation = error.operation,
+                    kind = ?error.kind,
+                    os_code = ?error.os_code,
+                    "revision persistence failed; terminating without publishing candidate state"
+                );
+
+                std::process::exit(1);
+            }
+
             Ok(Err(_)) => fail_stop("revision persistence worker failed"),
             Ok(Ok(Ok(()))) | Err(_) => fail_stop("revision commit exceeded five seconds"),
         }
@@ -518,6 +529,13 @@ fn fail_stop(message: &'static str) -> ! {
     tracing::error!("{message}; terminating without publishing candidate state");
 
     std::process::exit(1);
+}
+
+#[derive(Debug)]
+struct PersistenceError {
+    operation: &'static str,
+    kind: Option<io::ErrorKind>,
+    os_code: Option<i32>,
 }
 
 struct BoundedBytes(Vec<u8>);
@@ -539,58 +557,75 @@ impl Write for BoundedBytes {
 }
 
 impl StoreInner {
-    fn write(&self, ledger: Ledger) -> anyhow::Result<()> {
-        ledger.validate(self.uuid)?;
-        let mut bytes = BoundedBytes(Vec::new());
-        serde_json::to_writer(&mut bytes, &ledger).context("serialize bounded revision state")?;
+    fn write(&self, ledger: Ledger) -> Result<(), PersistenceError> {
+        let mut operation = "validate revision state";
 
-        let mut temporary = open_file(
-            &self.directory,
-            c"revisions.tmp",
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-        )
-        .context("create private revision temporary file")?;
+        let result = (|| {
+            ledger.validate(self.uuid)?;
+            let mut bytes = BoundedBytes(Vec::new());
+            operation = "serialize bounded revision state";
+            serde_json::to_writer(&mut bytes, &ledger)?;
+            operation = "create private revision temporary file";
 
-        check_private(&temporary.metadata()?, false)?;
-        let (first, second) = bytes.0.split_at(bytes.0.len() / 2);
-        temporary.write_all(first).context("write revision state")?;
-        #[cfg(test)]
-        self.inject(tests::Stage::Write)?;
+            let mut temporary = open_file(
+                &self.directory,
+                c"revisions.tmp",
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            )?;
 
-        temporary
-            .write_all(second)
-            .context("write revision state")?;
+            operation = "inspect revision temporary file";
+            check_private(&temporary.metadata()?, false)?;
+            let (first, second) = bytes.0.split_at(bytes.0.len() / 2);
+            operation = "write revision state";
+            temporary.write_all(first)?;
+            #[cfg(test)]
+            self.inject(tests::Stage::Write)?;
+            temporary.write_all(second)?;
+            operation = "flush revision state";
+            temporary.flush()?;
+            operation = "sync revision state";
+            #[cfg(test)]
+            self.inject(tests::Stage::FileSync)?;
+            temporary.sync_all()?;
+            operation = "replace revision state";
+            #[cfg(test)]
+            self.inject(tests::Stage::Rename)?;
 
-        temporary.flush().context("flush revision state")?;
-        #[cfg(test)]
-        self.inject(tests::Stage::FileSync)?;
-        temporary.sync_all().context("sync revision state")?;
-        #[cfg(test)]
-        self.inject(tests::Stage::Rename)?;
+            // SAFETY: both directory descriptors are live; both names are static C
+            // strings. Renaming within this directory provides atomic replacement.
+            let result = unsafe {
+                libc::renameat(
+                    self.directory.as_raw_fd(),
+                    c"revisions.tmp".as_ptr(),
+                    self.directory.as_raw_fd(),
+                    c"revisions.json".as_ptr(),
+                )
+            };
 
-        // SAFETY: both directory descriptors are live; both names are static C
-        // strings. Renaming within this directory provides atomic replacement.
-        let result = unsafe {
-            libc::renameat(
-                self.directory.as_raw_fd(),
-                c"revisions.tmp".as_ptr(),
-                self.directory.as_raw_fd(),
-                c"revisions.json".as_ptr(),
-            )
-        };
+            if result == -1 {
+                return Err(io::Error::last_os_error().into());
+            }
 
-        if result == -1 {
-            return Err(io::Error::last_os_error()).context("replace revision state");
-        }
+            operation = "sync revision directory";
+            #[cfg(test)]
+            self.inject(tests::Stage::DirectorySync)?;
+            self.directory.sync_all()?;
 
-        #[cfg(test)]
-        self.inject(tests::Stage::DirectorySync)?;
+            Ok(())
+        })();
 
-        self.directory
-            .sync_all()
-            .context("sync revision directory")?;
+        // Discard all source text before returning to the logging task.
+        result.map_err(|error: anyhow::Error| {
+            let io = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<io::Error>());
 
-        Ok(())
+            PersistenceError {
+                operation,
+                kind: io.map(io::Error::kind),
+                os_code: io.and_then(io::Error::raw_os_error),
+            }
+        })
     }
 }
 
@@ -626,6 +661,7 @@ mod tests {
     #[derive(Clone, Copy)]
     pub(super) enum Fault {
         Error(Stage),
+        SensitiveError(Stage),
         Crash(Stage),
         Hang,
         Panic,
@@ -636,7 +672,16 @@ mod tests {
         pub(super) fn inject(&self, stage: Stage) -> anyhow::Result<()> {
             match self.fault {
                 Some(Fault::Error(at)) if at == stage => {
-                    return Err(io::Error::from_raw_os_error(libc::EIO).into());
+                    return Err(io::Error::from_raw_os_error(libc::EIO))
+                        .context("/private/state/api-key=secret ledger=private");
+                }
+
+                Some(Fault::SensitiveError(at)) if at == stage => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "/private/state/api-key=secret ledger=private",
+                    ))
+                    .context("private error context");
                 }
 
                 Some(Fault::Crash(at)) if at == stage => std::process::exit(42),
@@ -1533,7 +1578,7 @@ mod tests {
             .env("REVISION_TEST_DIRECTORY", directory)
             .env("REVISION_TEST_MODE", mode)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap()
     }
@@ -1565,6 +1610,12 @@ mod tests {
         let directory = Path::new(&directory);
         let mode = std::env::var("REVISION_TEST_MODE").unwrap();
 
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(io::stderr)
+            .init();
+
         if mode == "noop" {
             return;
         }
@@ -1591,6 +1642,7 @@ mod tests {
             "panic" => Some(Fault::Panic),
             "late-ready" => Some(Fault::LateObservation),
             mode if mode.starts_with("error-") => Some(Fault::Error(stage)),
+            mode if mode.starts_with("sensitive-") => Some(Fault::SensitiveError(stage)),
             mode if mode.starts_with("crash-") => Some(Fault::Crash(stage)),
             _ => None,
         };
@@ -1658,6 +1710,65 @@ mod tests {
                 assert_eq!(recovered, expected);
                 assert!(!temporary.exists());
                 drop(store);
+            }
+        }
+    }
+
+    #[test]
+    fn persistence_diagnostics_exclude_error_payloads() {
+        for (stage, operation) in [
+            ("write", "write revision state"),
+            ("filesync", "sync revision state"),
+            ("rename", "replace revision state"),
+            ("dirsync", "sync revision directory"),
+        ] {
+            for action in ["error", "sensitive"] {
+                let directory = private_directory();
+                let old = populated();
+                install(directory.path(), &old);
+                let mut child = child(directory.path(), &format!("{action}-{stage}"));
+                assert_eq!(wait(&mut child, Duration::from_secs(5)).code(), Some(1));
+                let mut diagnostic = String::new();
+
+                child
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut diagnostic)
+                    .unwrap();
+
+                assert!(diagnostic.contains(operation), "{diagnostic}");
+
+                let (kind, code) = if action == "error" {
+                    (
+                        io::Error::from_raw_os_error(libc::EIO).kind(),
+                        Some(libc::EIO),
+                    )
+                } else {
+                    (io::ErrorKind::PermissionDenied, None)
+                };
+
+                assert!(
+                    diagnostic.contains(&format!("kind=Some({kind:?})")),
+                    "{diagnostic}"
+                );
+
+                assert!(
+                    diagnostic.contains(&format!("os_code={code:?}")),
+                    "{diagnostic}"
+                );
+
+                for private in [
+                    "private",
+                    "api-key",
+                    "secret",
+                    "ledger=",
+                    directory.path().to_str().unwrap(),
+                    &old.server_uuid.to_string(),
+                    &digest(1),
+                ] {
+                    assert!(!diagnostic.contains(private), "{diagnostic}");
+                }
             }
         }
     }
