@@ -252,7 +252,7 @@ impl Ledger {
     }
 }
 
-/// Owns an exclusive process-lifetime lock, also retained by every disk worker.
+/// Owns exclusive directory and file locks, also retained by every disk worker.
 #[derive(Clone)]
 pub struct Store {
     inner: Arc<StoreInner>,
@@ -339,6 +339,19 @@ impl Store {
     /// The configured path may be a symlink, as with systemd DynamicUser; validate
     /// and pin its target. First-install inspection requires Linux procfs.
     pub fn open(directory: &Path, uuid: Uuid) -> anyhow::Result<(Self, Ledger)> {
+        Self::open_inner(
+            directory,
+            uuid,
+            #[cfg(test)]
+            || {},
+        )
+    }
+
+    fn open_inner(
+        directory: &Path,
+        uuid: Uuid,
+        #[cfg(test)] after_lock_open: impl FnOnce(),
+    ) -> anyhow::Result<(Self, Ledger)> {
         ensure!(!uuid.is_nil(), "server UUID must not be nil");
 
         let directory_file = OpenOptions::new()
@@ -348,6 +361,12 @@ impl Store {
             .context("open revision directory")?;
 
         check_private(&directory_file.metadata()?, true)?;
+
+        // Serialize first-install ownership before creating any evidence of state.
+        // Retain this flock on the pinned target for the store/worker lifetime.
+        directory_file
+            .try_lock()
+            .context("revision directory is already locked or cannot be locked")?;
 
         let (lock, created) = match open_file(
             &directory_file,
@@ -367,6 +386,10 @@ impl Store {
 
         check_private(&lock.metadata()?, false)?;
 
+        #[cfg(test)]
+        after_lock_open();
+
+        // Keep the existing lock protocol for processes using only revisions.lock.
         lock.try_lock()
             .context("revision directory is already locked or cannot be locked")?;
 
@@ -708,6 +731,37 @@ mod tests {
         assert_eq!(ledger.albums[&id(2)].contents_digest, Some(digest(3)));
         assert_eq!(ledger.albums[&id(2)].metadata_digest, digest(2));
         assert!(!ledger.albums[&id(2)].present);
+    }
+
+    #[test]
+    fn concurrent_first_installation_preserves_creator_ownership() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        let directory = private_directory();
+
+        let (store, mut ledger) = Store::open_inner(directory.path(), id(1), || {
+            assert!(directory.path().join("revisions.lock").exists());
+
+            // Force the contender into the create/lock gap, without sleeps.
+            let error = thread::scope(|scope| {
+                scope
+                    .spawn(|| Store::open(directory.path(), id(1)).err().unwrap())
+                    .join()
+                    .unwrap()
+            });
+
+            assert!(matches!(
+                error.downcast_ref::<std::fs::TryLockError>(),
+                Some(std::fs::TryLockError::WouldBlock)
+            ));
+        })
+        .unwrap();
+
+        assert_eq!(ledger, empty());
+        ledger.restart();
+        store.inner.write(ledger.clone()).unwrap();
+        drop(store);
+        let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+        assert_eq!(loaded, ledger);
     }
 
     #[test]
@@ -1072,6 +1126,71 @@ mod tests {
     }
 
     #[test]
+    fn directory_lock_precedes_creation_and_existing_file_lock_remains_authoritative() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        let directory = private_directory();
+        let pinned = File::open(directory.path()).unwrap();
+        pinned.try_lock().unwrap();
+        assert!(Store::open(directory.path(), id(1)).is_err());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        drop(pinned);
+
+        install(directory.path(), &populated());
+        put(directory.path(), "revisions.lock", b"");
+        put(directory.path(), "revisions.tmp", b"uncommitted");
+
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.path().join("revisions.lock"))
+            .unwrap();
+
+        lock.try_lock().unwrap();
+        let lock_inode = lock.metadata().unwrap().ino();
+
+        let state_inode = fs::metadata(directory.path().join("revisions.json"))
+            .unwrap()
+            .ino();
+
+        // Simulate an existing process that holds only the original file lock.
+        let error = Store::open(directory.path(), id(1)).err().unwrap();
+
+        assert!(matches!(
+            error.downcast_ref::<std::fs::TryLockError>(),
+            Some(std::fs::TryLockError::WouldBlock)
+        ));
+
+        assert_eq!(
+            fs::read(directory.path().join("revisions.tmp")).unwrap(),
+            b"uncommitted"
+        );
+
+        assert_eq!(
+            fs::metadata(directory.path().join("revisions.json"))
+                .unwrap()
+                .ino(),
+            state_inode
+        );
+
+        lock.unlock().unwrap();
+        let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+        assert_eq!(loaded, populated());
+        assert!(!directory.path().join("revisions.tmp").exists());
+
+        assert!(matches!(
+            lock.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+
+        assert_eq!(
+            fs::metadata(directory.path().join("revisions.lock"))
+                .unwrap()
+                .ino(),
+            lock_inode
+        );
+    }
+
+    #[test]
     fn missing_state_with_any_evidence_fails_and_temporary_is_never_promoted() {
         let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
 
@@ -1320,6 +1439,30 @@ mod tests {
             fs::read_link(&configured).unwrap(),
             Path::new("private/unit")
         );
+    }
+
+    #[test]
+    fn directory_lock_and_writes_remain_on_pinned_symlink_target() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        let layout = private_directory();
+        let original = private_directory();
+        let replacement = private_directory();
+        let configured = layout.path().join("state");
+        symlink(original.path(), &configured).unwrap();
+        let (store, mut ledger) = Store::open(&configured, id(1)).unwrap();
+        fs::remove_file(&configured).unwrap();
+        symlink(replacement.path(), &configured).unwrap();
+        assert!(Store::open(original.path(), id(1)).is_err());
+        assert_eq!(fs::read_dir(replacement.path()).unwrap().count(), 0);
+        let (other, _) = Store::open(&configured, id(2)).unwrap();
+        ledger.restart();
+        store.inner.write(ledger.clone()).unwrap();
+        assert!(!replacement.path().join("revisions.json").exists());
+        drop(store);
+        let (_store, loaded) = Store::open(original.path(), id(1)).unwrap();
+        assert_eq!(loaded, ledger);
+        assert!(Store::open(replacement.path(), id(2)).is_err());
+        drop(other);
     }
 
     #[test]

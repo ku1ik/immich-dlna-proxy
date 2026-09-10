@@ -233,17 +233,7 @@ pub fn validate_state_directory(path: &Path) -> anyhow::Result<()> {
         "state_directory must be private and owned by the service user"
     );
 
-    let probe = path.join(format!(".write-check-{}", Uuid::new_v4()));
-
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&probe)
-        .context("state_directory must be writable")?;
-
-    drop(file);
-    fs::remove_file(probe).context("cannot remove state-directory write check")?;
+    // The locked startup revision commit establishes writability before listeners.
     File::open(path).context("cannot open state_directory")?;
 
     Ok(())
@@ -497,6 +487,41 @@ state_directory = "/var/lib/immich-dlna-proxy"
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(validate_state_directory(directory.path()).is_err());
         assert!(validate_state_directory(&directory.path().join("absent")).is_err());
+    }
+
+    #[test]
+    fn state_validation_never_creates_or_removes_entries() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Observe transient entries too, not just the directory after validation.
+        // SAFETY: inotify_init1 has no memory preconditions and returns an owned fd.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+
+        assert!(fd >= 0);
+
+        // SAFETY: the successful call above transferred ownership of fd.
+        let mut events = unsafe { File::from_raw_fd(fd) };
+        let path = std::ffi::CString::new(directory.path().as_os_str().as_encoded_bytes()).unwrap();
+
+        // SAFETY: events is live and path is a NUL-terminated directory path.
+        let watch = unsafe {
+            libc::inotify_add_watch(
+                events.as_raw_fd(),
+                path.as_ptr(),
+                libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO,
+            )
+        };
+
+        assert!(watch >= 0);
+        validate_state_directory(directory.path()).unwrap();
+
+        assert_eq!(
+            events.read(&mut [0; 4096]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
