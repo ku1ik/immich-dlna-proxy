@@ -548,7 +548,6 @@ async fn connection<C: Catalog, T: AsyncRead + AsyncWrite + Unpin + Send + 'stat
 
     builder
         .keep_alive(false)
-        .half_close(true)
         .max_buf_size(limits::HEADER_BYTES)
         .timer(TokioTimer::new())
         .header_read_timeout(timing.header);
@@ -1463,6 +1462,117 @@ mod tests {
         release.send(true).unwrap();
         task.await.unwrap();
         assert_eq!(server.browses.available_permits(), limits::BROWSES);
+    }
+
+    #[tokio::test]
+    async fn tcp_disconnect_cancels_stalled_media_and_releases_admission() {
+        for body_started in [false, true] {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut server = server(TestCatalog::default());
+
+            server.media = MediaProxy::new(
+                format!("http://{}/api/", upstream.local_addr().unwrap())
+                    .parse()
+                    .unwrap(),
+                HeaderValue::from_static("test-key"),
+            )
+            .unwrap();
+
+            let server = Arc::new(server);
+            let mut connections = Vec::new();
+
+            for _ in 0..limits::MEDIA_OPERATIONS {
+                let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+
+                let (socket, _) = listener.accept().await.unwrap();
+
+                let task = tokio::spawn(connection(
+                    socket,
+                    Ipv4Addr::LOCALHOST,
+                    server.clone(),
+                    CancellationToken::new(),
+                ));
+
+                client
+                    .write_all(
+                        request("GET", &format!("/media/assets/{ASSET}/original"), "", "")
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+
+                let (mut remote, _) = upstream.accept().await.unwrap();
+
+                assert!(
+                    read_headers(&mut remote)
+                        .await
+                        .starts_with("GET /api/assets/")
+                );
+
+                if body_started {
+                    remote.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 2\r\nConnection: close\r\n\r\na").await.unwrap();
+                    status(&read_headers(&mut client).await, 200);
+                    assert_eq!(client.read_u8().await.unwrap(), b'a');
+                }
+
+                connections.push((client, task, remote));
+            }
+
+            let response = server
+                .media
+                .serve(ASSET, "original", Method::GET, HeaderMap::new())
+                .await;
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            for (client, task, mut remote) in connections {
+                socket2::SockRef::from(&client)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+
+                drop(client);
+
+                timeout(Duration::from_secs(2), task)
+                    .await
+                    .expect("client reset must cancel without waiting for upstream progress")
+                    .unwrap();
+
+                let closed = timeout(Duration::from_secs(2), remote.read(&mut [0]))
+                    .await
+                    .unwrap();
+
+                assert!(
+                    matches!(closed, Ok(0))
+                        || closed.is_err_and(|e| e.kind() == io::ErrorKind::ConnectionReset)
+                );
+            }
+
+            // A new admitted request proves that disconnected operations released capacity.
+            let media = server.media.clone();
+
+            let task = tokio::spawn(async move {
+                media
+                    .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
+                    .await
+            });
+
+            let (mut remote, _) = timeout(Duration::from_secs(2), upstream.accept())
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert!(
+                read_headers(&mut remote)
+                    .await
+                    .starts_with("HEAD /api/assets/")
+            );
+
+            remote.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 2\r\nConnection: close\r\n\r\n").await.unwrap();
+            assert_eq!(task.await.unwrap().status(), StatusCode::OK);
+        }
     }
 
     #[tokio::test(start_paused = true)]
