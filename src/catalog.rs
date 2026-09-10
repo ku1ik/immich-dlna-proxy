@@ -506,6 +506,7 @@ impl Library {
                 if let Some(barrier) = barrier {
                     barrier.entered.notify_one();
                     barrier.release.acquire().await.unwrap().forget();
+                    assert!(!barrier.panic, "injected publication panic");
                 }
             }
 
@@ -986,7 +987,7 @@ mod tests {
             }
         }
 
-        fn config(&self, directory: &TempDir) -> Config {
+        fn config(&self, directory: &std::path::Path) -> Config {
             Config {
                 api_base: format!("http://{}/api/", self.address).parse().unwrap(),
                 api_key: HeaderValue::from_static("fake-key"),
@@ -994,7 +995,7 @@ mod tests {
                 friendly_name: "Photos & videos".into(),
                 collator: crate::config::collator("pl").unwrap(),
                 server_uuid: Uuid::from_u128(999),
-                state_directory: directory.path().to_owned(),
+                state_directory: directory.to_owned(),
                 log_level: tracing::Level::INFO,
                 interface: crate::config::Interface {
                     name: "test".into(),
@@ -1071,7 +1072,7 @@ mod tests {
 
             let directory = tempfile::tempdir().unwrap();
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-            let config = fake.config(&directory);
+            let config = fake.config(directory.path());
             let (store, mut ledger) = Store::open(directory.path(), config.server_uuid).unwrap();
             ledger.restart();
             store.persist(ledger.clone()).await;
@@ -1372,7 +1373,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let mut config = fake.config(&directory);
+        let mut config = fake.config(directory.path());
 
         config.listen_address = match address {
             std::net::SocketAddr::V4(address) => address,
@@ -2377,7 +2378,7 @@ mod tests {
         store.persist(restarted.clone()).await;
 
         fixture.library = Library::new(
-            fixture.fake.config(&fixture.directory),
+            fixture.fake.config(fixture.directory.path()),
             store,
             restarted.clone(),
             Subscriptions::new().unwrap(),
@@ -2693,6 +2694,192 @@ mod tests {
         fixture.fake.event(2).await;
         events_stop.cancel();
         events.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_failure_worker() {
+        let Some(directory) = std::env::var_os("CATALOG_TEST_DIRECTORY") else {
+            return;
+        };
+
+        let mode = std::env::var("CATALOG_TEST_MODE").unwrap();
+        let mut fake = Fake::new().await;
+        fake.upstream.lock().unwrap().albums = vec![album(1, "Album")];
+        let config = fake.config(std::path::Path::new(&directory));
+        let (store, mut ledger) = Store::open(&config.state_directory, config.server_uuid).unwrap();
+        ledger.restart();
+        store.persist(ledger.clone()).await;
+
+        let library = Library::new(
+            config,
+            store,
+            ledger,
+            Subscriptions::new().unwrap(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+
+        let supervised = library.clone();
+        let mut supervisor = tokio::spawn(async move { supervised.run().await });
+
+        library.browse(action("0", false, 0, 0, "")).await.unwrap();
+
+        let before = library.inner.state.lock().unwrap().ledger.clone();
+
+        let mut events = tokio::spawn(library.inner.events.clone().run(CancellationToken::new()));
+
+        fake.subscribe(&library);
+        fake.event(before.system_update_id).await;
+        fake.upstream.lock().unwrap().albums = vec![album(1, "Changed")];
+
+        library
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .root
+            .as_mut()
+            .unwrap()
+            .completed -= limits::CATALOG_FRESHNESS;
+
+        let mut barrier = Barrier::new();
+        Arc::get_mut(&mut barrier).unwrap().panic = mode == "panic";
+        *library.inner.publication.lock().unwrap() = Some(barrier.clone());
+        let mut caller = browse(&library, action("0", false, 0, 0, ""));
+        barrier.entered().await;
+        let directory = &library.inner.config.state_directory;
+
+        let committed: Ledger =
+            serde_json::from_slice(&fs::read(directory.join("revisions.json")).unwrap()).unwrap();
+
+        assert_eq!(committed.system_update_id, before.system_update_id + 1);
+        assert_ne!(committed.root_digest, before.root_digest);
+
+        {
+            let state = library.inner.state.lock().unwrap();
+            assert_eq!(state.ledger, before);
+
+            assert_eq!(
+                state.root.as_ref().unwrap().snapshot.albums[&Uuid::from_u128(1)]
+                    .object
+                    .title,
+                "Album"
+            );
+        }
+
+        // A subscription registered after durable completion still sees published state.
+        fake.subscribe(&library);
+        fake.event(before.system_update_id).await;
+        assert!(fake.notifications.try_recv().is_err());
+        assert!(!caller.is_finished());
+
+        fs::write(
+            directory.join("observed-candidate.json"),
+            serde_json::to_vec(&committed).unwrap(),
+        )
+        .unwrap();
+
+        if mode == "panic" {
+            barrier.release.add_permits(1);
+        }
+
+        // Only Publication::drop may end this worker successfully for the parent.
+        tokio::select! {
+            _ = &mut caller => std::process::exit(90),
+
+            _ = &mut supervisor => std::process::exit(91),
+
+            _ = &mut events => std::process::exit(92),
+
+            _ = fake.notifications.recv() => std::process::exit(93),
+
+            _ = tokio::time::sleep(limits::COMMIT_TIMEOUT + Duration::from_secs(1)) => {
+                std::process::exit(94);
+            }
+        }
+    }
+
+    async fn publication_failure(mode: &str) {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let test_name = format!(
+            "{}::publication_failure_worker",
+            module_path!().split_once("::").unwrap().1
+        );
+
+        let mut child = {
+            let _spawn = crate::revisions::SPAWN_OR_REOPEN.lock().unwrap();
+
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env("CATALOG_TEST_DIRECTORY", directory.path())
+                .env("CATALOG_TEST_MODE", mode)
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+
+        let started = std::time::Instant::now();
+
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+
+            if started.elapsed() >= Duration::from_secs(12) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("catalog publication worker exceeded watchdog deadline");
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert_eq!(status.code(), Some(1), "{mode}: {status}");
+
+        let candidate: Ledger = serde_json::from_slice(
+            &fs::read(directory.path().join("observed-candidate.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(candidate.system_update_id, 3);
+        let (store, mut restored) = Store::open(directory.path(), Uuid::from_u128(999)).unwrap();
+        assert_eq!(restored, candidate);
+        restored.restart();
+        store.persist(restored.clone()).await;
+        let mut fake = Fake::new().await;
+        fake.upstream.lock().unwrap().albums = vec![album(1, "Changed")];
+
+        let library = Library::new(
+            fake.config(directory.path()),
+            store,
+            restored.clone(),
+            Subscriptions::new().unwrap(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+
+        let result = library.browse(action("0", false, 0, 0, "")).await.unwrap();
+        assert_eq!(result.objects[0].title, "Changed");
+        assert_eq!(result.update_id, 4);
+        assert_eq!(*library.inner.state.lock().unwrap().ledger, restored);
+        let stop = CancellationToken::new();
+        let events = tokio::spawn(library.inner.events.clone().run(stop.clone()));
+        fake.subscribe(&library);
+        fake.event(4).await;
+        stop.cancel();
+        events.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_timeout_after_persist_fails_stop_and_restores_candidate() {
+        publication_failure("timeout").await;
+    }
+
+    #[tokio::test]
+    async fn publication_panic_after_persist_fails_stop_and_restores_candidate() {
+        publication_failure("panic").await;
     }
 
     #[tokio::test]

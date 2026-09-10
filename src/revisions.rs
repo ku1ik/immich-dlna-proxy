@@ -629,6 +629,11 @@ impl StoreInner {
     }
 }
 
+// Fork temporarily inherits flock descriptors even with CLOEXEC. All subprocess
+// tests share this guard with close/reopen tests until exec closes those copies.
+#[cfg(test)]
+pub(crate) static SPAWN_OR_REOPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,16 +644,10 @@ mod tests {
             process::CommandExt,
         },
         process::{Child, Command, ExitStatus, Stdio},
-        sync::Mutex,
         thread,
         time::{Duration, Instant},
     };
     use tempfile::TempDir;
-
-    // A fork temporarily inherits every test thread's flock descriptors, even
-    // with CLOEXEC. Exclude spawning across fixture close/reopen sequences until
-    // exec has closed those copies; never retry or weaken the production lock.
-    static SPAWN_OR_REOPEN: Mutex<()> = Mutex::new(());
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Stage {
