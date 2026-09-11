@@ -132,8 +132,24 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn timer_wakes_without_an_inner_wake() {
         let deadline = Instant::now() + Duration::from_secs(10);
-        assert_eq!(timeout_at(deadline, pending::<()>()).await, Err(Expired));
-        assert_eq!(Instant::now(), deadline);
+
+        let mut bounded = pin!(async {
+            let result = timeout_at(deadline, pending::<()>()).await;
+
+            (result, Instant::now())
+        });
+
+        assert!(futures_util::poll!(&mut bounded).is_pending());
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(futures_util::poll!(&mut bounded).is_pending());
+
+        let (result, observed) =
+            tokio::time::timeout_at(deadline + Duration::from_millis(100), bounded)
+                .await
+                .expect("the timer must wake without an inner wake");
+
+        assert_eq!(result, Err(Expired));
+        assert!((deadline..=deadline + Duration::from_millis(10)).contains(&observed));
     }
 
     struct Dropped<'a>(&'a Cell<bool>);

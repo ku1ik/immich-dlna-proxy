@@ -83,51 +83,77 @@ pub fn device_description(friendly_name: &str, uuid: uuid::Uuid) -> String {
     )
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub struct Action {
-    pub name: String,
-    pub arguments: BTreeMap<String, String>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Action {
+    Browse(BrowseArguments),
+    GetSearchCapabilities,
+    GetSortCapabilities,
+    GetSystemUpdateId,
+    GetProtocolInfo,
+    GetCurrentConnectionIds,
+    GetCurrentConnectionInfo(i32),
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub struct BrowseArguments<'a> {
-    pub object_id: &'a str,
+impl Action {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Browse(_) => "Browse",
+            Self::GetSearchCapabilities => "GetSearchCapabilities",
+            Self::GetSortCapabilities => "GetSortCapabilities",
+            Self::GetSystemUpdateId => "GetSystemUpdateID",
+            Self::GetProtocolInfo => "GetProtocolInfo",
+            Self::GetCurrentConnectionIds => "GetCurrentConnectionIDs",
+            Self::GetCurrentConnectionInfo(_) => "GetCurrentConnectionInfo",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowseArguments {
+    pub object_id: String,
     pub metadata: bool,
     pub starting_index: u32,
     pub requested_count: u32,
-    pub sort: &'a str,
+    /// None uses catalog order; Some(true) sorts dates descending.
+    pub sort: Option<bool>,
     pub filter: Filter,
 }
 
-/// Validate Browse inputs before catalog access; object identity belongs to the catalog.
-pub fn browse_arguments(action: &Action) -> Result<BrowseArguments<'_>, Fault> {
+fn action_arguments(
+    service: Service,
+    name: &str,
+    mut arguments: BTreeMap<String, String>,
+) -> Result<Action, Fault> {
     let invalid = Fault { code: 402 };
+    let inputs = service.inputs(name)?;
 
-    if action.name != "Browse" {
-        return Err(Fault { code: 401 });
-    }
-
-    let inputs = Service::ContentDirectory.inputs("Browse")?;
-
-    if action.arguments.len() != inputs.len() {
+    // Check the complete shape before value validation, including sort faults.
+    if arguments.len() != inputs.len() || inputs.iter().any(|name| !arguments.contains_key(*name)) {
         return Err(invalid);
     }
 
-    let argument = |name: &str| {
-        action
-            .arguments
-            .get(name)
-            .map(String::as_str)
-            .ok_or(invalid)
-    };
+    match name {
+        "GetSearchCapabilities" => return Ok(Action::GetSearchCapabilities),
+        "GetSortCapabilities" => return Ok(Action::GetSortCapabilities),
+        "GetSystemUpdateID" => return Ok(Action::GetSystemUpdateId),
+        "GetProtocolInfo" => return Ok(Action::GetProtocolInfo),
+        "GetCurrentConnectionIDs" => return Ok(Action::GetCurrentConnectionIds),
 
-    // Check the complete shape before value validation, including sort faults.
-    for name in inputs {
-        argument(name)?;
+        "GetCurrentConnectionInfo" => {
+            let id = arguments["ConnectionID"]
+                .parse::<i32>()
+                .map_err(|_| invalid)?;
+
+            return Ok(Action::GetCurrentConnectionInfo(id));
+        }
+
+        "Browse" => {}
+
+        _ => return Err(Fault { code: 401 }),
     }
 
     let number = |name| {
-        let value = argument(name)?;
+        let value = &arguments[name];
 
         if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(invalid);
@@ -139,7 +165,7 @@ pub fn browse_arguments(action: &Action) -> Result<BrowseArguments<'_>, Fault> {
     let starting_index = number("StartingIndex")?;
     let requested_count = number("RequestedCount")?;
 
-    let metadata = match argument("BrowseFlag")? {
+    let metadata = match arguments["BrowseFlag"].as_str() {
         "BrowseMetadata" => true,
         "BrowseDirectChildren" => false,
         _ => return Err(invalid),
@@ -149,22 +175,23 @@ pub fn browse_arguments(action: &Action) -> Result<BrowseArguments<'_>, Fault> {
         return Err(invalid);
     }
 
-    let sort = argument("SortCriteria")?;
+    let sort = match arguments["SortCriteria"].as_str() {
+        "" => None,
+        "+dc:date" => Some(false),
+        "-dc:date" => Some(true),
+        _ => return Err(Fault { code: 709 }),
+    };
 
-    if !matches!(sort, "" | "+dc:date" | "-dc:date") {
-        return Err(Fault { code: 709 });
-    }
+    let filter = Filter::parse(&arguments["Filter"])?;
 
-    let filter = Filter::parse(argument("Filter")?)?;
-
-    Ok(BrowseArguments {
-        object_id: argument("ObjectID")?,
+    Ok(Action::Browse(BrowseArguments {
+        object_id: arguments.remove("ObjectID").ok_or(invalid)?,
         metadata,
         starting_index,
         requested_count,
         sort,
         filter,
-    })
+    }))
 }
 
 fn xml_char(c: char) -> bool {
@@ -245,10 +272,7 @@ pub fn parse_action(body: &[u8], soap_action: &str, service: Service) -> Result<
     let mut action_seen = false;
     let mut declaration_seen = false;
 
-    let mut action = Action {
-        name: requested.to_owned(),
-        arguments: BTreeMap::new(),
-    };
+    let mut arguments = BTreeMap::new();
 
     loop {
         match reader.read_event().map_err(|_| invalid)? {
@@ -348,11 +372,7 @@ pub fn parse_action(body: &[u8], soap_action: &str, service: Service) -> Result<
                     }
 
                     3 if namespace.is_empty() => {
-                        if action
-                            .arguments
-                            .insert(local.to_owned(), String::new())
-                            .is_some()
-                        {
+                        if arguments.insert(local.to_owned(), String::new()).is_some() {
                             return Err(invalid);
                         }
                     }
@@ -376,11 +396,7 @@ pub fn parse_action(body: &[u8], soap_action: &str, service: Service) -> Result<
                 }
 
                 if stack.len() == 4 {
-                    action
-                        .arguments
-                        .get_mut(&stack[3])
-                        .ok_or(invalid)?
-                        .push_str(&text);
+                    arguments.get_mut(&stack[3]).ok_or(invalid)?.push_str(&text);
                 } else if !text.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n')) {
                     return Err(invalid);
                 }
@@ -393,11 +409,7 @@ pub fn parse_action(body: &[u8], soap_action: &str, service: Service) -> Result<
 
                 let text = text.xml10_content().map_err(|_| invalid)?;
 
-                action
-                    .arguments
-                    .get_mut(&stack[3])
-                    .ok_or(invalid)?
-                    .push_str(&text);
+                arguments.get_mut(&stack[3]).ok_or(invalid)?.push_str(&text);
             }
 
             Event::GeneralRef(reference) => {
@@ -422,7 +434,7 @@ pub fn parse_action(body: &[u8], soap_action: &str, service: Service) -> Result<
                     return Err(invalid);
                 }
 
-                action.arguments.get_mut(&stack[3]).ok_or(invalid)?.push(c);
+                arguments.get_mut(&stack[3]).ok_or(invalid)?.push(c);
             }
 
             Event::Decl(declaration) if !declaration_seen && !envelope_seen => {
@@ -468,30 +480,7 @@ pub fn parse_action(body: &[u8], soap_action: &str, service: Service) -> Result<
         return Err(invalid);
     }
 
-    let inputs = service.inputs(requested)?;
-
-    if requested == "Browse" {
-        browse_arguments(&action)?;
-    } else if action.arguments.len() != inputs.len()
-        || inputs
-            .iter()
-            .any(|name| !action.arguments.contains_key(*name))
-    {
-        return Err(invalid);
-    }
-
-    if requested == "GetCurrentConnectionInfo"
-        && action
-            .arguments
-            .get("ConnectionID")
-            .ok_or(invalid)?
-            .parse::<i32>()
-            .is_err()
-    {
-        return Err(invalid);
-    }
-
-    Ok(action)
+    action_arguments(service, requested, arguments)
 }
 
 fn escaped(c: char, buffer: &mut [u8; 4]) -> &str {
@@ -1031,7 +1020,7 @@ mod tests {
         );
 
         assert_eq!(
-            parse(&xml, "GetSortCapabilities").unwrap().name,
+            parse(&xml, "GetSortCapabilities").unwrap().name(),
             "GetSortCapabilities"
         );
 
@@ -1176,12 +1165,12 @@ mod tests {
             "<ObjectID> Łódź 東京 &#x10400;&#32;&amp;&lt;&gt;&quot;&apos;<![CDATA[<&]]><!--split--> z </ObjectID>",
         );
 
-        assert_eq!(
-            browse(&args).unwrap().arguments["ObjectID"],
-            " Łódź 東京 𐐀 &<>\"'<& z "
-        );
+        let Action::Browse(arguments) = browse(&args).unwrap() else {
+            panic!("expected Browse");
+        };
 
-        assert_eq!(browse(BROWSE_ARGS).unwrap().arguments["SortCriteria"], "");
+        assert_eq!(arguments.object_id, " Łódź 東京 𐐀 &<>\"'<& z ");
+        assert_eq!(arguments.sort, None);
     }
 
     #[test]
@@ -1308,56 +1297,54 @@ mod tests {
     }
 
     #[test]
-    fn browse_arguments_validates_direct_calls_and_fault_precedence() {
-        let valid = browse(BROWSE_ARGS).unwrap();
-        let arguments = browse_arguments(&valid).unwrap();
+    fn soap_browse_validates_shape_and_fault_precedence() {
+        let Action::Browse(arguments) = browse(BROWSE_ARGS).unwrap() else {
+            panic!("expected Browse");
+        };
+
         assert_eq!(arguments.object_id, "0");
         assert!(!arguments.metadata);
         assert_eq!(arguments.starting_index, 0);
         assert_eq!(arguments.requested_count, 0);
-        assert_eq!(arguments.sort, "");
+        assert_eq!(arguments.sort, None);
         assert_eq!(arguments.filter, Filter::parse("*").unwrap());
 
-        for name in valid.arguments.keys() {
-            let mut action = browse(BROWSE_ARGS).unwrap();
-            action.arguments.insert("SortCriteria".into(), "bad".into());
-            action.arguments.remove(name);
-            assert_eq!(browse_arguments(&action), Err(Fault { code: 402 }));
-            action.arguments.insert("Extra".into(), String::new());
-            assert_eq!(browse_arguments(&action), Err(Fault { code: 402 }));
+        for argument in [
+            "<ObjectID>0</ObjectID>",
+            "<BrowseFlag>BrowseDirectChildren</BrowseFlag>",
+            "<Filter>*</Filter>",
+            "<StartingIndex>0</StartingIndex>",
+            "<RequestedCount>0</RequestedCount>",
+            "<SortCriteria/>",
+        ] {
+            let args = BROWSE_ARGS
+                .replace(argument, "")
+                .replace("<SortCriteria/>", "<SortCriteria>bad</SortCriteria>");
+
+            assert_eq!(browse(&args), Err(Fault { code: 402 }));
+            assert_eq!(browse(&(args + "<Extra/>")), Err(Fault { code: 402 }));
         }
 
-        let mut action = valid;
-        action.arguments.insert("Filter".into(), "res,,".into());
-        assert_eq!(browse_arguments(&action), Err(Fault { code: 402 }));
-        action.arguments.insert("SortCriteria".into(), "bad".into());
-        assert_eq!(browse_arguments(&action), Err(Fault { code: 709 }));
-        action.arguments.insert("StartingIndex".into(), "1".into());
+        let args = BROWSE_ARGS.replace("<Filter>*</Filter>", "<Filter>res,,</Filter>");
+        assert_eq!(browse(&args), Err(Fault { code: 402 }));
+        let args = args.replace("<SortCriteria/>", "<SortCriteria>bad</SortCriteria>");
+        assert_eq!(browse(&args), Err(Fault { code: 709 }));
 
-        action
-            .arguments
-            .insert("BrowseFlag".into(), "BrowseMetadata".into());
+        let args = args
+            .replace("<StartingIndex>0", "<StartingIndex>1")
+            .replace("BrowseDirectChildren", "BrowseMetadata");
 
-        assert_eq!(browse_arguments(&action), Err(Fault { code: 402 }));
-        action.arguments.insert("Extra".into(), String::new());
-        action.name = "GetSystemUpdateID".into();
-        assert_eq!(browse_arguments(&action), Err(Fault { code: 401 }));
+        assert_eq!(browse(&args), Err(Fault { code: 402 }));
 
-        let mut action = browse(BROWSE_ARGS).unwrap();
+        let args = BROWSE_ARGS
+            .replace("<ObjectID>0", "<ObjectID>not-an-id")
+            .replace("<StartingIndex>0", "<StartingIndex>4294967295")
+            .replace("<RequestedCount>0", "<RequestedCount>4294967295");
 
-        action
-            .arguments
-            .insert("ObjectID".into(), "not-an-id".into());
+        let Action::Browse(arguments) = browse(&args).unwrap() else {
+            panic!("expected Browse");
+        };
 
-        action
-            .arguments
-            .insert("StartingIndex".into(), u32::MAX.to_string());
-
-        action
-            .arguments
-            .insert("RequestedCount".into(), u32::MAX.to_string());
-
-        let arguments = browse_arguments(&action).unwrap();
         assert_eq!(arguments.object_id, "not-an-id");
         assert_eq!(arguments.starting_index, u32::MAX);
         assert_eq!(arguments.requested_count, u32::MAX);
@@ -1393,13 +1380,21 @@ mod tests {
             browse(&BROWSE_ARGS.replace("<RequestedCount>0", "<RequestedCount>4294967295")).is_ok()
         );
 
-        for sort in ["", "+dc:date", "-dc:date"] {
+        for (sort, expected) in [
+            ("", None),
+            ("+dc:date", Some(false)),
+            ("-dc:date", Some(true)),
+        ] {
             let args = BROWSE_ARGS.replace(
                 "<SortCriteria/>",
                 &format!("<SortCriteria>{sort}</SortCriteria>"),
             );
 
-            assert!(browse(&args).is_ok());
+            let Action::Browse(arguments) = browse(&args).unwrap() else {
+                panic!("expected Browse");
+            };
+
+            assert_eq!(arguments.sort, expected);
         }
 
         for sort in [
@@ -1438,17 +1433,76 @@ mod tests {
 
         assert_eq!(browse(&args), Err(Fault { code: 402 }));
 
-        let xml = request("GetCurrentConnectionInfo", "<ConnectionID>0</ConnectionID>")
+        for (value, expected) in [
+            ("0", Ok(Action::GetCurrentConnectionInfo(0))),
+            ("+1", Ok(Action::GetCurrentConnectionInfo(1))),
+            (
+                "-2147483648",
+                Ok(Action::GetCurrentConnectionInfo(i32::MIN)),
+            ),
+            ("2147483647", Ok(Action::GetCurrentConnectionInfo(i32::MAX))),
+            ("2147483648", Err(Fault { code: 402 })),
+            ("-2147483649", Err(Fault { code: 402 })),
+            ("", Err(Fault { code: 402 })),
+            (" 0", Err(Fault { code: 402 })),
+            ("bad", Err(Fault { code: 402 })),
+        ] {
+            let xml = request(
+                "GetCurrentConnectionInfo",
+                &format!("<ConnectionID>{value}</ConnectionID>"),
+            )
             .replace(CONTENT_DIRECTORY, CONNECTION_MANAGER);
 
-        assert!(
-            parse_action(
-                xml.as_bytes(),
-                &format!("{CONNECTION_MANAGER}#GetCurrentConnectionInfo"),
-                Service::ConnectionManager
-            )
-            .is_ok()
-        );
+            assert_eq!(
+                parse_action(
+                    xml.as_bytes(),
+                    &format!("{CONNECTION_MANAGER}#GetCurrentConnectionInfo"),
+                    Service::ConnectionManager
+                ),
+                expected,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn soap_returns_typed_static_actions_and_rejects_wrong_service_actions() {
+        for (service, action) in [
+            (Service::ContentDirectory, Action::GetSearchCapabilities),
+            (Service::ContentDirectory, Action::GetSortCapabilities),
+            (Service::ContentDirectory, Action::GetSystemUpdateId),
+            (Service::ConnectionManager, Action::GetProtocolInfo),
+            (Service::ConnectionManager, Action::GetCurrentConnectionIds),
+        ] {
+            let name = action.name();
+            let xml = request(name, "").replace(CONTENT_DIRECTORY, service.namespace());
+
+            assert_eq!(
+                parse_action(
+                    xml.as_bytes(),
+                    &format!("{}#{name}", service.namespace()),
+                    service
+                ),
+                Ok(action)
+            );
+        }
+
+        for (service, name) in [
+            (Service::ContentDirectory, "GetProtocolInfo"),
+            (Service::ConnectionManager, "Browse"),
+            (Service::ContentDirectory, "Search"),
+        ] {
+            let xml = request(name, "<Extra/>").replace(CONTENT_DIRECTORY, service.namespace());
+
+            assert_eq!(
+                parse_action(
+                    xml.as_bytes(),
+                    &format!("{}#{name}", service.namespace()),
+                    service
+                ),
+                Err(Fault { code: 401 })
+            );
+        }
     }
 
     #[test]

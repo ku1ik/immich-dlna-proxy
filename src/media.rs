@@ -324,6 +324,17 @@ impl MediaProxy {
         let unsatisfiable =
             unsatisfied_length.is_some_and(|length| range.is_some_and(|r| r.unsatisfiable(length)));
 
+        if status == StatusCode::RANGE_NOT_SATISFIABLE {
+            if range.is_none() {
+                return Err(Failure::Upstream("unsolicited unsatisfied range response"));
+            }
+
+            // Native 416 may omit Content-Range, but supplied framing must agree.
+            if upstream.headers().contains_key(header::CONTENT_RANGE) && !unsatisfiable {
+                return Err(Failure::Upstream("invalid unsatisfied range framing"));
+            }
+        }
+
         if status == StatusCode::NOT_FOUND && unsatisfiable {
             status = StatusCode::RANGE_NOT_SATISFIABLE;
         }
@@ -350,10 +361,6 @@ impl MediaProxy {
             }
 
             StatusCode::RANGE_NOT_SATISFIABLE => {
-                if !unsatisfiable {
-                    return Err(Failure::Upstream("invalid unsatisfied range framing"));
-                }
-
                 safe.remove(header::CONTENT_TYPE);
                 safe.remove(header::CONTENT_LENGTH);
                 let mut result = response(status);
@@ -386,7 +393,7 @@ impl MediaProxy {
         }
 
         let mime = single(&safe, header::CONTENT_TYPE)
-            .and_then(|value| crate::mime::parse(value, false))
+            .and_then(crate::mime::parse)
             .ok_or(Failure::Upstream("missing or invalid media MIME"))?;
 
         if mime.eq_ignore_ascii_case("multipart/byteranges")
@@ -1120,6 +1127,12 @@ mod tests {
     #[tokio::test]
     async fn unsatisfied_ranges_normalize_only_proven_immich_404s() {
         for (upstream_status, range, content_range, expected) in [
+            (416, Some("bytes=10-"), "", 416),
+            (416, Some("bytes=0-2"), "", 416),
+            (416, None, "", 502),
+            (416, Some("bytes=0-1,4-5"), "", 502),
+            (404, Some("bytes=10-"), "", 404),
+            (404, None, "", 404),
             (404, Some("bytes=10-"), "bytes */10", 416),
             (404, Some("bytes=10-20"), "bytes */10", 416),
             (404, Some("bytes=-0"), "bytes */10", 416),
@@ -1130,14 +1143,36 @@ mod tests {
             (404, None, "bytes */0", 404),
             (404, Some("bytes=10-"), "bytes */18446744073709551616", 404),
             (416, Some("bytes=10-"), "bytes */10", 416),
+            (416, Some("bytes=9-"), "bytes */10", 502),
+            (416, Some("bytes=10-"), "bytes 0-2/10", 502),
+            (416, Some("bytes=10-"), "garbage", 502),
+            (416, Some("bytes=10-"), "bytes */18446744073709551616", 502),
+            (
+                416,
+                Some("bytes=10-"),
+                "bytes */10\r\nContent-Range: bytes */10",
+                502,
+            ),
+            (
+                416,
+                Some("bytes=10-"),
+                "bytes */10\r\nConnection: Content-Range",
+                502,
+            ),
             (416, Some("bytes=10-"), "bytes */*", 502),
             (416, None, "bytes */10", 502),
         ] {
+            let framing = if content_range.is_empty() {
+                String::new()
+            } else {
+                format!("Content-Range: {content_range}\r\n")
+            };
+
             let wire = format!(
-                "HTTP/1.1 {upstream_status} Error\r\nContent-Type: application/json\r\nContent-Length: 6\r\nContent-Range: {content_range}\r\nConnection: close\r\n\r\nsecret"
+                "HTTP/1.1 {upstream_status} Error\r\nContent-Type: application/json\r\nContent-Length: 6\r\n{framing}ETag: \"v1\"\r\nAccept-Ranges: bytes\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nSet-Cookie: secret=value\r\nX-Private: secret\r\nConnection: close, Last-Modified\r\n\r\nsecret"
             );
 
-            let server = FakeServer::new(vec![Reply::new(&wire)]).await;
+            let mut server = FakeServer::new(vec![Reply::new(&wire)]).await;
             let input = range.map(|r| headers(&[("range", r)])).unwrap_or_default();
 
             let result = server
@@ -1151,15 +1186,29 @@ mod tests {
                 "{upstream_status}, {range:?}, {content_range}"
             );
 
-            if expected == 416 {
+            if expected == 416 && !content_range.is_empty() {
                 assert_eq!(result.headers()[header::CONTENT_RANGE], content_range);
             } else {
                 assert!(!result.headers().contains_key(header::CONTENT_RANGE));
             }
 
+            if expected != 502 {
+                assert_eq!(result.headers()[header::ETAG], "\"v1\"");
+                assert_eq!(result.headers()[header::ACCEPT_RANGES], "bytes");
+            }
+
+            for name in ["last-modified", "set-cookie", "x-private", "connection"] {
+                assert!(!result.headers().contains_key(name), "{name}");
+            }
+
             assert!(!result.headers().contains_key(header::CONTENT_TYPE));
             assert!(!result.headers().contains_key(header::CONTENT_LENGTH));
             assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
+
+            assert_eq!(
+                request_header(&server.request().await, "range"),
+                range.filter(|value| ByteRange::parse(value).is_some())
+            );
         }
     }
 
@@ -1239,11 +1288,32 @@ mod tests {
             (
                 "preview",
                 "Content-Type: image/jpeg; quality =high\r\n",
-                502,
+                200,
             ),
             (
                 "preview",
                 "Content-Type: image/jpeg; quality= high\r\n",
+                200,
+            ),
+            (
+                "original",
+                "Content-Type: IMAGE/JPEG;; quality \t=\t \"high\"; ; x = y;\r\n",
+                200,
+            ),
+            (
+                "display",
+                "Content-Type: image/jpeg; quality\t=\thigh\r\n",
+                200,
+            ),
+            ("preview", "Content-Type: image/jpeg; x = \r\n", 502),
+            (
+                "preview",
+                "Content-Type: image/jpeg; x = \"v\"oops\r\n",
+                502,
+            ),
+            (
+                "preview",
+                "Content-Type: image/jpeg; x = \"bad\u{7f}\"\r\n",
                 502,
             ),
             ("playback", "Content-Type: Video/MP4\r\n", 200),
@@ -2276,7 +2346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_416_requires_a_demonstrably_unsatisfiable_range() {
+    async fn native_416_with_content_range_requires_consistent_unsatisfied_length() {
         for (range, length, expected) in [
             ("bytes=0-2", 10, StatusCode::BAD_GATEWAY),
             ("bytes=9-", 10, StatusCode::BAD_GATEWAY),

@@ -10,7 +10,7 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
     eventing::Subscriptions,
     media::MediaProxy,
-    protocol::{self, Action, Fault, Object, Service},
+    protocol::{self, BrowseArguments, Fault, Object, Service},
     server::{BrowseResult, Catalog, Server},
 };
 use tokio::{
@@ -46,14 +46,13 @@ impl Catalog for TestCatalog {
         42
     }
 
-    async fn browse(&self, action: Action) -> Result<BrowseResult, Fault> {
-        assert_eq!(action.name, "Browse");
-        assert_eq!(action.arguments["ObjectID"], "0");
-        assert_eq!(action.arguments["BrowseFlag"], "BrowseDirectChildren");
-        assert_eq!(action.arguments["Filter"], "res,sensitiveFilterToken");
-        assert_eq!(action.arguments["StartingIndex"], "3");
-        assert_eq!(action.arguments["RequestedCount"], "2");
-        assert_eq!(action.arguments["SortCriteria"], "-dc:date");
+    async fn browse(&self, arguments: BrowseArguments) -> Result<BrowseResult, Fault> {
+        assert_eq!(arguments.object_id, "0");
+        assert!(!arguments.metadata);
+        assert_eq!(arguments.filter, protocol::Filter::parse("res").unwrap());
+        assert_eq!(arguments.starting_index, 3);
+        assert_eq!(arguments.requested_count, 2);
+        assert_eq!(arguments.sort, Some(true));
 
         Ok(BrowseResult {
             objects: vec![Object {

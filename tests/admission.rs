@@ -4,7 +4,7 @@ use http::HeaderValue;
 use immich_dlna_proxy::{
     eventing::Subscriptions,
     media::MediaProxy,
-    protocol::{Action, Fault},
+    protocol::{BrowseArguments, Fault},
     server::{BrowseResult, Catalog, Server},
 };
 use socket2::SockRef;
@@ -28,7 +28,7 @@ impl Catalog for NoCatalog {
         panic!("media requests must not access the catalog");
     }
 
-    async fn browse(&self, _: Action) -> Result<BrowseResult, Fault> {
+    async fn browse(&self, _: BrowseArguments) -> Result<BrowseResult, Fault> {
         panic!("media requests must not browse");
     }
 }

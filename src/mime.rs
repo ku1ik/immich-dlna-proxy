@@ -1,6 +1,6 @@
 /// Validate a concrete MIME type and its parameters, preserving type/subtype case.
-/// SOAP permits whitespace around parameter `=`; catalog and media values do not.
-pub(crate) fn parse(value: &str, allow_parameter_whitespace: bool) -> Option<&str> {
+/// Accept spaces and tabs around parameter `=`.
+pub(crate) fn parse(value: &str) -> Option<&str> {
     fn token(byte: u8) -> bool {
         byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
     }
@@ -36,17 +36,9 @@ pub(crate) fn parse(value: &str, allow_parameter_whitespace: bool) -> Option<&st
             return None;
         }
 
-        rest = &rest[end..];
-
-        if allow_parameter_whitespace {
-            rest = rest.trim_start_matches([' ', '\t']);
-        }
-
+        rest = rest[end..].trim_start_matches([' ', '\t']);
         rest = rest.strip_prefix('=')?;
-
-        if allow_parameter_whitespace {
-            rest = rest.trim_start_matches([' ', '\t']);
-        }
+        rest = rest.trim_start_matches([' ', '\t']);
 
         if let Some(quoted) = rest.strip_prefix('"') {
             let mut bytes = quoted.bytes();
@@ -125,9 +117,7 @@ mod tests {
                 "application/vnd.a+b",
             ),
         ] {
-            for whitespace in [false, true] {
-                assert_eq!(parse(value, whitespace), Some(expected), "{value:?}");
-            }
+            assert_eq!(parse(value), Some(expected), "{value:?}");
         }
     }
 
@@ -176,22 +166,19 @@ mod tests {
             "image/jpeg; ;\u{a0}",
             "image/jpeg; ;\u{2003}",
         ] {
-            for whitespace in [false, true] {
-                assert_eq!(parse(value, whitespace), None, "{value:?}");
-            }
+            assert_eq!(parse(value), None, "{value:?}");
         }
     }
 
     #[test]
-    fn mime_parameter_whitespace_is_an_explicit_caller_policy() {
+    fn mime_parameter_whitespace_accepts_spaces_and_tabs() {
         for value in [
             "text/xml; charset =utf-8",
             "text/xml; charset= utf-8",
             "text/xml; charset \t=\t \"utf-8\"; a = b",
             "text/xml;; charset \t=\t \"utf-8\"; ; a = b;",
         ] {
-            assert_eq!(parse(value, false), None, "{value:?}");
-            assert_eq!(parse(value, true), Some("text/xml"), "{value:?}");
+            assert_eq!(parse(value), Some("text/xml"), "{value:?}");
         }
     }
 }

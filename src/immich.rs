@@ -853,7 +853,7 @@ fn encoded_size(value: &impl Serialize, limit: usize) -> Result<usize> {
 }
 
 fn media_type(value: &str) -> Option<String> {
-    crate::mime::parse(value, false).map(str::to_ascii_lowercase)
+    crate::mime::parse(value).map(str::to_ascii_lowercase)
 }
 
 #[cfg(test)]
@@ -1338,11 +1338,32 @@ mod tests {
                 "image/jpeg",
             ),
             (Some("image/png"), false, "original", "image/png"),
+            (Some("image/jpeg; q =90"), false, "original", "image/jpeg"),
+            (Some("image/jpeg; q= 90"), false, "original", "image/jpeg"),
+            (
+                Some("IMAGE/JPEG;; q \t=\t \"90\"; ; x = y;"),
+                false,
+                "original",
+                "image/jpeg",
+            ),
             (Some("image/gif"), false, "original", "image/gif"),
             (Some("image/jpeg"), true, "display", "image/jpeg"),
             (Some("image/heic"), false, "display", "image/jpeg"),
             (Some("image/webp"), false, "display", "image/jpeg"),
             (Some("image/jpeg;broken"), false, "display", "image/jpeg"),
+            (Some("image/jpeg; q = "), false, "display", "image/jpeg"),
+            (
+                Some("image/jpeg; q = \"90\"oops"),
+                false,
+                "display",
+                "image/jpeg",
+            ),
+            (
+                Some("image/jpeg; q = \"bad\u{7f}\""),
+                false,
+                "display",
+                "image/jpeg",
+            ),
             (None, false, "display", "image/jpeg"),
         ] {
             let mut dto = asset(1, "IMAGE");
@@ -2152,13 +2173,28 @@ mod tests {
     }
 
     #[test]
-    fn mime_normalization_uses_strict_parameters() {
-        assert_eq!(
-            media_type(" IMAGE/JPEG ; q=90").as_deref(),
-            Some("image/jpeg")
-        );
+    fn mime_normalization_accepts_parameter_whitespace_but_rejects_garbage() {
+        for value in [
+            " IMAGE/JPEG ; q=90",
+            "image/jpeg; q =90",
+            "image/jpeg; q= 90",
+            "IMAGE/JPEG;; q \t=\t \"90\"; ; x = y;",
+        ] {
+            assert_eq!(
+                media_type(value).as_deref(),
+                Some("image/jpeg"),
+                "{value:?}"
+            );
+        }
 
-        assert_eq!(media_type("image/jpeg; q =90"), None);
-        assert_eq!(media_type("image/jpeg; q= 90"), None);
+        for value in [
+            "image/jpeg; q = ",
+            "image/jpeg; q = \"90\"oops",
+            "image/jpeg; q\n=90",
+            "image/jpeg; q=\n90",
+            "image/jpeg; q = \"bad\u{7f}\"",
+        ] {
+            assert_eq!(media_type(value), None, "{value:?}");
+        }
     }
 }

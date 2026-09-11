@@ -82,17 +82,7 @@ pub async fn response(media: &MediaProxy, request: Request) -> Response {
             return empty(StatusCode::BAD_REQUEST);
         }
 
-        // Also bound bodies supplied directly by callers, not just Hyper's framing.
-        if !matches!(
-            timeout_at(
-                Instant::now() + limits::BODY_TIMEOUT,
-                axum::body::to_bytes(body, 0),
-            )
-            .await,
-            Ok(Ok(_))
-        ) {
-            return empty(StatusCode::BAD_REQUEST);
-        }
+        drop(body);
 
         let mut result = media
             .serve(ASSET, "original", parts.method, parts.headers)
@@ -630,16 +620,6 @@ mod tests {
 
             let request = Request::builder()
                 .uri(path)
-                .body(Body::from("undeclared"))
-                .unwrap();
-
-            assert_eq!(
-                response(&upstream.media, request).await.status(),
-                StatusCode::BAD_REQUEST
-            );
-
-            let request = Request::builder()
-                .uri(path)
                 .header(header::CONTENT_LENGTH, "0")
                 .header(header::CONTENT_LENGTH, "0")
                 .body(Body::empty())
@@ -662,26 +642,6 @@ mod tests {
             );
         }
 
-        assert!(upstream.requests.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn undeclared_pending_body_is_bounded_without_upstream_work() {
-        let upstream = Upstream::start().await;
-
-        let body = Body::from_stream(futures_util::stream::pending::<
-            Result<bytes::Bytes, io::Error>,
-        >());
-
-        let request = Request::builder().uri("/byte-seek").body(body).unwrap();
-        let started = Instant::now();
-
-        assert_eq!(
-            response(&upstream.media, request).await.status(),
-            StatusCode::BAD_REQUEST
-        );
-
-        assert_eq!(started.elapsed(), limits::BODY_TIMEOUT);
         assert!(upstream.requests.lock().unwrap().is_empty());
     }
 

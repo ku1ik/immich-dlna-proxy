@@ -21,13 +21,19 @@ use crate::{
     eventing::Subscriptions,
     immich::{self, Contents, FetchBudget, Immich, ObjectId, Root},
     limits,
-    protocol::{Action, Fault, Object, browse_arguments},
+    protocol::{BrowseArguments, Fault, Object},
     revisions::{AlbumRevision, Ledger, Store},
     server::{BrowseResult, Catalog},
 };
 
 const FAILED: Fault = Fault { code: 501 };
 const MISSING: Fault = Fault { code: 701 };
+
+// Eviction always has room for the retained root and the album being published.
+const _: () = {
+    assert!(2 * limits::SNAPSHOT_BYTES <= limits::CACHE_BYTES);
+    assert!(limits::RESIDENT_ALBUMS > 0);
+};
 
 #[derive(Clone)]
 pub struct Library {
@@ -109,14 +115,16 @@ enum Scope {
 }
 
 enum Token {
-    Root(Option<String>),
+    Root,
     Album(Uuid, AlbumRevision),
 }
 
 impl Token {
     fn applicable(&self, ledger: &Ledger) -> bool {
         match self {
-            Self::Root(digest) => &ledger.root_digest == digest,
+            // One root flight exists at a time; only it can change the root digest.
+            Self::Root => true,
+
             Self::Album(id, revision) => {
                 ledger.albums.get(id) == Some(revision) && revision.present
             }
@@ -343,7 +351,7 @@ impl Library {
                     .map_err(|_| FAILED)?;
 
                 let token = match scope {
-                    Scope::Root => Token::Root(state.ledger.root_digest.clone()),
+                    Scope::Root => Token::Root,
                     Scope::Album(id) => Token::Album(id, state.ledger.albums[&id].clone()),
                 };
 
@@ -447,23 +455,15 @@ impl Library {
 
         let deadline = Instant::now() + limits::COMMIT_TIMEOUT;
 
-        let (ledger, root_bytes) = {
+        let ledger = {
             let state = self.inner.state.lock().unwrap();
             ensure!(token.applicable(&state.ledger), "stale catalog candidate");
 
-            (
-                state.ledger.clone(),
-                state.root.as_ref().map_or(0, |root| root.snapshot.bytes),
-            )
+            state.ledger.clone()
         };
 
         let next = match &candidate {
             Candidate::Root(root) => {
-                ensure!(
-                    root.bytes <= self.inner.bounds.bytes,
-                    "root exceeds cache budget"
-                );
-
                 let albums = root
                     .albums
                     .iter()
@@ -473,15 +473,7 @@ impl Library {
                 ledger.root_transition(&root.digest, &albums)?
             }
 
-            Candidate::Album(id, contents) => {
-                ensure!(
-                    self.inner.bounds.albums > 0
-                        && contents.bytes <= self.inner.bounds.bytes.saturating_sub(root_bytes),
-                    "album exceeds cache budget"
-                );
-
-                ledger.contents_transition(*id, &contents.digest)?
-            }
+            Candidate::Album(id, contents) => ledger.contents_transition(*id, &contents.digest)?,
         };
 
         ensure!(
@@ -510,11 +502,10 @@ impl Library {
                 }
             }
 
+            // The commit gate remains owned from applicability checking through
+            // publication, so no other refresh can interleave a ledger write.
             let mut state = self.inner.state.lock().unwrap();
-            ensure!(
-                token.applicable(&state.ledger),
-                "stale catalog candidate at publication"
-            );
+
             ensure!(
                 Instant::now() < deadline,
                 "catalog publication deadline exceeded"
@@ -571,13 +562,10 @@ impl Library {
                     .iter()
                     .filter(|(id, _)| scope != Scope::Album(**id))
                     .min_by_key(|(id, cached)| (cached.used, **id))
-                    .map(|(id, _)| *id);
+                    .map(|(id, _)| *id)
+                    .expect("cache budget fits root and the published album");
 
-                if let Some(oldest) = oldest {
-                    state.albums.remove(&oldest);
-                } else {
-                    return Err(anyhow!("root exceeds cache budget"));
-                }
+                state.albums.remove(&oldest);
             }
 
             if changed {
@@ -624,18 +612,17 @@ impl Catalog for Library {
         self.inner.state.lock().unwrap().ledger.system_update_id
     }
 
-    async fn browse(&self, action: Action) -> Result<BrowseResult, Fault> {
-        let arguments = browse_arguments(&action)?;
-        let id = immich::parse_id(arguments.object_id)?;
-        let metadata = arguments.metadata;
-        let start = arguments.starting_index as usize;
-        let count = arguments.requested_count as usize;
-        let sort = (!arguments.sort.is_empty()).then_some(arguments.sort == "-dc:date");
+    async fn browse(&self, query: BrowseArguments) -> Result<BrowseResult, Fault> {
+        let id = immich::parse_id(&query.object_id)?;
         let mut view = self.fresh(Scope::Root).await?;
 
         match id {
-            ObjectId::Album(album) if !metadata => view = self.fresh(Scope::Album(album)).await?,
+            ObjectId::Album(album) if !query.metadata => {
+                view = self.fresh(Scope::Album(album)).await?
+            }
+
             ObjectId::Item { album, .. } => view = self.fresh(Scope::Album(album)).await?,
+
             _ => {}
         }
 
@@ -661,7 +648,7 @@ impl Catalog for Library {
             }
         };
 
-        if metadata {
+        if query.metadata {
             let object = match id {
                 ObjectId::Root => Object {
                     id: "0".into(),
@@ -697,7 +684,7 @@ impl Catalog for Library {
             ObjectId::Root => {
                 let mut rows: Vec<_> = root.albums.values().collect();
 
-                rows.sort_unstable_by(|a, b| match sort {
+                rows.sort_unstable_by(|a, b| match query.sort {
                     None => b
                         .end_date
                         .cmp(&a.end_date)
@@ -728,13 +715,13 @@ impl Catalog for Library {
 
                 rows.sort_unstable_by(|a, b| {
                     immich::compare_dates(
-                        sort.and(a.object.date.as_deref()),
+                        query.sort.and(a.object.date.as_deref()),
                         a.capture.as_ref(),
                         a.id,
-                        sort.and(b.object.date.as_deref()),
+                        query.sort.and(b.object.date.as_deref()),
                         b.capture.as_ref(),
                         b.id,
-                        sort.unwrap_or(false),
+                        query.sort.unwrap_or(false),
                     )
                 });
 
@@ -754,8 +741,12 @@ impl Catalog for Library {
 
         let objects = rows
             .into_iter()
-            .skip(start)
-            .take(if count == 0 { usize::MAX } else { count })
+            .skip(query.starting_index as usize)
+            .take(if query.requested_count == 0 {
+                usize::MAX
+            } else {
+                query.requested_count as usize
+            })
             .cloned()
             .collect();
 
@@ -1150,36 +1141,34 @@ mod tests {
         })
     }
 
-    fn action(id: &str, metadata: bool, start: u32, count: u32, sort: &str) -> Action {
-        Action {
-            name: "Browse".into(),
-            arguments: BTreeMap::from([
-                ("ObjectID".into(), id.into()),
-                (
-                    "BrowseFlag".into(),
-                    if metadata {
-                        "BrowseMetadata"
-                    } else {
-                        "BrowseDirectChildren"
-                    }
-                    .into(),
-                ),
-                ("Filter".into(), "*".into()),
-                ("StartingIndex".into(), start.to_string()),
-                ("RequestedCount".into(), count.to_string()),
-                ("SortCriteria".into(), sort.into()),
-            ]),
+    fn action(
+        id: &str,
+        metadata: bool,
+        start: u32,
+        count: u32,
+        sort: Option<bool>,
+    ) -> BrowseArguments {
+        BrowseArguments {
+            object_id: id.into(),
+            metadata,
+            starting_index: start,
+            requested_count: count,
+            sort,
+            filter: Filter::parse("*").unwrap(),
         }
     }
 
-    fn children(id: u128) -> Action {
-        action(&format!("album:{}", Uuid::from_u128(id)), false, 0, 0, "")
+    fn children(id: u128) -> BrowseArguments {
+        action(&format!("album:{}", Uuid::from_u128(id)), false, 0, 0, None)
     }
 
-    fn browse(library: &Library, action: Action) -> JoinHandle<Result<BrowseResult, Fault>> {
+    fn browse(
+        library: &Library,
+        query: BrowseArguments,
+    ) -> JoinHandle<Result<BrowseResult, Fault>> {
         let library = library.clone();
 
-        tokio::spawn(async move { library.browse(action).await })
+        tokio::spawn(async move { library.browse(query).await })
     }
 
     async fn fault(task: JoinHandle<Result<BrowseResult, Fault>>, code: u16) {
@@ -1196,20 +1185,15 @@ mod tests {
         use crate::{media::MediaProxy, server::Server};
         use quick_xml::{Reader, events::Event};
 
-        async fn soap(client: &reqwest::Client, base: &str, action: Action) -> (u16, String) {
-            let args: String = action
-                .arguments
-                .iter()
-                .map(|(name, value)| {
-                    format!("<{name}>{}</{name}>", quick_xml::escape::escape(value))
-                })
-                .collect();
-
+        async fn soap(
+            client: &reqwest::Client,
+            base: &str,
+            name: &str,
+            args: &str,
+        ) -> (u16, String) {
             let body = format!(
-                "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:{} xmlns:u=\"{}\">{args}</u:{}></s:Body></s:Envelope>",
-                action.name,
+                "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:{name} xmlns:u=\"{}\">{args}</u:{name}></s:Body></s:Envelope>",
                 protocol::CONTENT_DIRECTORY,
-                action.name,
             );
 
             let response = client
@@ -1217,7 +1201,7 @@ mod tests {
                 .header("content-type", "text/xml; charset=\"utf-8\"")
                 .header(
                     "soapaction",
-                    format!("\"{}#{}\"", protocol::CONTENT_DIRECTORY, action.name),
+                    format!("\"{}#{name}\"", protocol::CONTENT_DIRECTORY),
                 )
                 .body(body)
                 .send()
@@ -1413,12 +1397,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let system = || Action {
-            name: "GetSystemUpdateID".into(),
-            arguments: BTreeMap::new(),
-        };
-
-        let (status, local) = soap(&client, &base, system()).await;
+        let (status, local) = soap(&client, &base, "GetSystemUpdateID", "").await;
         assert_eq!(status, 200);
         assert_eq!(text(&local, "Id"), "1");
         assert_eq!(fixture.disk().1.system_update_id, 1);
@@ -1477,7 +1456,14 @@ mod tests {
                 .is_empty()
         );
 
-        let (status, root) = soap(&client, &base, action("0", false, 0, 0, "")).await;
+        let (status, root) = soap(
+            &client,
+            &base,
+            "Browse",
+            "<ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria/>",
+        )
+        .await;
+
         assert_eq!(status, 200);
         assert_eq!(text(&root, "NumberReturned"), "1");
         assert_eq!(text(&root, "TotalMatches"), "1");
@@ -1493,20 +1479,20 @@ mod tests {
         let (status, metadata) = soap(
             &client,
             &base,
-            action(&format!("album:{album_id}"), true, 0, 0, ""),
+            "Browse",
+            &format!("<ObjectID>album:{album_id}</ObjectID><BrowseFlag>BrowseMetadata</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria/>"),
         )
         .await;
 
         assert_eq!(status, 200);
         assert_eq!(text(&metadata, "UpdateID"), "0");
         assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
-        let mut request = children(1);
 
-        request
-            .arguments
-            .insert("Filter".into(), " dc:date, res@duration ".into());
+        let children = format!(
+            "<ObjectID>album:{album_id}</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter> dc:date, res@duration </Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria/>"
+        );
 
-        let (status, listing) = soap(&client, &base, request).await;
+        let (status, listing) = soap(&client, &base, "Browse", &children).await;
         assert_eq!(status, 200);
         assert_eq!(text(&listing, "NumberReturned"), "2");
         assert_eq!(text(&listing, "TotalMatches"), "2");
@@ -1639,13 +1625,20 @@ mod tests {
             }
         }
 
-        let (status, fault) = soap(&client, &base, action("0", false, 0, 0, "+dc:title")).await;
+        let (status, fault) = soap(
+            &client,
+            &base,
+            "Browse",
+            "<ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria>+dc:title</SortCriteria>",
+        )
+        .await;
+
         assert_eq!(status, 500);
         assert_eq!(text(&fault, "errorCode"), "709");
         assert_eq!(fixture.fake.upstream.lock().unwrap().requests.len(), 4);
         fixture.expire(Scope::Album(album_id));
         fixture.fake.upstream.lock().unwrap().outage = true;
-        let (status, fault) = soap(&client, &base, children(1)).await;
+        let (status, fault) = soap(&client, &base, "Browse", &children).await;
         assert_eq!(status, 500);
         assert_eq!(text(&fault, "errorCode"), "501");
 
@@ -1656,7 +1649,7 @@ mod tests {
         );
 
         let before_local = fixture.fake.upstream.lock().unwrap().requests.len();
-        let (status, local) = soap(&client, &base, system()).await;
+        let (status, local) = soap(&client, &base, "GetSystemUpdateID", "").await;
         assert_eq!(status, 200);
         assert_eq!(text(&local, "Id"), "3");
 
@@ -1673,7 +1666,7 @@ mod tests {
             upstream.contents.get_mut(&album_id).unwrap()[0]["checksum"] = json!("changed");
         }
 
-        let (status, changed) = soap(&client, &base, children(1)).await;
+        let (status, changed) = soap(&client, &base, "Browse", &children).await;
         assert_eq!(status, 200);
         assert_eq!(text(&changed, "UpdateID"), "2");
         let committed = fixture.disk();
@@ -1702,7 +1695,7 @@ mod tests {
 
         assert_eq!(notification["seq"], "1");
         assert_eq!(notification["sid"], sid);
-        let (status, local) = soap(&client, &base, system()).await;
+        let (status, local) = soap(&client, &base, "GetSystemUpdateID", "").await;
         assert_eq!(status, 200);
         assert_eq!(text(&body, "SystemUpdateID"), text(&local, "Id"));
 
@@ -1769,13 +1762,13 @@ mod tests {
 
         assert!(fixture.fake.upstream.lock().unwrap().requests.is_empty());
         fixture.fake.upstream.lock().unwrap().outage = true;
-        fault(browse(&fixture.library, action("0", true, 0, 0, "")), 501).await;
+        fault(browse(&fixture.library, action("0", true, 0, 0, None)), 501).await;
         assert_eq!(fixture.library.system_update_id(), 1);
         fixture.fake.upstream.lock().unwrap().outage = false;
 
         let root = fixture
             .library
-            .browse(action("0", true, 0, 99, ""))
+            .browse(action("0", true, 0, 99, None))
             .await
             .unwrap();
 
@@ -1795,7 +1788,7 @@ mod tests {
                 true,
                 0,
                 0,
-                "-dc:date",
+                Some(true),
             ))
             .await
             .unwrap();
@@ -1815,53 +1808,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_direct_arguments_do_not_panic_or_fetch() {
+    async fn invalid_object_id_fails_before_fetch() {
         let fixture = Fixture::new(1).await;
 
-        for (key, value, code) in [
-            ("ObjectID", "asset:bad", 701),
-            ("SortCriteria", "+dc:title", 709),
-            ("SortCriteria", "+dc:date,-dc:date", 709),
-            ("BrowseFlag", "bad", 402),
-            ("StartingIndex", "1", 402),
-            ("StartingIndex", "+0", 402),
-            ("RequestedCount", "4294967296", 402),
-            ("RequestedCount", "", 402),
-            ("Filter", "res,,dc:date", 402),
-            ("Extra", "", 402),
-        ] {
-            let mut request = action("0", true, 0, 0, "");
-            request.arguments.insert(key.into(), value.into());
-
-            assert_eq!(
-                fixture.library.browse(request).await.err(),
-                Some(Fault { code })
-            );
-        }
-
-        for key in [
-            "ObjectID",
-            "BrowseFlag",
-            "Filter",
-            "StartingIndex",
-            "RequestedCount",
-            "SortCriteria",
-        ] {
-            let mut request = action("0", true, 0, 0, "");
-            request.arguments.remove(key);
-
-            assert_eq!(
-                fixture.library.browse(request).await.err(),
-                Some(Fault { code: 402 })
-            );
-        }
-
-        let mut request = action("0", true, 0, 0, "");
-        request.name = "GetSystemUpdateID".into();
-
         assert_eq!(
-            fixture.library.browse(request).await.err(),
-            Some(Fault { code: 401 })
+            fixture
+                .library
+                .browse(action("asset:bad", true, 0, 0, None))
+                .await
+                .err(),
+            Some(MISSING)
         );
 
         assert!(fixture.fake.upstream.lock().unwrap().requests.is_empty());
@@ -1902,9 +1858,9 @@ mod tests {
         let task = fixture.run();
 
         for (sort, expected) in [
-            ("", [3, 4, 5, 1, 2, 6, 7, 8, 9]),
-            ("+dc:date", [1, 3, 4, 5, 6, 7, 8, 9, 2]),
-            ("-dc:date", [2, 3, 4, 5, 6, 7, 8, 9, 1]),
+            (None, [3, 4, 5, 1, 2, 6, 7, 8, 9]),
+            (Some(false), [1, 3, 4, 5, 6, 7, 8, 9, 2]),
+            (Some(true), [2, 3, 4, 5, 6, 7, 8, 9, 1]),
         ] {
             let full = fixture
                 .library
@@ -1961,7 +1917,7 @@ mod tests {
         }
 
         let task = fixture.run();
-        let request = || action("0", false, 0, 0, "");
+        let request = || action("0", false, 0, 0, None);
         let before = fixture.library.browse(request()).await.unwrap();
         assert_eq!(before.objects[0].title, "Z");
         let disk = fixture.disk().1;
@@ -2071,7 +2027,7 @@ mod tests {
 
         let root = fixture
             .library
-            .browse(action("0", false, 1, 2, ""))
+            .browse(action("0", false, 1, 2, None))
             .await
             .unwrap();
 
@@ -2087,7 +2043,7 @@ mod tests {
 
         let root_date = fixture
             .library
-            .browse(action("0", false, 0, 1, "+dc:date"))
+            .browse(action("0", false, 0, 1, Some(false)))
             .await
             .unwrap();
 
@@ -2106,12 +2062,12 @@ mod tests {
         );
 
         for (sort, titles) in [
-            ("+dc:date", ["Photo 1", "Photo 2", "Photo 3"]),
-            ("-dc:date", ["Photo 2", "Photo 1", "Photo 3"]),
+            (false, ["Photo 1", "Photo 2", "Photo 3"]),
+            (true, ["Photo 2", "Photo 1", "Photo 3"]),
         ] {
             let mut request = children(1);
-            request.arguments.insert("SortCriteria".into(), sort.into());
-            request.arguments.insert("Filter".into(), "".into());
+            request.sort = Some(sort);
+            request.filter = Filter::parse("").unwrap();
             let rows = fixture.library.browse(request).await.unwrap();
             assert_eq!(rows.total_matches, 3);
 
@@ -2138,7 +2094,7 @@ mod tests {
                     false,
                     start,
                     count,
-                    "+dc:date",
+                    Some(false),
                 ))
                 .await
                 .unwrap();
@@ -2155,7 +2111,7 @@ mod tests {
 
         let metadata = fixture
             .library
-            .browse(action(&appearance, true, 0, 0, ""))
+            .browse(action(&appearance, true, 0, 0, None))
             .await
             .unwrap();
 
@@ -2163,7 +2119,7 @@ mod tests {
         assert_eq!(metadata.total_matches, 1);
 
         fault(
-            browse(&fixture.library, action(&appearance, false, 0, 0, "")),
+            browse(&fixture.library, action(&appearance, false, 0, 0, None)),
             710,
         )
         .await;
@@ -2171,13 +2127,13 @@ mod tests {
         let wrong_album = format!("album:{}:asset:{}", Uuid::from_u128(2), Uuid::from_u128(1));
 
         fault(
-            browse(&fixture.library, action(&wrong_album, true, 0, 0, "")),
+            browse(&fixture.library, action(&wrong_album, true, 0, 0, None)),
             701,
         )
         .await;
 
         fault(
-            browse(&fixture.library, action(&wrong_album, false, 0, 0, "")),
+            browse(&fixture.library, action(&wrong_album, false, 0, 0, None)),
             701,
         )
         .await;
@@ -2277,6 +2233,19 @@ mod tests {
     async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
         let mut fixture = Fixture::new(2).await;
 
+        for id in 1..=2 {
+            let mut asset = item(id, None, None);
+            asset["checksum"] = json!("x".repeat(4096));
+
+            fixture
+                .fake
+                .upstream
+                .lock()
+                .unwrap()
+                .contents
+                .insert(Uuid::from_u128(id), vec![asset]);
+        }
+
         let budget = FetchBudget {
             deadline: Instant::now() + limits::REFRESH_PREPARATION_TIMEOUT,
             stop: fixture.library.inner.stop.clone(),
@@ -2284,10 +2253,18 @@ mod tests {
 
         let root = fixture.library.inner.source.root(&budget).await.unwrap();
 
+        let contents = fixture
+            .library
+            .inner
+            .source
+            .contents(Uuid::from_u128(1), &budget)
+            .await
+            .unwrap();
+
         Arc::get_mut(&mut fixture.library.inner)
             .unwrap()
             .bounds
-            .bytes = root.bytes + 2;
+            .bytes = root.bytes + 2 * contents.bytes;
 
         let task = fixture.run();
         fixture.library.browse(children(1)).await.unwrap();
@@ -2296,8 +2273,15 @@ mod tests {
         {
             let state = fixture.library.inner.state.lock().unwrap();
             assert!(state.root.is_some());
-            assert_eq!(state.albums.len(), 1);
+            assert_eq!(state.albums.len(), 2);
             assert_eq!(state.ledger.albums.len(), 2);
+
+            assert!(
+                state
+                    .albums
+                    .values()
+                    .all(|a| a.snapshot.bytes == contents.bytes)
+            );
 
             assert!(
                 state
@@ -2310,16 +2294,47 @@ mod tests {
 
         let before = fixture.disk();
 
-        fixture
-            .fake
-            .upstream
-            .lock()
-            .unwrap()
-            .contents
-            .insert(Uuid::from_u128(1), vec![item(1, None, None)]);
+        fixture.fake.upstream.lock().unwrap().albums[0]["albumName"] =
+            json!("A".repeat(contents.bytes / 2));
 
-        fault(browse(&fixture.library, children(1)), 501).await;
-        assert_eq!(fixture.disk(), before);
+        fixture.expire(Scope::Root);
+
+        fixture
+            .library
+            .browse(action("0", true, 0, 0, None))
+            .await
+            .unwrap();
+
+        {
+            let state = fixture.library.inner.state.lock().unwrap();
+            let root_bytes = state.root.as_ref().unwrap().snapshot.bytes;
+            assert!(root_bytes > root.bytes);
+            assert!(root_bytes + contents.bytes <= fixture.library.inner.bounds.bytes);
+            assert!(root_bytes + 2 * contents.bytes > fixture.library.inner.bounds.bytes);
+            assert_eq!(state.albums.len(), 1);
+            assert!(!state.albums.contains_key(&Uuid::from_u128(1)));
+            assert_eq!(state.ledger.albums.len(), 2);
+
+            for (id, album) in &state.ledger.albums {
+                assert_eq!(album.contents_digest, before.1.albums[id].contents_digest);
+            }
+        }
+
+        let grown = fixture.disk();
+        assert_eq!(grown.1.system_update_id, before.1.system_update_id + 1);
+
+        assert_eq!(
+            grown.1.albums[&Uuid::from_u128(1)].update_id,
+            before.1.albums[&Uuid::from_u128(1)].update_id + 1
+        );
+
+        assert_eq!(
+            grown.1.albums[&Uuid::from_u128(2)],
+            before.1.albums[&Uuid::from_u128(2)]
+        );
+
+        fixture.library.browse(children(1)).await.unwrap();
+        assert_eq!(fixture.disk(), grown);
         fixture.stop(task).await;
     }
 
@@ -2340,7 +2355,7 @@ mod tests {
                 true,
                 0,
                 1,
-                "",
+                None,
             ))
             .await
             .unwrap();
@@ -2408,7 +2423,7 @@ mod tests {
 
         fixture
             .library
-            .browse(action("0", true, 0, 0, ""))
+            .browse(action("0", true, 0, 0, None))
             .await
             .unwrap();
 
@@ -2479,7 +2494,7 @@ mod tests {
 
         fixture
             .library
-            .browse(action("0", true, 0, 0, ""))
+            .browse(action("0", true, 0, 0, None))
             .await
             .unwrap();
 
@@ -2533,7 +2548,7 @@ mod tests {
 
         fixture
             .library
-            .browse(action("0", true, 0, 0, ""))
+            .browse(action("0", true, 0, 0, None))
             .await
             .unwrap();
 
@@ -2560,7 +2575,7 @@ mod tests {
 
         fixture
             .library
-            .browse(action("0", true, 0, 0, ""))
+            .browse(action("0", true, 0, 0, None))
             .await
             .unwrap();
 
@@ -2641,7 +2656,7 @@ mod tests {
                     .insert(Scope::Root, barrier.clone());
             }
 
-            let caller = browse(&fixture.library, action("0", true, 0, 0, ""));
+            let caller = browse(&fixture.library, action("0", true, 0, 0, None));
             barrier.entered().await;
 
             if waiting_gate {
@@ -2660,7 +2675,7 @@ mod tests {
         let mut task = fixture.run();
         let barrier = Barrier::new();
         *fixture.library.inner.publication.lock().unwrap() = Some(barrier.clone());
-        let caller = browse(&fixture.library, action("0", true, 0, 0, ""));
+        let caller = browse(&fixture.library, action("0", true, 0, 0, None));
         barrier.entered().await;
         assert_eq!(fixture.disk().1.system_update_id, 2);
         assert_eq!(fixture.library.system_update_id(), 1);
@@ -2722,7 +2737,10 @@ mod tests {
         let supervised = library.clone();
         let mut supervisor = tokio::spawn(async move { supervised.run().await });
 
-        library.browse(action("0", false, 0, 0, "")).await.unwrap();
+        library
+            .browse(action("0", false, 0, 0, None))
+            .await
+            .unwrap();
 
         let before = library.inner.state.lock().unwrap().ledger.clone();
 
@@ -2745,7 +2763,7 @@ mod tests {
         let mut barrier = Barrier::new();
         Arc::get_mut(&mut barrier).unwrap().panic = mode == "panic";
         *library.inner.publication.lock().unwrap() = Some(barrier.clone());
-        let mut caller = browse(&library, action("0", false, 0, 0, ""));
+        let mut caller = browse(&library, action("0", false, 0, 0, None));
         barrier.entered().await;
         let directory = &library.inner.config.state_directory;
 
@@ -2860,7 +2878,11 @@ mod tests {
         )
         .unwrap();
 
-        let result = library.browse(action("0", false, 0, 0, "")).await.unwrap();
+        let result = library
+            .browse(action("0", false, 0, 0, None))
+            .await
+            .unwrap();
+
         assert_eq!(result.objects[0].title, "Changed");
         assert_eq!(result.update_id, 4);
         assert_eq!(*library.inner.state.lock().unwrap().ledger, restored);
@@ -2889,7 +2911,7 @@ mod tests {
         let mut barrier = Barrier::new();
         Arc::get_mut(&mut barrier).unwrap().panic = true;
         *fixture.library.inner.prepared.lock().unwrap() = Some((Scope::Root, barrier.clone()));
-        let caller = browse(&fixture.library, action("0", true, 0, 0, ""));
+        let caller = browse(&fixture.library, action("0", true, 0, 0, None));
         barrier.entered().await;
         caller.abort();
         barrier.release.add_permits(1);
@@ -2933,7 +2955,7 @@ mod tests {
             .gates
             .insert(Scope::Root, barrier.clone());
 
-        let caller = browse(&fixture.library, action("0", true, 0, 0, ""));
+        let caller = browse(&fixture.library, action("0", true, 0, 0, None));
         barrier.entered().await;
         caller.abort();
         let _ = caller.await;
@@ -2979,7 +3001,7 @@ mod tests {
 
         fixture
             .library
-            .browse(action("0", true, 0, 0, ""))
+            .browse(action("0", true, 0, 0, None))
             .await
             .unwrap();
 
@@ -2988,7 +3010,11 @@ mod tests {
         let appearance = format!("album:{}:asset:{}", Uuid::from_u128(1), Uuid::from_u128(1));
 
         let mut metadata_waiter =
-            Box::pin(fixture.library.browse(action(&appearance, true, 0, 0, "")));
+            Box::pin(
+                fixture
+                    .library
+                    .browse(action(&appearance, true, 0, 0, None)),
+            );
 
         assert!(futures_util::poll!(&mut metadata_waiter).is_pending());
 
@@ -3038,7 +3064,7 @@ mod tests {
 
         fixture
             .library
-            .browse(action("0", true, 0, 0, ""))
+            .browse(action("0", true, 0, 0, None))
             .await
             .unwrap();
 
@@ -3079,7 +3105,7 @@ mod tests {
         );
 
         fixture.expire(Scope::Root);
-        let mut root_waiter = Box::pin(fixture.library.browse(action("0", true, 0, 0, "")));
+        let mut root_waiter = Box::pin(fixture.library.browse(action("0", true, 0, 0, None)));
         assert!(futures_util::poll!(&mut root_waiter).is_pending());
 
         let mut album_waiter = Box::pin(fixture.library.browse(action(
@@ -3087,7 +3113,7 @@ mod tests {
             true,
             0,
             0,
-            "",
+            None,
         )));
 
         assert!(futures_util::poll!(&mut album_waiter).is_pending());
@@ -3100,7 +3126,7 @@ mod tests {
 
         let removed = fixture
             .library
-            .browse(action("0", true, 0, 0, ""))
+            .browse(action("0", true, 0, 0, None))
             .await
             .unwrap();
 

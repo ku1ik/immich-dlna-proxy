@@ -152,16 +152,14 @@ impl Ledger {
         }
     }
 
-    /// `albums` is the complete present map with deterministic metadata digests.
+    /// `albums` is the complete present map with internally generated metadata digests.
+    /// The ledger is validated on load and again before persistence.
     /// `None` means no revision write, even when a snapshot needs a cache refill.
     pub fn root_transition(
         &self,
         root_digest: &str,
         albums: &BTreeMap<Uuid, String>,
     ) -> anyhow::Result<Option<Self>> {
-        self.validate(self.server_uuid)?;
-        validate_digest(root_digest)?;
-
         ensure!(
             albums.len() <= CURRENT_ALBUMS,
             "root exceeds 4096 present albums"
@@ -176,10 +174,6 @@ impl Ledger {
             self.albums.len() + new_identities <= RETAINED_ALBUMS,
             "revision history exhausted; stop the service, archive state, and use a new server UUID and empty private directory"
         );
-
-        for digest in albums.values() {
-            validate_digest(digest)?;
-        }
 
         let mut next = self.clone();
         let mut changed = self.root_digest.as_deref() != Some(root_digest);
@@ -227,9 +221,6 @@ impl Ledger {
     }
 
     pub fn contents_transition(&self, id: Uuid, digest: &str) -> anyhow::Result<Option<Self>> {
-        self.validate(self.server_uuid)?;
-        validate_digest(digest)?;
-
         let album = self.albums.get(&id).filter(|album| album.present);
         let album = album.context("contents transition requires a present album")?;
 
@@ -1663,7 +1654,13 @@ mod tests {
         };
 
         if mode == "invalid" {
-            ledger.root_digest = Some("x".repeat(REVISION_BYTES + 1));
+            ledger = ledger
+                .root_transition(
+                    &"x".repeat(REVISION_BYTES + 1),
+                    &BTreeMap::from([(id(2), digest(2))]),
+                )
+                .unwrap()
+                .unwrap();
         }
 
         if mode == "temp-collision" {

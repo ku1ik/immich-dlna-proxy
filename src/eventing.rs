@@ -1595,10 +1595,22 @@ mod tests {
         tokio::time::advance(limits::EVENT_MODERATION).await;
         tokio::time::resume();
 
+        let mut sequences: std::collections::BTreeMap<_, u32> = tokens
+            .iter()
+            .map(|sid| (format!("uuid:{sid}"), 0))
+            .collect();
+
         for _ in 0..limits::NOTIFICATION_DELIVERIES {
             let (request, body) = callback.next().await;
             assert_eq!(request.headers["seq"], "1");
             assert_eq!(body, event_body(SERVICE, 1));
+
+            let seq = sequences
+                .get_mut(request.headers["sid"].to_str().unwrap())
+                .unwrap();
+
+            assert_eq!(*seq, 0);
+            *seq = 1;
         }
 
         subscriptions.publish(2);
@@ -1624,20 +1636,35 @@ mod tests {
             assert!(state.entries.iter().all(|entry| entry.pending == Some(2)));
         }
 
-        // Even when earlier subscribers are due again, later ones get their turn.
+        // Every subscriber gets the coalesced change, without a global FIFO contract.
         tokio::time::pause();
         tokio::time::advance(limits::EVENT_MODERATION).await;
         tokio::time::resume();
-        callback.release.add_permits(1);
-        let (request, body) = callback.next().await;
-        assert_eq!(request.headers["seq"], "1");
+        let mut seen = std::collections::BTreeSet::new();
 
-        assert_eq!(
-            request.headers["sid"],
-            format!("uuid:{}", tokens[limits::NOTIFICATION_DELIVERIES])
-        );
+        for _ in &tokens {
+            callback.release.add_permits(1);
+            let (request, body) = callback.next().await;
+            let sid = request.headers["sid"].to_str().unwrap();
+            assert!(seen.insert(sid.to_owned()));
+            let seq = sequences.get_mut(sid).unwrap();
+            *seq += 1;
+            assert_eq!(request.headers["seq"], seq.to_string());
+            assert_eq!(body, event_body(SERVICE, 2));
 
-        assert_eq!(body, event_body(SERVICE, 2));
+            assert_eq!(
+                subscriptions
+                    .state
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.delivering)
+                    .count(),
+                limits::NOTIFICATION_DELIVERIES
+            );
+        }
+
         shutdown.cancel();
         task.await.unwrap().unwrap();
         assert!(subscriptions.state.lock().unwrap().entries.is_empty());
@@ -1712,8 +1739,7 @@ mod tests {
             inflight.push_back(last);
             subscriptions.response_complete(target, true);
             subscriptions.response_complete(waiting, true);
-            let mut target_turn = None;
-            let mut seen = std::collections::BTreeSet::new();
+            let mut seen: std::collections::BTreeSet<_> = inflight.iter().copied().collect();
 
             // Removing one completed delivery, then appending 2, 1, 0 entries
             // repeatedly keeps the old numeric cursor skipping T indefinitely.
@@ -1736,10 +1762,6 @@ mod tests {
                 let completed = inflight.pop_front().unwrap();
                 inflight.push_back(sid);
 
-                if sid == target {
-                    target_turn = Some(turn);
-                }
-
                 for _ in 0..2 - turn % 3 {
                     let sid = register(&callback);
                     subscriptions.response_complete(sid, true);
@@ -1749,6 +1771,13 @@ mod tests {
                 assert!((6..=7).contains(&state.entries.len()));
                 assert!(state.entries.iter().all(|entry| !entry.active));
                 assert!(state.entries.iter().all(|entry| entry.sid != completed));
+
+                assert!(inflight.iter().all(|sid| {
+                    state
+                        .entries
+                        .iter()
+                        .any(|entry| entry.sid == *sid && entry.delivering)
+                }));
 
                 assert_eq!(
                     state
@@ -1762,7 +1791,7 @@ mod tests {
 
             shutdown.cancel();
             task.await.unwrap().unwrap();
-            assert_eq!(target_turn, Some(0), "old T must get the first freed slot");
+            assert!(seen.contains(&target), "old T must not starve during churn");
         }
     }
 

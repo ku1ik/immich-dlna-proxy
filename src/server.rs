@@ -22,7 +22,7 @@ use crate::{
     eventing::Subscriptions,
     limits,
     media::MediaProxy,
-    protocol::{self, Fault, Service},
+    protocol::{self, Action, BrowseArguments, Fault, Service},
     transport::{self, WriteDeadline},
 };
 
@@ -31,7 +31,7 @@ pub trait Catalog: Send + Sync + 'static {
     fn system_update_id(&self) -> u32;
     fn browse(
         &self,
-        action: protocol::Action,
+        arguments: BrowseArguments,
     ) -> impl Future<Output = Result<BrowseResult, Fault>> + Send;
 }
 
@@ -349,30 +349,35 @@ impl<C: Catalog> Server<C> {
         // Acquisition has its own HTTP errors; only an acquired body enters SOAP processing.
         let deadline = started + self.timing.processing;
 
-        let action = match crate::deadline::timeout_at(deadline, async {
-            protocol::parse_action(&body, soap_action, service)
-        })
-        .await
-        {
-            Ok(Ok(action)) => action,
+        if Instant::now() >= deadline {
+            return soap(Err(Fault { code: 501 }));
+        }
 
-            Ok(Err(fault)) => {
+        let parsed = protocol::parse_action(&body, soap_action, service);
+
+        if Instant::now() >= deadline {
+            return soap(Err(Fault { code: 501 }));
+        }
+
+        let action = match parsed {
+            Ok(action) => action,
+
+            Err(fault) => {
                 tracing::debug!(%peer, ?service, code = fault.code, "SOAP request rejected");
 
                 return soap(Err(fault));
             }
-
-            Err(_) => return soap(Err(Fault { code: 501 })),
         };
 
-        tracing::debug!(%peer, ?service, action = %action.name, "SOAP action");
+        let name = action.name();
+        tracing::debug!(%peer, ?service, action = name, "SOAP action");
 
         if Instant::now() >= deadline {
             return soap(Err(Fault { code: 501 }));
         }
 
         // Keep admission outside timed execution, including fault construction and handoff.
-        let permit = if action.name == "Browse" {
+        let permit = if matches!(action, Action::Browse(_)) {
             let Ok(permit) = self.browses.clone().try_acquire_owned() else {
                 return empty(StatusCode::SERVICE_UNAVAILABLE);
             };
@@ -383,23 +388,22 @@ impl<C: Catalog> Server<C> {
         };
 
         let result = crate::deadline::timeout_at(deadline, async {
-            let args = match action.name.as_str() {
-                "Browse" => {
-                    let args = protocol::browse_arguments(&action)?;
-                    let filter = args.filter;
-                    let object = crate::immich::parse_id(args.object_id).ok();
+            let args = match action {
+                Action::Browse(args) => {
+                    let filter = args.filter.clone();
+                    let object = crate::immich::parse_id(&args.object_id).ok();
 
                     tracing::debug!(
                         %peer, ?object,
                         metadata = args.metadata,
                         starting_index = ?Some(args.starting_index),
                         requested_count = ?Some(args.requested_count),
-                        sort = args.sort,
+                        sort = ?args.sort,
                         resources_selected = filter.res(),
                         "Browse request"
                     );
 
-                    let result = self.catalog.browse(action).await?;
+                    let result = self.catalog.browse(args).await?;
 
                     if Instant::now() >= deadline {
                         return Err(Fault { code: 501 });
@@ -427,22 +431,24 @@ impl<C: Catalog> Server<C> {
                     return Ok(soap(Ok(envelope)));
                 }
 
-                "GetSearchCapabilities" => vec![("SearchCaps", String::new())],
-                "GetSortCapabilities" => vec![("SortCaps", "dc:date".into())],
-                "GetSystemUpdateID" => {
+                Action::GetSearchCapabilities => vec![("SearchCaps", String::new())],
+                Action::GetSortCapabilities => vec![("SortCaps", "dc:date".into())],
+
+                Action::GetSystemUpdateId => {
                     let id = self.catalog.system_update_id();
                     tracing::debug!(%peer, id, "published update ID");
 
                     vec![("Id", id.to_string())]
                 }
-                "GetProtocolInfo" => {
+
+                Action::GetProtocolInfo => {
                     vec![("Source", "http-get:*:*:*".into()), ("Sink", String::new())]
                 }
 
-                "GetCurrentConnectionIDs" => vec![("ConnectionIDs", "0".into())],
+                Action::GetCurrentConnectionIds => vec![("ConnectionIDs", "0".into())],
 
-                "GetCurrentConnectionInfo" => {
-                    if action.arguments["ConnectionID"].parse::<i32>() != Ok(0) {
+                Action::GetCurrentConnectionInfo(id) => {
+                    if id != 0 {
                         return Err(Fault { code: 706 });
                     }
 
@@ -456,8 +462,6 @@ impl<C: Catalog> Server<C> {
                         ("Status", "Unknown".into()),
                     ]
                 }
-
-                _ => return Err(Fault { code: 401 }),
             };
 
             let args: Vec<_> = args
@@ -467,7 +471,7 @@ impl<C: Catalog> Server<C> {
 
             Ok(soap(protocol::action_response(
                 service,
-                &action.name,
+                name,
                 &args,
             )))
         }).await.unwrap_or(Err(Fault { code: 501 }));
@@ -628,7 +632,7 @@ fn declared_body(headers: &HeaderMap) -> bool {
 }
 
 fn soap_content_type(value: &str) -> bool {
-    crate::mime::parse(value, true).is_some_and(|mime| mime.eq_ignore_ascii_case("text/xml"))
+    crate::mime::parse(value).is_some_and(|mime| mime.eq_ignore_ascii_case("text/xml"))
 }
 
 fn empty(status: StatusCode) -> Response {
@@ -700,7 +704,7 @@ mod tests {
     #[derive(Default)]
     struct TestCatalog {
         calls: AtomicUsize,
-        actions: Mutex<Vec<protocol::Action>>,
+        actions: Mutex<Vec<BrowseArguments>>,
         entered: Notify,
         release: Option<Semaphore>,
         panic: bool,
@@ -712,10 +716,10 @@ mod tests {
             42
         }
 
-        async fn browse(&self, action: protocol::Action) -> Result<BrowseResult, Fault> {
+        async fn browse(&self, arguments: BrowseArguments) -> Result<BrowseResult, Fault> {
             assert!(!self.panic, "test catalog panic");
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.actions.lock().unwrap().push(action);
+            self.actions.lock().unwrap().push(arguments);
             self.entered.notify_one();
 
             if let Some(release) = &self.release {
@@ -948,9 +952,9 @@ mod tests {
 
         let actions = server.catalog.actions.lock().unwrap();
         assert_eq!(actions.len(), 3);
-        assert_eq!(actions[0].arguments["StartingIndex"], "3");
-        assert_eq!(actions[0].arguments["RequestedCount"], "2");
-        assert_eq!(actions[0].arguments["SortCriteria"], "-dc:date");
+        assert_eq!(actions[0].starting_index, 3);
+        assert_eq!(actions[0].requested_count, 2);
+        assert_eq!(actions[0].sort, Some(true));
     }
 
     #[test]
@@ -1028,6 +1032,46 @@ mod tests {
         status(&response, 500);
         assert!(response.contains("<errorCode>501</errorCode>"));
         assert_eq!(server.catalog.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_browse_faults_precede_catalog_and_full_admission() {
+        let server = Arc::new(server(TestCatalog::default()));
+
+        let _permits = server
+            .browses
+            .clone()
+            .try_acquire_many_owned(limits::BROWSES as u32)
+            .unwrap();
+
+        let valid = "<ObjectID>0</ObjectID><BrowseFlag>BrowseMetadata</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria/>";
+
+        for (original, replacement, code) in [
+            ("<ObjectID>0</ObjectID>", "", 402),
+            ("<Filter>*</Filter>", "", 402),
+            ("BrowseMetadata", "Unknown", 402),
+            ("<StartingIndex>0", "<StartingIndex>1", 402),
+            ("<RequestedCount>0", "<RequestedCount>+1", 402),
+            (
+                "<SortCriteria/>",
+                "<SortCriteria>+dc:title</SortCriteria>",
+                709,
+            ),
+            ("<Filter>*", "<Filter>res@@size", 402),
+        ] {
+            let response = exchange(
+                server.clone(),
+                &action(CDS, "Browse", &valid.replace(original, replacement)),
+            )
+            .await;
+
+            status(&response, 500);
+            assert!(response.contains(&format!("<errorCode>{code}</errorCode>")));
+        }
+
+        assert_eq!(server.catalog.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(server.browses.available_permits(), 0);
+        status(&exchange(server.clone(), &browse("*")).await, 503);
     }
 
     #[tokio::test]
@@ -1169,6 +1213,70 @@ mod tests {
             assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
             assert_eq!(server.catalog.calls.load(Ordering::SeqCst), 0);
             assert_eq!(server.browses.available_permits(), limits::BROWSES);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquired_body_processing_deadline_precedes_parse_result_or_fault() {
+        for elapsed in [1, 2, 3] {
+            for valid in [false, true] {
+                let mut server = server(TestCatalog::default());
+                server.timing.processing = Duration::from_secs(2);
+                let wire = browse("*");
+                let (_, body) = wire.split_once("\r\n\r\n").unwrap();
+                let body = if valid { body } else { "<malformed" };
+                let mut headers = HeaderMap::new();
+                headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/xml"));
+
+                headers.insert(
+                    "soapaction",
+                    format!("{}#Browse", protocol::CONTENT_DIRECTORY)
+                        .parse()
+                        .unwrap(),
+                );
+
+                let response = server
+                    .control(
+                        Service::ContentDirectory,
+                        headers,
+                        Body::from(body.to_owned()),
+                        Instant::now() - Duration::from_secs(elapsed),
+                        Ipv4Addr::LOCALHOST,
+                    )
+                    .await;
+
+                let accepted = elapsed < 2 && valid;
+
+                assert_eq!(
+                    response.status(),
+                    if accepted {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                );
+
+                let body = axum::body::to_bytes(response.into_body(), limits::SOAP_RESPONSE_BYTES)
+                    .await
+                    .unwrap();
+
+                if !accepted {
+                    let code = if elapsed < 2 { 402 } else { 501 };
+
+                    assert!(
+                        std::str::from_utf8(&body)
+                            .unwrap()
+                            .contains(&format!("<errorCode>{code}</errorCode>"))
+                    );
+                }
+
+                assert_eq!(
+                    server.catalog.calls.load(Ordering::SeqCst),
+                    usize::from(accepted)
+                );
+
+                assert_eq!(server.browses.available_permits(), limits::BROWSES);
+            }
         }
     }
 
