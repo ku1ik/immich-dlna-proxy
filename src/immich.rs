@@ -17,7 +17,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    limits,
+    deadline, limits,
     protocol::{Fault, Object, Resource},
 };
 
@@ -304,12 +304,17 @@ impl Immich {
         // Recheck immediately before allowing another HTTP request to start.
         budget.check()?;
 
-        let mut response = tokio::time::timeout(limits::UPSTREAM_HEADER_TIMEOUT, request.send())
-            .await
-            .map_err(|_| anyhow!("Immich catalog response-header deadline exceeded"))?
-            .map_err(|_| anyhow!("Immich catalog connection failed"))?;
+        let header_deadline = budget
+            .deadline
+            .min(Instant::now() + limits::UPSTREAM_HEADER_TIMEOUT);
+
+        let response = deadline::timeout_at(header_deadline, async { request.send().await }).await;
 
         budget.check()?;
+
+        let mut response = response
+            .map_err(|_| anyhow!("Immich catalog response-header deadline exceeded"))?
+            .map_err(|_| anyhow!("Immich catalog connection failed"))?;
 
         ensure!(
             response.status().is_success(),
@@ -979,6 +984,117 @@ mod tests {
             .project(ALBUM, serde_json::from_value(value).unwrap(), &mut 0)
             .unwrap()
             .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_headers_before_at_and_after_header_or_preparation_deadline() {
+        use std::{future::Future, task::Wake, time::Duration};
+
+        use futures_util::FutureExt;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            sync::Notify,
+        };
+
+        struct HeaderWake(Notify);
+
+        impl Wake for HeaderWake {
+            fn wake(self: Arc<Self>) {
+                self.0.notify_one();
+            }
+        }
+
+        // Let loopback I/O progress without auto-advancing the paused clock.
+        let clock_guard = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+
+        for preparation in [Duration::from_secs(10), limits::REFRESH_PREPARATION_TIMEOUT] {
+            let limit = preparation.min(limits::UPSTREAM_HEADER_TIMEOUT);
+
+            for elapsed in [
+                limit - Duration::from_secs(1),
+                limit,
+                limit + Duration::from_secs(1),
+            ] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+                let immich = Immich::new(
+                    format!("http://{}/api/", listener.local_addr().unwrap())
+                        .parse()
+                        .unwrap(),
+                    HeaderValue::from_static("private-test-key"),
+                    "192.0.2.1:8200".parse().unwrap(),
+                    "Photos".into(),
+                )
+                .unwrap();
+
+                let started = Instant::now();
+
+                let budget = FetchBudget {
+                    deadline: started + preparation,
+                    ..budget()
+                };
+
+                let request = immich.json::<Value>(
+                    immich.client.get(immich.api_base.join("albums").unwrap()),
+                    &budget,
+                );
+
+                tokio::pin!(request);
+
+                let mut socket = tokio::select! {
+                    _ = &mut request => panic!("request ended before headers"),
+                    accepted = listener.accept() => accepted.unwrap().0,
+                };
+
+                let read_request = async {
+                    let mut bytes = Vec::new();
+
+                    while !bytes.ends_with(b"\r\n\r\n") {
+                        bytes.push(socket.read_u8().await.unwrap());
+                    }
+                };
+
+                tokio::select! {
+                    _ = &mut request => panic!("request ended before headers"),
+                    _ = read_request => {}
+                }
+
+                let wake = Arc::new(HeaderWake(Notify::new()));
+                let waker = std::task::Waker::from(wake.clone());
+                let mut context = std::task::Context::from_waker(&waker);
+                assert!(request.as_mut().poll(&mut context).is_pending());
+                let _ = wake.0.notified().now_or_never();
+
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]")
+                    .await
+                    .unwrap();
+
+                wake.0.notified().await;
+                assert_eq!(Instant::now(), started);
+                tokio::time::advance(elapsed).await;
+                let result = request.await;
+
+                if elapsed < limit {
+                    assert_eq!(result.unwrap(), json!([]));
+                } else {
+                    let expected = if preparation <= limits::UPSTREAM_HEADER_TIMEOUT {
+                        "Immich catalog refresh preparation deadline exceeded"
+                    } else {
+                        "Immich catalog response-header deadline exceeded"
+                    };
+
+                    assert_eq!(result.unwrap_err().to_string(), expected);
+                }
+            }
+        }
+
+        clock_guard.abort();
+        let _ = clock_guard.await;
     }
 
     async fn processing_boundary(cancel: bool) {
@@ -1924,6 +2040,65 @@ mod tests {
         drop(listener);
         let error = format!("{:#}", immich.root(&budget()).await.unwrap_err());
         assert_eq!(error, "Immich catalog connection failed");
+    }
+
+    #[tokio::test]
+    async fn stalled_headers_are_capped_by_remaining_preparation_budget() {
+        use std::time::Duration;
+
+        use tokio::io::AsyncReadExt;
+
+        let fake = Fake::new(vec![]).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut immich = fake.immich.clone();
+
+        immich.api_base =
+            Url::parse(&format!("http://{}/api/", listener.local_addr().unwrap())).unwrap();
+
+        let budget = FetchBudget {
+            deadline: Instant::now() + Duration::from_secs(10),
+            ..budget()
+        };
+
+        // No outer timeout: the header wait must enforce the remaining budget itself.
+        let fetch = immich.root(&budget);
+        tokio::pin!(fetch);
+
+        let (mut socket, _) = tokio::select! {
+            _ = &mut fetch => panic!("fetch completed before connection"),
+
+            accepted = listener.accept() => accepted.unwrap(),
+        };
+
+        tokio::select! {
+            _ = &mut fetch => panic!("fetch completed before headers"),
+
+            _ = async {
+                let mut request = Vec::new();
+
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+            } => {}
+        }
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(9)).await;
+        assert!(futures_util::poll!(&mut fetch).is_pending());
+
+        // Observe the timer after its resolution boundary, still before the
+        // uncapped fifteen-second header deadline would expire.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let now = Instant::now();
+        let error = fetch.await.unwrap_err();
+        assert_eq!(Instant::now(), now);
+
+        assert_eq!(
+            error.to_string(),
+            "Immich catalog refresh preparation deadline exceeded"
+        );
+
+        assert_eq!(socket.read(&mut [0; 1]).await.unwrap(), 0);
     }
 
     #[tokio::test]

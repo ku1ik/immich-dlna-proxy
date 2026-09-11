@@ -11,7 +11,7 @@ mod seek;
 mod loopback_eventing;
 
 #[cfg(test)]
-use immich_dlna_proxy::{protocol, server_header};
+use immich_dlna_proxy::{deadline, protocol, server_header};
 
 use std::{
     future::Future,
@@ -841,7 +841,7 @@ mod tests {
 
             if let Some(catalog) = catalog {
                 bound.server = Server::new(
-                    "Wire fixture".into(),
+                    "Wire\rfixture\r\nname".into(),
                     bound.uuid,
                     catalog,
                     MediaProxy::new(
@@ -1441,9 +1441,43 @@ mod tests {
 
         fn text(reader: &mut NsReader<&[u8]>, namespace: &str, name: &str) -> String {
             let element = start(reader, namespace, name);
-            let raw = reader.read_text(element.name()).unwrap();
 
-            quick_xml::escape::unescape(&raw).unwrap().into_owned()
+            content(reader, &element)
+        }
+
+        fn content(reader: &mut NsReader<&[u8]>, element: &BytesStart<'_>) -> String {
+            let mut value = String::new();
+
+            loop {
+                match reader.read_event().unwrap() {
+                    Event::Text(text) => value.push_str(&text.xml10_content().unwrap()),
+
+                    Event::GeneralRef(reference) => {
+                        let c = if let Some(c) = reference.resolve_char_ref().unwrap() {
+                            c
+                        } else {
+                            match reference.decode().unwrap().as_ref() {
+                                "amp" => '&',
+                                "lt" => '<',
+                                "gt" => '>',
+                                "quot" => '"',
+                                "apos" => '\'',
+                                name => panic!("unexpected reference: {name}"),
+                            }
+                        };
+
+                        value.push(c);
+                    }
+
+                    Event::End(end) => {
+                        assert_eq!(end.name(), element.name());
+
+                        return value;
+                    }
+
+                    event => panic!("unexpected text content: {event:?}"),
+                }
+            }
         }
 
         const SOAP: &str = "http://schemas.xmlsoap.org/soap/envelope/";
@@ -1451,9 +1485,18 @@ mod tests {
         const DIDL: &str = "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/";
         const DC: &str = "http://purl.org/dc/elements/1.1/";
         const UPNP: &str = "urn:schemas-upnp-org:metadata-1-0/upnp/";
-        const TITLE: &str = "Rock & Roll <live> \"encore\" 'take 2' &amp;.jpg";
+        const DEVICE: &str = "urn:schemas-upnp-org:device-1-0";
+        const TITLE: &str = "Rock & Roll <live>\r\"encore\"\r\n 'take 2'\t&amp;.jpg\n";
         const ART: &str = "http://127.0.0.1:8200/cover?size=preview&label=rock%26roll";
         const RESOURCE: &str = "http://127.0.0.1:8200/photo?edited=true&label=live%3C2%3E";
+
+        let mut normalization =
+            NsReader::from_str("<title>raw\rline\r\nnext&#13;&#xD;&amp;#13;</title>");
+
+        assert_eq!(
+            text(&mut normalization, "", "title"),
+            "raw\nline\nnext\r\r&#13;"
+        );
 
         let id = format!("{ALBUM_ID}:asset:{ORIGINAL_JPEG_ID}");
         let mut object = fixture_catalog::objects("127.0.0.1:8200".parse().unwrap()).remove(2);
@@ -1505,8 +1548,7 @@ mod tests {
         let info = resource.try_get_attribute("protocolInfo").unwrap().unwrap();
         assert_eq!(info.unescape_value().unwrap(), "http-get:*:image/jpeg:*");
         assert_eq!(resource.attributes().count(), 1);
-        let raw = didl.read_text(resource.name()).unwrap();
-        assert_eq!(quick_xml::escape::unescape(&raw).unwrap(), RESOURCE);
+        assert_eq!(content(&mut didl, &resource), RESOURCE);
 
         for reader in [&mut didl, &mut soap] {
             loop {
@@ -1519,6 +1561,33 @@ mod tests {
                 }
             }
         }
+
+        let description = harness
+            .client
+            .get(harness.url("/device.xml"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        let mut device = NsReader::from_str(&description);
+        start(&mut device, DEVICE, "root");
+        start(&mut device, DEVICE, "specVersion");
+        assert_eq!(text(&mut device, DEVICE, "major"), "1");
+        assert_eq!(text(&mut device, DEVICE, "minor"), "0");
+        start(&mut device, DEVICE, "device");
+
+        assert_eq!(
+            text(&mut device, DEVICE, "deviceType"),
+            "urn:schemas-upnp-org:device:MediaServer:1"
+        );
+
+        assert_eq!(
+            text(&mut device, DEVICE, "friendlyName"),
+            "Wire\rfixture\r\nname"
+        );
 
         harness.finish().await;
     }

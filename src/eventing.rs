@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{limits, protocol::Service};
+use crate::{deadline, limits, protocol::Service};
 
 #[derive(Clone)]
 pub struct Subscriptions {
@@ -579,15 +579,11 @@ async fn deliver(
                 .header(header::ACCEPT_ENCODING, "identity")
                 .body(body.clone());
 
-            let mut response = tokio::time::timeout_at(header_deadline, request.send())
-                .await
-                .ok()?
-                .ok()?;
-
-            // Timeout polls the response first, so a ready result can already be late.
-            if Instant::now() >= header_deadline {
-                return None;
-            }
+            let mut response =
+                deadline::timeout_at(header_deadline, async { request.send().await })
+                    .await
+                    .ok()?
+                    .ok()?;
 
             let status = response.status();
 
@@ -615,11 +611,7 @@ async fn deliver(
             Some(status)
         };
 
-        let result = tokio::time::timeout_at(deadline, attempt).await;
-
-        if Instant::now() >= deadline {
-            continue;
-        }
+        let result = deadline::timeout_at(deadline, attempt).await;
 
         match result {
             Ok(Some(StatusCode::OK)) => {

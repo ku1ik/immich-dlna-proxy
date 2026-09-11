@@ -1,25 +1,22 @@
 //! Fixture-only comparison of otherwise identical original-video responses.
 
-use std::{
-    future::Future,
-    io,
-    pin::Pin,
-    task::{Context, Poll},
-};
+use std::sync::{Arc, Mutex};
 
 use axum::{Router, body::Body, extract::Request, response::Response};
 use http::{HeaderValue, Method, StatusCode, header};
-use hyper::server::conn::http1;
-use hyper_util::{
-    rt::{TokioIo, TokioTimer},
-    service::TowerToHyperService,
+use hyper_util::{rt::TokioIo, service::TowerToHyperService};
+use immich_dlna_proxy::{
+    deadline::timeout_at,
+    limits,
+    media::MediaProxy,
+    transport::{self, WriteDeadline},
 };
-use immich_dlna_proxy::{limits, media::MediaProxy};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncWrite},
     net::TcpListener,
+    sync::OwnedSemaphorePermit,
     task::JoinSet,
-    time::{Instant, Sleep, timeout, timeout_at},
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -87,7 +84,11 @@ pub async fn response(media: &MediaProxy, request: Request) -> Response {
 
         // Also bound bodies supplied directly by callers, not just Hyper's framing.
         if !matches!(
-            timeout(limits::BODY_TIMEOUT, axum::body::to_bytes(body, 0)).await,
+            timeout_at(
+                Instant::now() + limits::BODY_TIMEOUT,
+                axum::body::to_bytes(body, 0),
+            )
+            .await,
             Ok(Ok(_))
         ) {
             return empty(StatusCode::BAD_REQUEST);
@@ -143,12 +144,6 @@ pub async fn run(
     let mut tasks = JoinSet::new();
     let mut failure = None;
 
-    let router = Router::new().fallback(move |request| {
-        let media = media.clone();
-
-        async move { response(&media, request).await }
-    });
-
     loop {
         tokio::select! {
             biased;
@@ -181,32 +176,7 @@ pub async fn run(
                     continue;
                 }
 
-                let router = router.clone();
-
-                tasks.spawn(async move {
-                    let mut builder = http1::Builder::new();
-
-                    builder
-                        .keep_alive(false)
-                        .half_close(true)
-                        .max_buf_size(limits::HEADER_BYTES)
-                        .timer(TokioTimer::new())
-                        .header_read_timeout(limits::HEADER_TIMEOUT);
-
-                    let transport = WriteDeadline {
-                        io: socket,
-                        blocked: None,
-                    };
-
-                    if builder
-                        .serve_connection(TokioIo::new(transport), TowerToHyperService::new(router))
-                        .await
-                        .is_err()
-                    {
-                        // Client framing, disconnects and timeouts are not listener failures.
-                        tracing::debug!("fixture seek connection transport or framing failure");
-                    }
-                });
+                tasks.spawn(connection(socket, media.clone()));
             }
         }
     }
@@ -254,77 +224,45 @@ pub async fn run(
     }
 }
 
-// Only blocked writes count as downstream idle time, not waiting for upstream bytes.
-struct WriteDeadline<T> {
-    io: T,
-    blocked: Option<Pin<Box<Sleep>>>,
-}
+async fn connection<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(io: T, media: MediaProxy) {
+    let permit = Arc::new(Mutex::new(None));
+    let admitted = permit.clone();
 
-impl<T> WriteDeadline<T> {
-    fn progress<R>(
-        &mut self,
-        cx: &mut Context<'_>,
-        result: Poll<io::Result<R>>,
-    ) -> Poll<io::Result<R>> {
-        if result.is_ready() {
-            self.blocked = None;
+    let router = Router::new().fallback(move |request| {
+        let media = media.clone();
+        let admitted = admitted.clone();
 
-            return result;
+        async move {
+            let mut response = response(&media, request).await;
+
+            *admitted.lock().unwrap() = response
+                .extensions_mut()
+                .remove::<Arc<OwnedSemaphorePermit>>();
+
+            response
         }
+    });
 
-        let timer = self
-            .blocked
-            .get_or_insert_with(|| Box::pin(tokio::time::sleep(limits::STREAM_IDLE_TIMEOUT)));
+    let transport = WriteDeadline::new(io, limits::STREAM_IDLE_TIMEOUT);
 
-        if timer.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "fixture seek write stalled",
-            )));
-        }
-
-        Poll::Pending
-    }
-}
-
-impl<T: AsyncRead + Unpin> AsyncRead for WriteDeadline<T> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_read(cx, buf)
-    }
-}
-
-impl<T: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<T> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let result = Pin::new(&mut self.io).poll_write(cx, buf);
-
-        self.progress(cx, result)
+    if transport::http1(limits::HEADER_TIMEOUT)
+        .serve_connection(TokioIo::new(transport), TowerToHyperService::new(router))
+        .await
+        .is_err()
+    {
+        // Client framing, disconnects and timeouts are not listener failures.
+        tracing::debug!("fixture seek connection transport or framing failure");
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let result = Pin::new(&mut self.io).poll_flush(cx);
-
-        self.progress(cx, result)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let result = Pin::new(&mut self.io).poll_shutdown(cx);
-
-        self.progress(cx, result)
-    }
+    // Hyper can consume the body before its buffered bytes reach the transport.
+    drop(permit);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{
+        io,
         net::{Ipv4Addr, SocketAddr},
         sync::{Arc, Mutex},
         time::Duration,
@@ -335,6 +273,7 @@ mod tests {
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
         net::TcpStream,
         task::JoinHandle,
+        time::timeout,
     };
 
     const KEY: &str = "seek-test-upstream-secret";
@@ -399,6 +338,10 @@ mod tests {
                     let condition = headers
                         .get(header::IF_NONE_MATCH)
                         .and_then(|value| value.to_str().ok());
+
+                    if condition == Some("\"headers\"") {
+                        released.cancelled().await;
+                    }
 
                     let range = headers
                         .get(header::RANGE)
@@ -743,7 +686,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_proxy_permits_cover_both_cases_and_release_on_body_drop() {
+    async fn shared_proxy_permits_cover_both_cases_and_release_on_response_drop() {
         let upstream = Upstream::start().await;
         let mut held = Vec::new();
 
@@ -781,6 +724,146 @@ mod tests {
         assert_eq!(result.headers()[CAPABILITY], "DLNA.ORG_OP=01");
     }
 
+    #[tokio::test]
+    async fn direct_head_retains_admission_until_response_disposal() {
+        let upstream = Upstream::start().await;
+        let mut held = Vec::new();
+
+        for _ in 0..limits::MEDIA_OPERATIONS {
+            let request = Request::builder()
+                .method(Method::HEAD)
+                .uri("/byte-seek")
+                .body(Body::empty())
+                .unwrap();
+
+            let result = response(&upstream.media, request).await;
+            assert_eq!(result.status(), StatusCode::OK);
+
+            assert!(
+                result
+                    .extensions()
+                    .get::<Arc<OwnedSemaphorePermit>>()
+                    .is_some()
+            );
+
+            held.push(result);
+        }
+
+        let rejected = upstream
+            .media
+            .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
+            .await;
+
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        held.pop();
+
+        let admitted = upstream
+            .media
+            .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
+            .await;
+
+        assert_eq!(admitted.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn buffered_responses_hold_per_connection_admission_until_teardown() {
+        for method in ["GET", "HEAD"] {
+            for finish in ["read", "disconnect", "cancel"] {
+                let upstream = Upstream::start().await;
+                let mut connections = Vec::new();
+
+                for _ in 0..limits::MEDIA_OPERATIONS {
+                    let (mut client, io) = tokio::io::duplex(1);
+                    let task = tokio::spawn(connection(io, upstream.media.clone()));
+
+                    client
+                        .write_all(
+                            format!("{method} /byte-seek HTTP/1.1\r\nHost: fixture\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+
+                    timeout(Duration::from_secs(2), async {
+                        if method == "GET" {
+                            let mut headers = Vec::new();
+
+                            while !headers.ends_with(b"\r\n\r\n") {
+                                headers.push(client.read_u8().await.unwrap());
+                                assert!(headers.len() < 2048);
+                            }
+
+                            assert!(headers.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                            assert_eq!(client.read_u8().await.unwrap(), BYTES[0]);
+                        } else {
+                            assert_eq!(client.read_u8().await.unwrap(), b'H');
+                        }
+                    })
+                    .await
+                    .unwrap();
+
+                    assert!(!task.is_finished());
+                    connections.push((client, task));
+                }
+
+                let rejected = upstream
+                    .media
+                    .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
+                    .await;
+
+                assert_eq!(
+                    rejected.status(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{method} {finish}"
+                );
+
+                for (mut client, task) in connections {
+                    match finish {
+                        "read" => {
+                            let mut rest = Vec::new();
+
+                            timeout(Duration::from_secs(2), client.read_to_end(&mut rest))
+                                .await
+                                .unwrap()
+                                .unwrap();
+
+                            if method == "GET" {
+                                assert_eq!(rest, &BYTES[1..]);
+                            }
+                        }
+
+                        "disconnect" => drop(client),
+
+                        "cancel" => task.abort(),
+
+                        _ => unreachable!(),
+                    }
+
+                    assert_eq!(
+                        timeout(Duration::from_secs(2), task)
+                            .await
+                            .unwrap()
+                            .is_err(),
+                        finish == "cancel"
+                    );
+                }
+
+                // All slots, not only the most recent connection's slot, must return.
+                let mut held = Vec::new();
+
+                for _ in 0..limits::MEDIA_OPERATIONS {
+                    let result = upstream
+                        .media
+                        .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
+                        .await;
+
+                    assert_eq!(result.status(), StatusCode::OK, "{method} {finish}");
+                    held.push(result);
+                }
+            }
+        }
+    }
+
     async fn wire(address: SocketAddr, request: &str) -> String {
         let mut socket = TcpStream::connect(address).await.unwrap();
         socket.write_all(request.as_bytes()).await.unwrap();
@@ -792,6 +875,92 @@ mod tests {
             .unwrap();
 
         result
+    }
+
+    #[tokio::test]
+    async fn tcp_reset_cancels_upstream_waiting_and_returns_all_admission() {
+        for condition in ["headers", "stream"] {
+            let upstream = Upstream::start().await;
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let stop = CancellationToken::new();
+            let task = tokio::spawn(run(listener, upstream.media.clone(), stop.clone()));
+            let mut clients = Vec::new();
+
+            for count in 1..=limits::MEDIA_OPERATIONS {
+                let mut client = TcpStream::connect(address).await.unwrap();
+
+                client
+                    .write_all(format!("GET /byte-seek HTTP/1.1\r\nHost: fixture\r\nIf-None-Match: \"{condition}\"\r\n\r\n").as_bytes())
+                    .await
+                    .unwrap();
+
+                timeout(Duration::from_secs(2), async {
+                    while upstream.requests.lock().unwrap().len() < count {
+                        tokio::task::yield_now().await;
+                    }
+
+                    if condition == "stream" {
+                        let mut headers = Vec::new();
+
+                        while !headers.ends_with(b"\r\n\r\n") {
+                            headers.push(client.read_u8().await.unwrap());
+                            assert!(headers.len() < 2048);
+                        }
+
+                        assert!(headers.starts_with(b"HTTP/1.1 200 OK\r\n"));
+                    }
+                })
+                .await
+                .unwrap();
+
+                clients.push(client);
+            }
+
+            let rejected = upstream
+                .media
+                .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
+                .await;
+
+            assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            for client in clients {
+                socket2::SockRef::from(&client)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+
+                drop(client);
+            }
+
+            let mut held = Vec::new();
+
+            timeout(Duration::from_secs(2), async {
+                while held.len() < limits::MEDIA_OPERATIONS {
+                    let result = upstream
+                        .media
+                        .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
+                        .await;
+
+                    if result.status() == StatusCode::SERVICE_UNAVAILABLE {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+
+                    assert_eq!(result.status(), StatusCode::OK);
+                    held.push(result);
+                }
+            })
+            .await
+            .expect("disconnect must release admission before upstream deadlines");
+
+            stop.cancel();
+
+            timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -914,23 +1083,5 @@ mod tests {
             assert_eq!(&body[..], if finish { BYTES } else { &[][..] });
             assert!(TcpStream::connect(address).await.is_err());
         }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn write_deadline_tracks_blocking_not_total_stream_duration() {
-        let (io, mut peer) = tokio::io::duplex(1);
-        let mut transport = WriteDeadline { io, blocked: None };
-        transport.write_all(b"a").await.unwrap();
-        tokio::time::advance(limits::STREAM_IDLE_TIMEOUT * 2).await;
-        let mut byte = [0];
-        peer.read_exact(&mut byte).await.unwrap();
-        transport.write_all(b"b").await.unwrap();
-        let started = Instant::now();
-        let error = transport.write_all(b"c").await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(started.elapsed(), limits::STREAM_IDLE_TIMEOUT);
-        peer.read_exact(&mut byte).await.unwrap();
-        transport.write_all(b"d").await.unwrap();
-        assert!(transport.blocked.is_none());
     }
 }

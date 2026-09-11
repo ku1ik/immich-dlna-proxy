@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod config;
+pub mod deadline;
 pub mod eventing;
 pub mod immich;
 pub mod lifecycle;
@@ -10,6 +11,7 @@ pub mod protocol;
 pub mod revisions;
 pub mod server;
 pub mod ssdp;
+pub mod transport;
 
 pub fn server_header() -> &'static str {
     static HEADER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {

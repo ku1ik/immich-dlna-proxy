@@ -501,6 +501,7 @@ fn escaped(c: char, buffer: &mut [u8; 4]) -> &str {
         '>' => "&gt;",
         '"' => "&quot;",
         '\'' => "&apos;",
+        '\r' => "&#13;",
         c if xml_char(c) => c.encode_utf8(buffer),
         _ => "\u{fffd}",
     }
@@ -1562,8 +1563,8 @@ mod tests {
     #[test]
     fn serialization_sanitizes_xml_and_escapes_exactly_two_layers() {
         assert_eq!(
-            escape_text("Łódź 東京 𐐀 &<>\"'\u{0}\u{b}\u{ffff}"),
-            "Łódź 東京 𐐀 &amp;&lt;&gt;&quot;&apos;\u{fffd}\u{fffd}\u{fffd}"
+            escape_text("Łódź 東京 𐐀 &<>\"'\u{0}\u{b}\u{ffff}\r\r\n\t\n"),
+            "Łódź 東京 𐐀 &amp;&lt;&gt;&quot;&apos;\u{fffd}\u{fffd}\u{fffd}&#13;&#13;\n\t\n"
         );
 
         let mut object = object();
@@ -1612,7 +1613,9 @@ mod tests {
 
     #[test]
     fn both_serialization_layers_fail_at_the_bound_without_partial_results() {
-        let objects = [object()];
+        let mut item = object();
+        item.title.push_str("\rline\r\nnext");
+        let objects = [item];
         let filter = Filter::parse("*").unwrap();
         let xml = didl(&objects, &filter).unwrap();
         let encoded_size = escape_text(&xml).len();
@@ -1665,9 +1668,13 @@ mod tests {
     #[test]
     fn descriptions_and_faults_have_correct_namespaces_and_fixed_contracts() {
         let uuid = uuid::Uuid::parse_str("7B37DF49-B75D-4BCB-89A6-0C917A934643").unwrap();
-        let device = device_description("Łódź & <photos>\u{0}", uuid);
+        let device = device_description("Łódź & <photos>\u{0}\rline\r\nnext", uuid);
         assert_xml(&device);
-        assert!(device.contains("<friendlyName>Łódź &amp; &lt;photos&gt;\u{fffd}</friendlyName>"));
+
+        assert!(device.contains(
+            "<friendlyName>Łódź &amp; &lt;photos&gt;\u{fffd}&#13;line&#13;\nnext</friendlyName>"
+        ));
+
         assert!(device.contains("<UDN>uuid:7b37df49-b75d-4bcb-89a6-0c917a934643</UDN>"));
         assert!(device.contains("<major>1</major><minor>0</minor>"));
 

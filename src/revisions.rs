@@ -1303,10 +1303,26 @@ mod tests {
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
         let duplicates = format!(
-            "{{\"server_uuid\":\"{}\",\"system_update_id\":0,\"root_digest\":null,\"albums\":{{\"{uuid}\":{album},\"{}\":{album}}}}}",
+            "{{\"server_uuid\":\"{}\",\"system_update_id\":0,\"root_digest\":\"{}\",\"albums\":{{\"{uuid}\":{album},\"{}\":{album}}}}}",
             id(1),
+            digest(1),
             uuid.to_uppercase()
         );
+
+        for key in [uuid.to_owned(), uuid.to_uppercase()] {
+            let single = duplicates.replace(&format!(",\"{}\":{album}", uuid.to_uppercase()), "");
+            let single = single.replace(uuid, &key);
+            let directory = private_directory();
+            put(directory.path(), "revisions.json", single.as_bytes());
+            let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+            assert_eq!(loaded.root_digest, Some(digest(1)));
+            assert_eq!(loaded.albums.len(), 1);
+
+            assert_eq!(
+                loaded.albums[&Uuid::parse_str(uuid).unwrap()],
+                populated().albums[&id(2)]
+            );
+        }
 
         let invalid = [
             "{".to_owned(),

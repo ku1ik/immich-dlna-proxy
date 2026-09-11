@@ -1,26 +1,19 @@
 use std::{
     future::Future,
-    io,
     net::Ipv4Addr,
-    pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll},
     time::Duration,
 };
 
 use axum::{Router, body::Body, extract::Request, response::Response};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
-use hyper::server::conn::http1;
-use hyper_util::{
-    rt::{TokioIo, TokioTimer},
-    service::TowerToHyperService,
-};
+use hyper_util::{rt::TokioIo, service::TowerToHyperService};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncWrite},
     net::TcpListener,
     sync::{OwnedSemaphorePermit, Semaphore, oneshot},
     task::JoinSet,
-    time::{Instant, Sleep, timeout_at},
+    time::{Instant, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -30,6 +23,7 @@ use crate::{
     limits,
     media::MediaProxy,
     protocol::{self, Fault, Service},
+    transport::{self, WriteDeadline},
 };
 
 /// The catalog selects, sorts and paginates objects, capturing their revision together.
@@ -238,19 +232,9 @@ impl<C: Catalog> Server<C> {
                 return method_not_allowed("POST");
             }
 
-            let deadline = started + self.timing.processing;
-
-            let result = timeout_at(
-                deadline,
-                self.control(service, parts.headers, body, started, peer),
-            )
-            .await;
-
-            // Synchronous XML parsing/serialization cannot be preempted by timeout_at.
-            let response = match result {
-                Ok(response) if Instant::now() < deadline => response,
-                _ => soap(Err(Fault { code: 501 })),
-            };
+            let response = self
+                .control(service, parts.headers, body, started, peer)
+                .await;
 
             tracing::debug!(%peer, ?service, status = response.status().as_u16(), elapsed_ms = started.elapsed().as_millis(), "control response");
 
@@ -338,16 +322,15 @@ impl<C: Catalog> Server<C> {
 
         let body_deadline = started + self.timing.body;
 
-        let body = match timeout_at(
+        let body = match crate::deadline::timeout_at(
             body_deadline,
             axum::body::to_bytes(body, limits::SOAP_BODY_BYTES),
         )
         .await
         {
-            // Timeout polls its inner future first, even when the deadline has passed.
-            Ok(Ok(body)) if Instant::now() < body_deadline => body,
+            Ok(Ok(body)) => body,
 
-            Ok(Ok(_)) | Err(_) => return empty(StatusCode::REQUEST_TIMEOUT),
+            Err(_) => return empty(StatusCode::REQUEST_TIMEOUT),
 
             Ok(Err(error)) => {
                 use std::error::Error;
@@ -363,25 +346,45 @@ impl<C: Catalog> Server<C> {
             }
         };
 
-        let action = match protocol::parse_action(&body, soap_action, service) {
-            Ok(action) => action,
+        // Acquisition has its own HTTP errors; only an acquired body enters SOAP processing.
+        let deadline = started + self.timing.processing;
 
-            Err(fault) => {
+        let action = match crate::deadline::timeout_at(deadline, async {
+            protocol::parse_action(&body, soap_action, service)
+        })
+        .await
+        {
+            Ok(Ok(action)) => action,
+
+            Ok(Err(fault)) => {
                 tracing::debug!(%peer, ?service, code = fault.code, "SOAP request rejected");
 
                 return soap(Err(fault));
             }
+
+            Err(_) => return soap(Err(Fault { code: 501 })),
         };
 
         tracing::debug!(%peer, ?service, action = %action.name, "SOAP action");
 
-        let result = async {
+        if Instant::now() >= deadline {
+            return soap(Err(Fault { code: 501 }));
+        }
+
+        // Keep admission outside timed execution, including fault construction and handoff.
+        let permit = if action.name == "Browse" {
+            let Ok(permit) = self.browses.clone().try_acquire_owned() else {
+                return empty(StatusCode::SERVICE_UNAVAILABLE);
+            };
+
+            Some(permit)
+        } else {
+            None
+        };
+
+        let result = crate::deadline::timeout_at(deadline, async {
             let args = match action.name.as_str() {
                 "Browse" => {
-                    let Ok(permit) = self.browses.clone().try_acquire_owned() else {
-                        return Ok(empty(StatusCode::SERVICE_UNAVAILABLE));
-                    };
-
                     let args = protocol::browse_arguments(&action)?;
                     let filter = args.filter;
                     let object = crate::immich::parse_id(args.object_id).ok();
@@ -397,7 +400,16 @@ impl<C: Catalog> Server<C> {
                     );
 
                     let result = self.catalog.browse(action).await?;
+
+                    if Instant::now() >= deadline {
+                        return Err(Fault { code: 501 });
+                    }
+
                     let didl = protocol::didl(&result.objects, &filter)?;
+
+                    if Instant::now() >= deadline {
+                        return Err(Fault { code: 501 });
+                    }
 
                     let envelope = protocol::action_response(
                         service,
@@ -412,10 +424,7 @@ impl<C: Catalog> Server<C> {
 
                     tracing::debug!(%peer, ?object, returned = result.objects.len(), total = result.total_matches, update_id = result.update_id, "Browse response");
 
-                    let mut response = soap(Ok(envelope));
-                    response.extensions_mut().insert(Arc::new(permit));
-
-                    return Ok(response);
+                    return Ok(soap(Ok(envelope)));
                 }
 
                 "GetSearchCapabilities" => vec![("SearchCaps", String::new())],
@@ -461,14 +470,19 @@ impl<C: Catalog> Server<C> {
                 &action.name,
                 &args,
             )))
-        }
-        .await;
+        }).await.unwrap_or(Err(Fault { code: 501 }));
 
-        result.unwrap_or_else(|fault| {
+        let mut response = result.unwrap_or_else(|fault| {
             tracing::debug!(%peer, ?service, code = fault.code, "SOAP action failed");
 
             soap(Err(fault))
-        })
+        });
+
+        if let Some(permit) = permit {
+            response.extensions_mut().insert(Arc::new(permit));
+        }
+
+        response
     }
 }
 
@@ -506,8 +520,8 @@ async fn connection<C: Catalog, T: AsyncRead + AsyncWrite + Unpin + Send + 'stat
     let token = completion.token.clone();
     let (start_tx, mut start_rx) = oneshot::channel();
     let start_tx = Arc::new(Mutex::new(Some(start_tx)));
-    let browse = Arc::new(Mutex::new(None));
-    let admitted = browse.clone();
+    let admission = Arc::new(Mutex::new(None));
+    let admitted = admission.clone();
 
     let router = Router::new().fallback(move |request: Request| {
         let server = server.clone();
@@ -545,19 +559,8 @@ async fn connection<C: Catalog, T: AsyncRead + AsyncWrite + Unpin + Send + 'stat
         }
     });
 
-    let mut builder = http1::Builder::new();
-
-    builder
-        .keep_alive(false)
-        .max_buf_size(limits::HEADER_BYTES)
-        .timer(TokioTimer::new())
-        .header_read_timeout(timing.header);
-
-    let transport = WriteDeadline {
-        io,
-        timeout: timing.write,
-        blocked: None,
-    };
+    let builder = transport::http1(timing.header);
+    let transport = WriteDeadline::new(io, timing.write);
 
     let connection =
         builder.serve_connection(TokioIo::new(transport), TowerToHyperService::new(router));
@@ -608,75 +611,6 @@ async fn connection<C: Catalog, T: AsyncRead + AsyncWrite + Unpin + Send + 'stat
     };
 
     completion.finish(success);
-}
-
-/// Only time spent waiting for an actual write/flush/shutdown is idle writing.
-/// Waiting for the next upstream chunk must not time out a healthy media stream.
-struct WriteDeadline<T> {
-    io: T,
-    timeout: Duration,
-    blocked: Option<Pin<Box<Sleep>>>,
-}
-
-impl<T> WriteDeadline<T> {
-    fn progress<R>(
-        &mut self,
-        cx: &mut Context<'_>,
-        result: Poll<io::Result<R>>,
-    ) -> Poll<io::Result<R>> {
-        if result.is_ready() {
-            self.blocked = None;
-
-            return result;
-        }
-
-        let timer = self
-            .blocked
-            .get_or_insert_with(|| Box::pin(tokio::time::sleep(self.timeout)));
-
-        if timer.as_mut().poll(cx).is_ready() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "HTTP write stalled",
-            )));
-        }
-
-        Poll::Pending
-    }
-}
-
-impl<T: AsyncRead + Unpin> AsyncRead for WriteDeadline<T> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.io).poll_read(cx, buf)
-    }
-}
-
-impl<T: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<T> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let result = Pin::new(&mut self.io).poll_write(cx, buf);
-
-        self.progress(cx, result)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let result = Pin::new(&mut self.io).poll_flush(cx);
-
-        self.progress(cx, result)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let result = Pin::new(&mut self.io).poll_shutdown(cx);
-
-        self.progress(cx, result)
-    }
 }
 
 fn single<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -744,9 +678,14 @@ fn soap(result: Result<String, Fault>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        io,
+        pin::Pin,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
+        io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadBuf},
         net::TcpStream,
         sync::Notify,
         task::JoinHandle,
@@ -765,6 +704,7 @@ mod tests {
         entered: Notify,
         release: Option<Semaphore>,
         panic: bool,
+        fail: bool,
     }
 
     impl Catalog for TestCatalog {
@@ -780,6 +720,10 @@ mod tests {
 
             if let Some(release) = &self.release {
                 release.acquire().await.unwrap().forget();
+            }
+
+            if self.fail {
+                return Err(Fault { code: 501 });
             }
 
             Ok(BrowseResult {
@@ -1014,6 +958,9 @@ mod tests {
         for value in [
             "text/xml",
             "TEXT/XML; Charset=utf-8",
+            "text/xml;",
+            "text/xml; ",
+            "text/xml;; a=x;",
             "text/xml; a=\"with;semicolon\"; b=token",
             "text/xml; a=\"escaped\\\"quote\"",
         ] {
@@ -1023,13 +970,10 @@ mod tests {
         for value in [
             "text/xmljunk",
             "application/soap+xml",
-            "text/xml;",
-            "text/xml; ",
             "text/xml; charset",
             "text/xml; charset=",
             "text/xml; a=\"unterminated",
             "text/xml; a=\"ok\"garbage",
-            "text/xml; a=x;",
         ] {
             assert!(!soap_content_type(value), "{value}");
         }
@@ -1175,8 +1119,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn regression_ready_body_at_or_after_deadline_is_not_admitted() {
-        for (poll_pending_first, late) in [(false, Duration::ZERO), (true, Duration::from_secs(1))]
-        {
+        for (poll_pending_first, late) in [
+            (false, Duration::ZERO),
+            (true, Duration::from_secs(1)),
+            (true, Duration::from_secs(16)),
+        ] {
             let server = server(TestCatalog::default());
             let request = browse("*");
             let (_, body) = request.split_once("\r\n\r\n").unwrap();
@@ -1197,13 +1144,17 @@ mod tests {
                 Ok::<_, io::Error>(receive.await.unwrap())
             }));
 
-            let response = server.control(
-                Service::ContentDirectory,
-                headers,
-                body,
-                Instant::now(),
-                Ipv4Addr::LOCALHOST,
-            );
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(CDS)
+                .body(body)
+                .unwrap();
+            *request.headers_mut() = headers;
+            let token = Mutex::new(None);
+            let stop = CancellationToken::new();
+
+            let response =
+                server.handle(request, Ipv4Addr::LOCALHOST, &token, &stop, Instant::now());
             tokio::pin!(response);
 
             if poll_pending_first {
@@ -1267,6 +1218,39 @@ mod tests {
             response.status(),
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_body_repolled_after_processing_deadline_still_sends_408() {
+        let server = Arc::new(server(TestCatalog::default()));
+        let (mut client, io) = tokio::io::duplex(4096);
+
+        client.write_all(request(
+            "POST", CDS,
+            &format!("Content-Type: text/xml\r\nSOAPAction: \"{}#Browse\"\r\nContent-Length: 100\r\n", protocol::CONTENT_DIRECTORY),
+            "<",
+        ).as_bytes()).await.unwrap();
+
+        let mut task = Box::pin(connection(
+            io,
+            Ipv4Addr::LOCALHOST,
+            server.clone(),
+            CancellationToken::new(),
+        ));
+        assert!(futures_util::poll!(&mut task).is_pending());
+        assert!(futures_util::poll!(&mut task).is_pending());
+        tokio::time::advance(Duration::from_secs(26)).await;
+
+        let (_, response) = tokio::join!(task, async {
+            let mut response = String::new();
+            client.read_to_string(&mut response).await.unwrap();
+
+            response
+        });
+
+        status(&response, 408);
+        assert_eq!(server.catalog.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(server.browses.available_permits(), limits::BROWSES);
     }
 
     #[tokio::test]
@@ -1364,31 +1348,124 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn browse_permit_survives_body_eof_until_transport_shutdown() {
-        let server = Arc::new(server(TestCatalog::default()));
-        let (mut client, io) = tokio::io::duplex(4096);
-        let entered = Arc::new(Notify::new());
-        let (release, gate) = oneshot::channel();
+        for outcome in ["success", "failure", "timeout"] {
+            let mut server = server(TestCatalog {
+                release: (outcome == "timeout").then(|| Semaphore::new(0)),
+                fail: outcome == "failure",
+                ..TestCatalog::default()
+            });
 
-        let task = tokio::spawn(connection(
-            GatedIo {
-                io,
-                shutdown_entered: entered.clone(),
-                allow_shutdown: gate,
-                shutdown_completed: Arc::new(AtomicBool::new(false)),
-            },
-            Ipv4Addr::LOCALHOST,
-            server.clone(),
-            CancellationToken::new(),
-        ));
+            server.timing.processing = Duration::from_millis(1);
+            let server = Arc::new(server);
+            let (mut client, io) = tokio::io::duplex(4096);
+            let entered = Arc::new(Notify::new());
+            let (release, gate) = oneshot::channel();
 
-        client.write_all(browse("*").as_bytes()).await.unwrap();
-        entered.notified().await;
-        assert_eq!(server.browses.available_permits(), limits::BROWSES - 1);
-        release.send(true).unwrap();
-        task.await.unwrap();
-        assert_eq!(server.browses.available_permits(), limits::BROWSES);
+            let task = tokio::spawn(connection(
+                GatedIo {
+                    io,
+                    shutdown_entered: entered.clone(),
+                    allow_shutdown: gate,
+                    shutdown_completed: Arc::new(AtomicBool::new(false)),
+                },
+                Ipv4Addr::LOCALHOST,
+                server.clone(),
+                CancellationToken::new(),
+            ));
+
+            client.write_all(browse("*").as_bytes()).await.unwrap();
+            entered.notified().await;
+            status(
+                &read_headers(&mut client).await,
+                if outcome == "success" { 200 } else { 500 },
+            );
+            assert_eq!(server.browses.available_permits(), limits::BROWSES - 1);
+            release.send(true).unwrap();
+            task.await.unwrap();
+            assert_eq!(server.browses.available_permits(), limits::BROWSES);
+        }
+    }
+
+    #[tokio::test]
+    async fn media_admission_covers_head_conditional_and_error_transport_shutdown() {
+        for (method, upstream_status, local_status) in
+            [("HEAD", 200, 200), ("GET", 304, 304), ("GET", 403, 502)]
+        {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut server = server(TestCatalog::default());
+
+            server.media = MediaProxy::new(
+                format!("http://{}/api/", upstream.local_addr().unwrap())
+                    .parse()
+                    .unwrap(),
+                HeaderValue::from_static("test-key"),
+            )
+            .unwrap();
+
+            let server = Arc::new(server);
+            let body = if method == "HEAD" || upstream_status == 304 {
+                ""
+            } else {
+                "abc"
+            };
+
+            let wire = format!(
+                "HTTP/1.1 {upstream_status} Response\r\nContent-Type: image/jpeg\r\nContent-Length: 3\r\nConnection: close\r\n\r\n{body}"
+            );
+
+            let remote = tokio::spawn(async move {
+                for _ in 0..limits::MEDIA_OPERATIONS {
+                    let (mut io, _) = upstream.accept().await.unwrap();
+                    read_headers(&mut io).await;
+                    io.write_all(wire.as_bytes()).await.unwrap();
+                    io.shutdown().await.unwrap();
+                }
+            });
+
+            let mut connections = Vec::new();
+            let path = format!("/media/assets/{ASSET}/original");
+
+            for _ in 0..limits::MEDIA_OPERATIONS {
+                let (mut client, io) = tokio::io::duplex(4096);
+                let entered = Arc::new(Notify::new());
+                let (release, gate) = oneshot::channel();
+
+                let task = tokio::spawn(connection(
+                    GatedIo {
+                        io,
+                        shutdown_entered: entered.clone(),
+                        allow_shutdown: gate,
+                        shutdown_completed: Arc::new(AtomicBool::new(false)),
+                    },
+                    Ipv4Addr::LOCALHOST,
+                    server.clone(),
+                    CancellationToken::new(),
+                ));
+
+                client
+                    .write_all(request(method, &path, "", "").as_bytes())
+                    .await
+                    .unwrap();
+                entered.notified().await;
+                status(&read_headers(&mut client).await, local_status);
+                connections.push((client, task, release));
+            }
+
+            remote.await.unwrap();
+            status(
+                &exchange(server.clone(), &request("GET", &path, "", "")).await,
+                503,
+            );
+
+            for (_client, task, release) in connections {
+                release.send(true).unwrap();
+                task.await.unwrap();
+            }
+
+            assert_eq!(server.catalog.calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]
@@ -1891,11 +1968,7 @@ mod tests {
     async fn write_deadline_measures_blocked_writes_not_stream_duration() {
         let (mut reader, writer) = tokio::io::duplex(1);
 
-        let mut writer = WriteDeadline {
-            io: writer,
-            timeout: Duration::from_secs(2),
-            blocked: None,
-        };
+        let mut writer = WriteDeadline::new(writer, Duration::from_secs(2));
 
         writer.write_all(b"a").await.unwrap();
         tokio::time::advance(Duration::from_secs(100)).await;

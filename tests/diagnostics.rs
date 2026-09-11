@@ -229,6 +229,32 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
         assert!(headers.contains("content-length: 3"));
         assert!(headers.contains("content-type: IMAGE/JPEG; note=\"a;b\""));
         assert_eq!(body, "abc");
+
+        let overrun = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let overrun_address = overrun.local_addr().unwrap();
+
+        tasks.spawn(async move {
+            let (mut socket, _) = overrun.accept().await.unwrap();
+            let mut request = Vec::new();
+
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+
+            socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Type: image/jpeg\r\nContent-Range: bytes 0-2/10\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n0\r\n\r\n").await.unwrap();
+        });
+
+        let media = MediaProxy::new(
+            format!("http://{overrun_address}/api/").parse().unwrap(),
+            HeaderValue::from_static("api-key-secret"),
+        )
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-2"));
+        let response = media.serve(ASSET, "original", Method::GET, headers).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert!(axum::body::to_bytes(response.into_body(), 1024).await.is_err());
         shutdown.cancel();
 
         while let Some(result) = tasks.join_next().await {
@@ -272,6 +298,8 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
         "content_length=Some(3)",
         "accepts_bytes=true",
         "body_length=Some(3)",
+        "media stream terminated",
+        "media body exceeds declared content length",
     ] {
         assert!(log.contains(expected), "missing {expected}: {log}");
     }

@@ -14,13 +14,22 @@ pub(crate) fn parse(value: &str, allow_parameter_whitespace: bool) -> Option<&st
         || kind == "*"
         || subtype == "*"
         || !kind.bytes().chain(subtype.bytes()).all(token)
-        || (value.contains(';') && rest.trim().is_empty())
     {
         return None;
     }
 
     while !rest.is_empty() {
         rest = rest.trim_start_matches([' ', '\t']);
+
+        if rest.is_empty() {
+            break;
+        }
+
+        if let Some(next) = rest.strip_prefix(';') {
+            rest = next;
+            continue;
+        }
+
         let end = rest.bytes().take_while(|&byte| token(byte)).count();
 
         if end == 0 {
@@ -79,10 +88,6 @@ pub(crate) fn parse(value: &str, allow_parameter_whitespace: bool) -> Option<&st
 
         if !rest.is_empty() {
             rest = rest.strip_prefix(';')?;
-
-            if rest.trim().is_empty() {
-                return None;
-            }
         }
     }
 
@@ -99,6 +104,14 @@ mod tests {
             ("image/jpeg", "image/jpeg"),
             (" IMAGE/JPEG \t", "IMAGE/JPEG"),
             (" IMAGE/JPEG ; q=90", "IMAGE/JPEG"),
+            ("image/jpeg;", "image/jpeg"),
+            ("image/jpeg; \t", "image/jpeg"),
+            ("image/jpeg; x=1;", "image/jpeg"),
+            ("image/jpeg; x=1; \t", "image/jpeg"),
+            ("image/jpeg;;x=1", "image/jpeg"),
+            ("image/jpeg;;q=90;", "image/jpeg"),
+            ("image/jpeg; ;\t; q=90; ;\t", "image/jpeg"),
+            ("text/xml;; charset=utf-8;;", "text/xml"),
             ("video/mp4; codecs=avc1", "video/mp4"),
             ("image/jpeg; note=\"semi;colon\"", "image/jpeg"),
             ("image/jpeg; note=\"a;\\\"b\"; x=y", "image/jpeg"),
@@ -131,15 +144,10 @@ mod tests {
             "image/jpeg/extra",
             "image/jpeg, image/png",
             "image /jpeg",
-            "image/jpeg;",
-            "image/jpeg; \t",
             "image/jpeg; x",
             "image/jpeg; x=",
             "image/jpeg; x=\"unterminated",
             "image/jpeg; x=\"v\"oops",
-            "image/jpeg; x=1;",
-            "image/jpeg; x=1; \t",
-            "image/jpeg;;x=1",
             "image/jpeg; =x",
             "image/jpeg; x=a b",
             "image/jpeg; x=\"dangling\\",
@@ -159,6 +167,14 @@ mod tests {
             "image/jpeg; x\n=1",
             "image/jpeg; x=\n1",
             "image/jpeg; x=\u{a0}1",
+            "image/jpeg;\r",
+            "image/jpeg; \t\n",
+            "image/jpeg;;\0",
+            "image/jpeg;;\u{b}",
+            "image/jpeg; x=1;\u{c}",
+            "image/jpeg; x=1;;\u{7f}",
+            "image/jpeg; ;\u{a0}",
+            "image/jpeg; ;\u{2003}",
         ] {
             for whitespace in [false, true] {
                 assert_eq!(parse(value, whitespace), None, "{value:?}");
@@ -172,6 +188,7 @@ mod tests {
             "text/xml; charset =utf-8",
             "text/xml; charset= utf-8",
             "text/xml; charset \t=\t \"utf-8\"; a = b",
+            "text/xml;; charset \t=\t \"utf-8\"; ; a = b;",
         ] {
             assert_eq!(parse(value, false), None, "{value:?}");
             assert_eq!(parse(value, true), Some("text/xml"), "{value:?}");
