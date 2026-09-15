@@ -1,9 +1,9 @@
 use std::{
     ffi::CStr,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::Read,
     net::{Ipv4Addr, SocketAddrV4},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
@@ -72,12 +72,11 @@ pub struct Interface {
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = fs::read_to_string(path).context("cannot read configuration file")?;
-        let settings = validate_settings(&text)?;
+        let settings = parse_settings(&text)?;
         let api_base = normalize_api_base(&settings.immich_url)?;
         let collator = collator(&settings.sort_locale)?;
         let api_key = read_key(&settings.immich_api_key_file)?;
         let interface = resolve_interface(*settings.listen_address.ip())?;
-        validate_state_directory(&settings.state_directory)?;
 
         Ok(Self {
             api_base,
@@ -93,13 +92,10 @@ impl Config {
     }
 }
 
-fn validate_settings(text: &str) -> anyhow::Result<Settings> {
+fn parse_settings(text: &str) -> anyhow::Result<Settings> {
     // TOML diagnostics can include source lines: do not propagate the raw document.
     let settings: Settings = toml::from_str(text)
         .map_err(|_| anyhow::anyhow!("invalid configuration fields or TOML"))?;
-
-    normalize_api_base(&settings.immich_url)?;
-    collator(&settings.sort_locale)?;
 
     ensure!(
         settings.immich_api_key_file.is_absolute() && settings.state_directory.is_absolute(),
@@ -221,24 +217,6 @@ fn read_key(path: &Path) -> anyhow::Result<HeaderValue> {
     Ok(value)
 }
 
-pub fn validate_state_directory(path: &Path) -> anyhow::Result<()> {
-    ensure!(path.is_absolute(), "state_directory must be absolute");
-    let metadata = fs::metadata(path).context("state_directory must already exist")?;
-
-    // SAFETY: geteuid has no arguments or memory preconditions.
-    let uid = unsafe { libc::geteuid() };
-
-    ensure!(
-        metadata.is_dir() && metadata.uid() == uid && metadata.permissions().mode() & 0o077 == 0,
-        "state_directory must be private and owned by the service user"
-    );
-
-    // The locked startup revision commit establishes writability before listeners.
-    File::open(path).context("cannot open state_directory")?;
-
-    Ok(())
-}
-
 pub fn resolve_interface(address: Ipv4Addr) -> anyhow::Result<Interface> {
     ensure!(
         is_unicast(address),
@@ -346,7 +324,7 @@ state_directory = "/var/lib/immich-dlna-proxy"
 
     #[test]
     fn defaults_and_canonical_identity() {
-        let settings = validate_settings(CONFIG).unwrap();
+        let settings = parse_settings(CONFIG).unwrap();
         assert_eq!(settings.friendly_name, "Immich");
         assert_eq!(settings.log_level, "info");
 
@@ -360,7 +338,6 @@ state_directory = "/var/lib/immich-dlna-proxy"
     fn invalid_settings_fail_without_echoing_source() {
         for (old, new) in [
             ("sort_locale = \"pl\"", ""),
-            ("sort_locale = \"pl\"", "sort_locale = \"not_a_locale!\""),
             ("192.168.1.10:8200", "0.0.0.0:8200"),
             ("192.168.1.10:8200", "127.0.0.1:8200"),
             ("192.168.1.10:8200", "239.255.255.250:8200"),
@@ -372,12 +349,8 @@ state_directory = "/var/lib/immich-dlna-proxy"
             ),
             ("/run/secrets/key", "relative-key"),
             ("/var/lib/immich-dlna-proxy", "relative-state"),
-            ("https://immich.example.com", "https://secret@example.com"),
         ] {
-            assert!(
-                validate_settings(&CONFIG.replace(old, new)).is_err(),
-                "{new}"
-            );
+            assert!(parse_settings(&CONFIG.replace(old, new)).is_err(), "{new}");
         }
 
         for extra in [
@@ -386,19 +359,45 @@ state_directory = "/var/lib/immich-dlna-proxy"
             "friendly_name = \"\\u0001\"",
             "log_level = \"INFO\"",
         ] {
-            let error = validate_settings(&format!("{CONFIG}\n{extra}"))
-                .err()
-                .unwrap();
+            let error = parse_settings(&format!("{CONFIG}\n{extra}")).err().unwrap();
             assert!(!error.to_string().contains("private-value"));
         }
 
         assert!(
-            validate_settings(&format!(
+            parse_settings(&format!(
                 "{CONFIG}\nfriendly_name = \"{}\"",
                 "x".repeat(129)
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn load_rejects_invalid_url_and_locale_before_runtime_lookups() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+
+        for (old, new, diagnostic) in [
+            (
+                "https://immich.example.com",
+                "https://secret@example.com",
+                "immich_url must be an absolute HTTP(S) URL without userinfo, query or fragment",
+            ),
+            (
+                "https://immich.example.com",
+                "relative",
+                "invalid immich_url",
+            ),
+            (
+                "sort_locale = \"pl\"",
+                "sort_locale = \"not_a_locale!\"",
+                "invalid sort_locale identifier",
+            ),
+        ] {
+            fs::write(&path, CONFIG.replace(old, new)).unwrap();
+            let error = Config::load(&path).err().unwrap();
+            assert_eq!(error.to_string(), diagnostic);
+        }
     }
 
     #[test]
@@ -476,52 +475,6 @@ state_directory = "/var/lib/immich-dlna-proxy"
         assert!(read_key(&path).is_err());
         assert!(read_key(&directory.path().join("absent")).is_err());
         assert!(read_key(directory.path()).is_err());
-    }
-
-    #[test]
-    fn state_must_exist_and_be_private() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        validate_state_directory(directory.path()).unwrap();
-        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(validate_state_directory(directory.path()).is_err());
-        assert!(validate_state_directory(&directory.path().join("absent")).is_err());
-    }
-
-    #[test]
-    fn state_validation_never_creates_or_removes_entries() {
-        use std::os::fd::{AsRawFd, FromRawFd};
-
-        let directory = tempfile::tempdir().unwrap();
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-
-        // Observe transient entries too, not just the directory after validation.
-        // SAFETY: inotify_init1 has no memory preconditions and returns an owned fd.
-        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-
-        assert!(fd >= 0);
-
-        // SAFETY: the successful call above transferred ownership of fd.
-        let mut events = unsafe { File::from_raw_fd(fd) };
-        let path = std::ffi::CString::new(directory.path().as_os_str().as_encoded_bytes()).unwrap();
-
-        // SAFETY: events is live and path is a NUL-terminated directory path.
-        let watch = unsafe {
-            libc::inotify_add_watch(
-                events.as_raw_fd(),
-                path.as_ptr(),
-                libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO,
-            )
-        };
-
-        assert!(watch >= 0);
-        validate_state_directory(directory.path()).unwrap();
-
-        assert_eq!(
-            events.read(&mut [0; 4096]).unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
     }
 
     #[test]

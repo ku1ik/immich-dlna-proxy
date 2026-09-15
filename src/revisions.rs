@@ -1426,6 +1426,8 @@ mod tests {
     fn rejects_nonprivate_symlink_nonregular_and_hardlinked_files_without_blocking() {
         let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
         let directory = private_directory();
+        assert!(Store::open(&directory.path().join("absent"), id(1)).is_err());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(Store::open(directory.path(), id(1)).is_err());
         let parent = private_directory();
