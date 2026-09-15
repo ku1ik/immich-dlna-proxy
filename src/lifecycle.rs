@@ -157,6 +157,109 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
 
+    #[tokio::test]
+    async fn pending_subscription_becomes_owed_during_shutdown_and_callback_obeys_grace() {
+        use crate::protocol::Service;
+        use http::{HeaderMap, HeaderValue, Method, StatusCode};
+        use std::{net::Ipv4Addr, time::Duration};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        tokio::time::timeout(limits::SHUTDOWN_GRACE + Duration::from_secs(3), async {
+            let callback = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let subscriptions = Subscriptions::new().unwrap();
+            subscriptions.publish(42);
+            let mut headers = HeaderMap::new();
+            headers.insert("nt", HeaderValue::from_static("upnp:event"));
+
+            headers.insert(
+                "callback",
+                format!("<http://{}/events>", callback.local_addr().unwrap())
+                    .parse()
+                    .unwrap(),
+            );
+
+            let (response, pending) = subscriptions.request(
+                Service::ContentDirectory,
+                Ipv4Addr::LOCALHOST,
+                &Method::from_bytes(b"SUBSCRIBE").unwrap(),
+                &headers,
+            );
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let pending = pending.unwrap();
+            let sid = response.headers()["sid"].to_str().unwrap().to_owned();
+            let stop = CancellationToken::new();
+            let events_stop = CancellationToken::new();
+            let mut tasks = JoinSet::new();
+            let events = subscriptions.clone();
+            let token = events_stop.clone();
+
+            tasks.spawn(async move { ("eventing", events.run(token).await) });
+
+            let admission = stop.clone();
+
+            tasks.spawn(async move {
+                // Model completion of an admitted response after shutdown begins.
+                // Transport/FIN ordering is exercised by the server's wire tests.
+                admission.cancelled().await;
+                subscriptions.response_complete(pending, true);
+
+                ("HTTP", Ok(()))
+            });
+
+            let started = Instant::now();
+            let supervisor = tokio::spawn(supervise(tasks, stop, events_stop.clone(), async {}));
+
+            let (socket, _) = tokio::time::timeout(Duration::from_secs(2), callback.accept())
+                .await
+                .expect("accepted subscription must retain its initial notification")
+                .unwrap();
+
+            let mut callback = BufReader::new(socket);
+            let mut notification = String::new();
+            let mut length = None;
+
+            loop {
+                let mut line = String::new();
+                assert_ne!(callback.read_line(&mut line).await.unwrap(), 0);
+                notification.push_str(&line);
+
+                if line == "\r\n" {
+                    break;
+                }
+
+                if let Some(value) = line.strip_prefix("content-length:") {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+
+            let mut body = vec![0; length.unwrap()];
+            callback.read_exact(&mut body).await.unwrap();
+            assert!(notification.starts_with("NOTIFY /events HTTP/1.1\r\n"));
+            assert!(notification.contains(&format!("sid: {sid}\r\n")));
+            assert!(notification.contains("seq: 0\r\n"));
+
+            assert!(
+                String::from_utf8(body)
+                    .unwrap()
+                    .contains("<SystemUpdateID>42</SystemUpdateID>")
+            );
+
+            assert!(!supervisor.is_finished());
+            assert!(!events_stop.is_cancelled());
+
+            // An unanswered callback has a 30-second timeout; shutdown must cut it short.
+            supervisor.await.unwrap().unwrap();
+            assert!(events_stop.is_cancelled());
+            assert!(started.elapsed() < limits::SHUTDOWN_GRACE + Duration::from_secs(1));
+            let mut remaining = Vec::new();
+            callback.read_to_end(&mut remaining).await.unwrap();
+            assert!(remaining.is_empty());
+        })
+        .await
+        .expect("subscription shutdown exceeded the common grace");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn shutdown_retains_events_for_admitted_work_within_one_common_budget() {
         let stop = CancellationToken::new();
