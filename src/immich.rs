@@ -438,7 +438,8 @@ impl Immich {
 
             let mut projection = Projection::new(limits::SNAPSHOT_BYTES);
             projection.json(&album)?;
-            album.digest = projection.finish().0;
+            let (digest, size) = projection.finish();
+            album.digest = digest;
 
             if let Some(previous) = albums.get(&album.id) {
                 ensure!(previous == &album, "conflicting duplicate Immich album");
@@ -450,7 +451,7 @@ impl Immich {
                 "Immich root exceeds album limit"
             );
 
-            bytes += 1 + encoded_size(&album, limits::SNAPSHOT_BYTES - bytes)?;
+            bytes += 1 + size;
 
             ensure!(
                 bytes <= limits::SNAPSHOT_BYTES,
@@ -800,33 +801,12 @@ fn title(value: &str, id: Uuid) -> String {
     }
 }
 
-// Hash and count the same canonical JSON without allocating a serialized snapshot.
-struct Projection {
-    hash: Sha256,
+struct ByteCount {
     bytes: usize,
     limit: usize,
 }
 
-impl Projection {
-    fn new(limit: usize) -> Self {
-        Self {
-            hash: Sha256::new(),
-            bytes: 0,
-            limit,
-        }
-    }
-
-    fn json(&mut self, value: &impl Serialize) -> Result<()> {
-        serde_json::to_writer(self, value)
-            .map_err(|_| anyhow!("catalog projected byte limit exceeded"))
-    }
-
-    fn finish(self) -> (String, usize) {
-        (format!("{:x}", self.hash.finalize()), self.bytes)
-    }
-}
-
-impl Write for Projection {
+impl Write for ByteCount {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if bytes.len() > self.limit - self.bytes {
             return Err(std::io::Error::other(
@@ -834,7 +814,6 @@ impl Write for Projection {
             ));
         }
 
-        self.hash.update(bytes);
         self.bytes += bytes.len();
 
         Ok(bytes.len())
@@ -845,11 +824,50 @@ impl Write for Projection {
     }
 }
 
-fn encoded_size(value: &impl Serialize, limit: usize) -> Result<usize> {
-    let mut projection = Projection::new(limit);
-    projection.json(value)?;
+// Hash and count the same canonical JSON without allocating a serialized snapshot.
+struct Projection {
+    hash: Sha256,
+    count: ByteCount,
+}
 
-    Ok(projection.bytes)
+impl Projection {
+    fn new(limit: usize) -> Self {
+        Self {
+            hash: Sha256::new(),
+            count: ByteCount { bytes: 0, limit },
+        }
+    }
+
+    fn json(&mut self, value: &impl Serialize) -> Result<()> {
+        serde_json::to_writer(self, value)
+            .map_err(|_| anyhow!("catalog projected byte limit exceeded"))
+    }
+
+    fn finish(self) -> (String, usize) {
+        (format!("{:x}", self.hash.finalize()), self.count.bytes)
+    }
+}
+
+impl Write for Projection {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.count.write_all(bytes)?;
+        self.hash.update(bytes);
+
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encoded_size(value: &impl Serialize, limit: usize) -> Result<usize> {
+    let mut count = ByteCount { bytes: 0, limit };
+
+    serde_json::to_writer(&mut count, value)
+        .map_err(|_| anyhow!("catalog projected byte limit exceeded"))?;
+
+    Ok(count.bytes)
 }
 
 fn media_type(value: &str) -> Option<String> {
@@ -1798,7 +1816,8 @@ mod tests {
 
     #[tokio::test]
     async fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
-        let first = asset(2, "IMAGE");
+        let mut first = asset(2, "IMAGE");
+        first["originalFileName"] = json!("Zażółć \"photo\"\\name\n.jpg");
         let second = asset(1, "IMAGE");
 
         let fake = Fake::new(vec![
@@ -1850,9 +1869,13 @@ mod tests {
         let mut digest = Projection::new(limits::SNAPSHOT_BYTES);
         digest.json(&reversed).unwrap();
         assert_ne!(original, digest.finish().0);
-        let size = encoded_size(item, limits::SNAPSHOT_BYTES).unwrap();
-        assert_eq!(encoded_size(item, size).unwrap(), size);
-        assert!(encoded_size(item, size - 1).is_err());
+
+        for item in baseline.items.values() {
+            let size = serde_json::to_vec(item).unwrap().len();
+            assert_eq!(encoded_size(item, limits::SNAPSHOT_BYTES).unwrap(), size);
+            assert_eq!(encoded_size(item, size).unwrap(), size);
+            assert!(encoded_size(item, size - 1).is_err());
+        }
     }
 
     #[tokio::test]
