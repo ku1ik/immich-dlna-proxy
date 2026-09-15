@@ -159,7 +159,7 @@ in
         PrivateTmp = true;
         PrivateDevices = true;
         RestrictSUIDSGID = true;
-        # Keep host networking and /proc available for multicast and interface discovery.
+        # Keep host networking available for multicast and interface discovery.
         RestrictAddressFamilies = [
           "AF_INET"
           "AF_INET6"
