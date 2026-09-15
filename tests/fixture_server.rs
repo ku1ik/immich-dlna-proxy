@@ -19,9 +19,9 @@ use clap::Parser;
 use futures_util::StreamExt;
 use http::{HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
+    catalog::{ObjectId, parse_id},
     config::{is_unicast, resolve_interface},
     eventing::Subscriptions,
-    immich::{ObjectId, parse_id},
     lifecycle, limits,
     media::MediaProxy,
     protocol::{BrowseArguments, Fault, Object},

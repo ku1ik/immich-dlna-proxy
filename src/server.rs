@@ -391,7 +391,7 @@ impl<C: Catalog> Server<C> {
             let args = match action {
                 Action::Browse(args) => {
                     let filter = args.filter.clone();
-                    let object = crate::immich::parse_id(&args.object_id).ok();
+                    let object = crate::catalog::parse_id(&args.object_id).ok();
 
                     tracing::debug!(
                         %peer, ?object,

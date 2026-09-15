@@ -1,6 +1,9 @@
 //! Browse-driven snapshots and service-owned, durably published refreshes.
 
+mod source;
+
 use std::{
+    cmp::Ordering,
     collections::BTreeMap,
     sync::{Arc, Mutex},
     task::Poll,
@@ -8,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow, ensure};
+use chrono::{DateTime, Utc};
 use tokio::{
     sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, watch},
     task::JoinSet,
@@ -18,13 +22,74 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
+    deadline::Budget,
     eventing::Subscriptions,
-    immich::{self, Contents, FetchBudget, Immich, ObjectId, Root},
-    limits,
+    immich, limits,
     protocol::{BrowseArguments, Fault, Object},
     revisions::{AlbumRevision, Ledger, Store},
     server::{BrowseResult, Catalog},
 };
+
+use source::{Contents, Root, Source};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectId {
+    Root,
+    Album(Uuid),
+    Item { album: Uuid, asset: Uuid },
+}
+
+pub fn parse_id(value: &str) -> Result<ObjectId, Fault> {
+    let invalid = Fault { code: 701 };
+    let mut parts = value.split(':');
+
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("0"), None, None) => Ok(ObjectId::Root),
+
+        (Some("album"), Some(album), None) => Ok(ObjectId::Album(
+            Uuid::parse_str(album).map_err(|_| invalid)?,
+        )),
+
+        (Some("album"), Some(album), Some("asset")) => {
+            let asset = parts.next().ok_or(invalid)?;
+
+            if parts.next().is_some() {
+                return Err(invalid);
+            }
+
+            Ok(ObjectId::Item {
+                album: Uuid::parse_str(album).map_err(|_| invalid)?,
+                asset: Uuid::parse_str(asset).map_err(|_| invalid)?,
+            })
+        }
+
+        _ => Err(invalid),
+    }
+}
+
+fn compare_dates(
+    a_date: Option<&str>,
+    a_capture: Option<&DateTime<Utc>>,
+    a_id: Uuid,
+    b_date: Option<&str>,
+    b_capture: Option<&DateTime<Utc>>,
+    b_id: Uuid,
+    descending: bool,
+) -> Ordering {
+    fn optional<T: Ord>(a: Option<T>, b: Option<T>, descending: bool) -> Ordering {
+        match (a, b) {
+            (Some(a), Some(b)) if descending => b.cmp(&a),
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        }
+    }
+
+    optional(a_date, b_date, descending)
+        .then_with(|| optional(a_capture, b_capture, descending))
+        .then_with(|| a_id.cmp(&b_id))
+}
 
 const FAILED: Fault = Fault { code: 501 };
 const MISSING: Fault = Fault { code: 701 };
@@ -41,7 +106,7 @@ pub struct Library {
 }
 
 struct Inner {
-    source: Immich,
+    source: Source,
     config: Config,
     store: Store,
     events: Subscriptions,
@@ -193,12 +258,11 @@ impl Library {
         events: Subscriptions,
         stop: CancellationToken,
     ) -> Result<Self> {
-        let source = Immich::new(
-            config.api_base.clone(),
-            config.api_key.clone(),
+        let source = Source::new(
+            immich::Client::new(config.api_base.clone(), config.api_key.clone())?,
             config.listen_address,
             config.friendly_name.clone(),
-        )?;
+        );
 
         events.publish(ledger.system_update_id);
 
@@ -409,7 +473,7 @@ impl Library {
         );
 
         let prepare = async {
-            let budget = FetchBudget {
+            let budget = Budget {
                 deadline: preparation,
                 stop: self.inner.stop.clone(),
             };
@@ -613,7 +677,7 @@ impl Catalog for Library {
     }
 
     async fn browse(&self, query: BrowseArguments) -> Result<BrowseResult, Fault> {
-        let id = immich::parse_id(&query.object_id)?;
+        let id = parse_id(&query.object_id)?;
         let mut view = self.fresh(Scope::Root).await?;
 
         match id {
@@ -696,7 +760,7 @@ impl Catalog for Library {
                         })
                         .then_with(|| a.id.cmp(&b.id)),
 
-                    Some(descending) => immich::compare_dates(
+                    Some(descending) => compare_dates(
                         a.object.date.as_deref(),
                         a.created_at.as_ref(),
                         a.id,
@@ -714,7 +778,7 @@ impl Catalog for Library {
                 let mut rows: Vec<_> = contents.as_ref().ok_or(FAILED)?.items.values().collect();
 
                 rows.sort_unstable_by(|a, b| {
-                    immich::compare_dates(
+                    compare_dates(
                         query.sort.and(a.object.date.as_deref()),
                         a.capture.as_ref(),
                         a.id,
@@ -778,6 +842,105 @@ mod tests {
     use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 
     use crate::protocol::{self, Filter, Service};
+
+    #[test]
+    fn ids_and_date_ordering() {
+        let album = Uuid::from_u128(100_000);
+        let asset = Uuid::from_u128(0xabcdef);
+        let id = format!("album:{album}:asset:{asset}");
+
+        assert_eq!(
+            parse_id(
+                &id.to_uppercase()
+                    .replacen("ALBUM", "album", 1)
+                    .replacen("ASSET", "asset", 1)
+            ),
+            Ok(ObjectId::Item { album, asset })
+        );
+
+        assert_eq!(parse_id("0"), Ok(ObjectId::Root));
+
+        assert_eq!(
+            parse_id(&format!("album:{album}")),
+            Ok(ObjectId::Album(album))
+        );
+
+        for id in [
+            "",
+            "00",
+            "0:",
+            "asset:bad",
+            "album:bad",
+            "album:0:asset:0",
+            &format!("album:{album}:"),
+            &format!("{id}:extra"),
+            &format!("album:{album}:asset:"),
+        ] {
+            assert_eq!(parse_id(id), Err(Fault { code: 701 }));
+        }
+
+        let early = "2023-12-31T22:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        let late = "2024-01-01T00:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        let low = Uuid::from_u128(1);
+        let high = Uuid::from_u128(2);
+
+        for descending in [false, true] {
+            assert_eq!(
+                compare_dates(
+                    None,
+                    Some(&early),
+                    low,
+                    Some("2024-01-01"),
+                    None,
+                    high,
+                    descending
+                ),
+                Ordering::Greater
+            );
+
+            assert_eq!(
+                compare_dates(
+                    Some("2024-01-01"),
+                    None,
+                    low,
+                    Some("2024-01-01"),
+                    Some(&late),
+                    high,
+                    descending
+                ),
+                Ordering::Greater
+            );
+
+            assert_eq!(
+                compare_dates(None, None, low, None, None, high, descending),
+                Ordering::Less
+            );
+
+            let expected = if descending {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+
+            assert_eq!(
+                compare_dates(
+                    Some("2023-12-31"),
+                    Some(&late),
+                    high,
+                    Some("2024-01-01"),
+                    Some(&early),
+                    low,
+                    descending
+                ),
+                expected
+            );
+
+            assert_eq!(
+                compare_dates(None, Some(&early), high, None, Some(&late), low, descending),
+                expected
+            );
+        }
+    }
 
     pub(super) struct Barrier {
         pub(super) entered: Notify,
@@ -2246,7 +2409,7 @@ mod tests {
                 .insert(Uuid::from_u128(id), vec![asset]);
         }
 
-        let budget = FetchBudget {
+        let budget = Budget {
             deadline: Instant::now() + limits::REFRESH_PREPARATION_TIMEOUT,
             stop: fixture.library.inner.stop.clone(),
         };
