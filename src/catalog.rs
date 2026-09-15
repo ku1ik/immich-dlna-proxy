@@ -21,6 +21,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, ensure};
 use chrono::{DateTime, Utc};
+use icu_collator::CollatorBorrowed;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -1184,7 +1185,8 @@ pub struct Library {
 
 struct Inner {
     source: Source,
-    config: Config,
+    friendly_name: String,
+    collator: CollatorBorrowed<'static>,
     store: Store,
     events: Subscriptions,
     stop: CancellationToken,
@@ -1193,18 +1195,11 @@ struct Inner {
     permits: Arc<Semaphore>,
     supervisor: Mutex<Supervisor>,
     wake: Notify,
-    bounds: Bounds,
+    preparation_timeout: Duration,
     #[cfg(test)]
     publication: Mutex<Option<Arc<tests::Barrier>>>,
     #[cfg(test)]
     prepared: Mutex<Option<(Scope, Arc<tests::Barrier>)>>,
-}
-
-struct Bounds {
-    freshness: Duration,
-    albums: usize,
-    bytes: usize,
-    preparation: Duration,
 }
 
 struct Supervisor {
@@ -1215,8 +1210,7 @@ struct Supervisor {
 
 struct State {
     ledger: Arc<Ledger>,
-    root: Option<Cached<Root>>,
-    albums: BTreeMap<Uuid, Cached<Contents>>,
+    cache: Cache,
     flights: BTreeMap<Scope, watch::Receiver<Option<RefreshResult>>>,
 }
 
@@ -1233,14 +1227,118 @@ impl State {
     fn view(&self, scope: Scope) -> RefreshResult {
         let contents = match scope {
             Scope::Root => None,
-            Scope::Album(id) => Some(self.albums.get(&id).ok_or(FAILED)?.snapshot.clone()),
+            Scope::Album(id) => Some(self.cache.albums.get(&id).ok_or(FAILED)?.snapshot.clone()),
         };
 
         Ok(Arc::new(View {
-            root: self.root.as_ref().ok_or(FAILED)?.snapshot.clone(),
+            root: self.cache.root.as_ref().ok_or(FAILED)?.snapshot.clone(),
             contents,
             ledger: self.ledger.clone(),
         }))
+    }
+}
+
+// Snapshot residency and freshness; synchronized with the ledger by State's lock.
+struct Cache {
+    root: Option<Cached<Root>>,
+    albums: BTreeMap<Uuid, Cached<Contents>>,
+    freshness: Duration,
+    album_limit: usize,
+    byte_limit: usize,
+}
+
+impl Cache {
+    fn new() -> Self {
+        Self {
+            root: None,
+            albums: BTreeMap::new(),
+            freshness: CATALOG_FRESHNESS,
+            album_limit: RESIDENT_ALBUMS,
+            byte_limit: CACHE_BYTES,
+        }
+    }
+
+    fn is_fresh(&mut self, scope: Scope, now: Instant) -> bool {
+        match scope {
+            Scope::Root => self
+                .root
+                .as_mut()
+                .is_some_and(|cached| cached.is_fresh(now, self.freshness)),
+
+            Scope::Album(id) => self
+                .albums
+                .get_mut(&id)
+                .is_some_and(|cached| cached.is_fresh(now, self.freshness)),
+        }
+    }
+
+    fn invalidate(&mut self, before: &Ledger, after: &Ledger) {
+        self.albums.retain(|id, _| {
+            let before = before.albums.get(id);
+            let after = after.albums.get(id);
+
+            after.is_some_and(|album| album.present)
+                && before.map(|album| album.present) == after.map(|album| album.present)
+        });
+    }
+
+    fn insert(&mut self, candidate: Candidate, now: Instant) {
+        let scope = match candidate {
+            Candidate::Root(snapshot) => {
+                self.root = Some(Cached {
+                    snapshot,
+                    completed: now,
+                    used: now,
+                });
+
+                Scope::Root
+            }
+
+            Candidate::Album(id, snapshot) => {
+                self.albums.insert(
+                    id,
+                    Cached {
+                        snapshot,
+                        completed: now,
+                        used: now,
+                    },
+                );
+
+                Scope::Album(id)
+            }
+        };
+
+        while self.albums.len() > self.album_limit
+            || self.root.as_ref().map_or(0, |root| root.snapshot.bytes)
+                + self
+                    .albums
+                    .values()
+                    .map(|album| album.snapshot.bytes)
+                    .sum::<usize>()
+                > self.byte_limit
+        {
+            let oldest = self
+                .albums
+                .iter()
+                .filter(|(id, _)| scope != Scope::Album(**id))
+                .min_by_key(|(id, cached)| (cached.used, **id))
+                .map(|(id, _)| *id)
+                .expect("cache budget fits root and the published album");
+
+            self.albums.remove(&oldest);
+        }
+    }
+
+    fn mark_completed(&mut self, scope: Scope, completed: Instant) {
+        match scope {
+            Scope::Root => self.root.as_mut().unwrap().completed = completed,
+
+            Scope::Album(id) => {
+                if let Some(cached) = self.albums.get_mut(&id) {
+                    cached.completed = completed;
+                }
+            }
+        }
     }
 }
 
@@ -1248,6 +1346,14 @@ struct Cached<T> {
     snapshot: Arc<T>,
     completed: Instant,
     used: Instant,
+}
+
+impl<T> Cached<T> {
+    fn is_fresh(&mut self, now: Instant, freshness: Duration) -> bool {
+        self.used = now;
+
+        now.duration_since(self.completed) < freshness
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1336,7 +1442,7 @@ impl Library {
         stop: CancellationToken,
     ) -> Result<Self> {
         let source = Source::new(
-            immich::Client::new(config.api_base.clone(), config.api_key.clone())?,
+            immich::Client::new(config.api_base, config.api_key)?,
             config.listen_address,
             config.friendly_name.clone(),
         );
@@ -1346,14 +1452,14 @@ impl Library {
         Ok(Self {
             inner: Arc::new(Inner {
                 source,
-                config,
+                friendly_name: config.friendly_name,
+                collator: config.collator,
                 store,
                 events,
                 stop,
                 state: Mutex::new(State {
                     ledger: Arc::new(ledger),
-                    root: None,
-                    albums: BTreeMap::new(),
+                    cache: Cache::new(),
                     flights: BTreeMap::new(),
                 }),
                 commit: AsyncMutex::new(()),
@@ -1364,12 +1470,7 @@ impl Library {
                     failed: false,
                 }),
                 wake: Notify::new(),
-                bounds: Bounds {
-                    freshness: CATALOG_FRESHNESS,
-                    albums: RESIDENT_ALBUMS,
-                    bytes: CACHE_BYTES,
-                    preparation: REFRESH_PREPARATION_TIMEOUT,
-                },
+                preparation_timeout: REFRESH_PREPARATION_TIMEOUT,
                 #[cfg(test)]
                 publication: Mutex::new(None),
                 #[cfg(test)]
@@ -1437,32 +1538,17 @@ impl Library {
 
             let now = Instant::now();
 
-            let fresh = match scope {
-                Scope::Root => state.root.as_mut().map(|cached| {
-                    cached.used = now;
+            if let Scope::Album(id) = scope
+                && !state
+                    .ledger
+                    .albums
+                    .get(&id)
+                    .is_some_and(|album| album.present)
+            {
+                return Err(MISSING);
+            }
 
-                    now.duration_since(cached.completed) < self.inner.bounds.freshness
-                }),
-
-                Scope::Album(id) => {
-                    if !state
-                        .ledger
-                        .albums
-                        .get(&id)
-                        .is_some_and(|album| album.present)
-                    {
-                        return Err(MISSING);
-                    }
-
-                    state.albums.get_mut(&id).map(|cached| {
-                        cached.used = now;
-
-                        now.duration_since(cached.completed) < self.inner.bounds.freshness
-                    })
-                }
-            };
-
-            if fresh == Some(true) {
+            if state.cache.is_fresh(scope, now) {
                 return state.view(scope);
             }
 
@@ -1508,7 +1594,7 @@ impl Library {
                 };
 
                 let library = self.clone();
-                let deadline = now + self.inner.bounds.preparation;
+                let deadline = now + self.inner.preparation_timeout;
 
                 supervisor.tasks.spawn(async move {
                     flight.result =
@@ -1653,61 +1739,12 @@ impl Library {
             );
 
             if let Some(next) = next {
-                let State { ledger, albums, .. } = &mut *state;
-
-                albums.retain(|id, _| {
-                    let before = ledger.albums.get(id);
-                    let after = next.albums.get(id);
-
-                    after.is_some_and(|album| album.present)
-                        && before.map(|album| album.present) == after.map(|album| album.present)
-                });
-
-                state.ledger = Arc::new(next);
+                let State { ledger, cache, .. } = &mut *state;
+                cache.invalidate(ledger, &next);
+                *ledger = Arc::new(next);
             }
 
-            let now = Instant::now();
-
-            match candidate {
-                Candidate::Root(snapshot) => {
-                    state.root = Some(Cached {
-                        snapshot,
-                        completed: now,
-                        used: now,
-                    });
-                }
-
-                Candidate::Album(id, snapshot) => {
-                    state.albums.insert(
-                        id,
-                        Cached {
-                            snapshot,
-                            completed: now,
-                            used: now,
-                        },
-                    );
-                }
-            }
-
-            while state.albums.len() > self.inner.bounds.albums
-                || state.root.as_ref().map_or(0, |root| root.snapshot.bytes)
-                    + state
-                        .albums
-                        .values()
-                        .map(|album| album.snapshot.bytes)
-                        .sum::<usize>()
-                    > self.inner.bounds.bytes
-            {
-                let oldest = state
-                    .albums
-                    .iter()
-                    .filter(|(id, _)| scope != Scope::Album(**id))
-                    .min_by_key(|(id, cached)| (cached.used, **id))
-                    .map(|(id, _)| *id)
-                    .expect("cache budget fits root and the published album");
-
-                state.albums.remove(&oldest);
-            }
+            state.cache.insert(candidate, Instant::now());
 
             if changed {
                 self.inner.events.publish(state.ledger.system_update_id);
@@ -1719,15 +1756,7 @@ impl Library {
 
             // Freshness starts after the entire publication boundary, not fetch.
             let completed = Instant::now();
-
-            match scope {
-                Scope::Root => state.root.as_mut().unwrap().completed = completed,
-                Scope::Album(id) => {
-                    if let Some(cached) = state.albums.get_mut(&id) {
-                        cached.completed = completed;
-                    }
-                }
-            }
+            state.cache.mark_completed(scope, completed);
 
             ensure!(
                 completed < deadline,
@@ -1767,11 +1796,23 @@ impl Catalog for Library {
             _ => {}
         }
 
-        let View {
+        view.browse(id, query, &self.inner.friendly_name, &self.inner.collator)
+    }
+}
+
+impl View {
+    fn browse(
+        &self,
+        id: ObjectId,
+        query: BrowseArguments,
+        friendly_name: &str,
+        collator: &CollatorBorrowed<'_>,
+    ) -> Result<BrowseResult, Fault> {
+        let Self {
             root,
             contents,
             ledger,
-        } = &*view;
+        } = self;
 
         let update_id = match id {
             ObjectId::Root => ledger.system_update_id,
@@ -1794,7 +1835,7 @@ impl Catalog for Library {
                 ObjectId::Root => Object {
                     id: "0".into(),
                     parent_id: "-1".into(),
-                    title: self.inner.config.friendly_name.clone(),
+                    title: friendly_name.to_owned(),
                     class: "object.container".into(),
                     date: None,
                     art: None,
@@ -1829,12 +1870,7 @@ impl Catalog for Library {
                     None => b
                         .end_date
                         .cmp(&a.end_date)
-                        .then_with(|| {
-                            self.inner
-                                .config
-                                .collator
-                                .compare(&a.object.title, &b.object.title)
-                        })
+                        .then_with(|| collator.compare(&a.object.title, &b.object.title))
                         .then_with(|| a.id.cmp(&b.id)),
 
                     Some(descending) => compare_dates(
@@ -4275,10 +4311,10 @@ mod tests {
             let mut state = self.library.inner.state.lock().unwrap();
 
             match scope {
-                Scope::Root => state.root.as_mut().unwrap().completed -= CATALOG_FRESHNESS,
+                Scope::Root => state.cache.root.as_mut().unwrap().completed -= CATALOG_FRESHNESS,
 
                 Scope::Album(id) => {
-                    state.albums.get_mut(&id).unwrap().completed -= CATALOG_FRESHNESS
+                    state.cache.albums.get_mut(&id).unwrap().completed -= CATALOG_FRESHNESS
                 }
             }
         }
@@ -5344,10 +5380,14 @@ mod tests {
     async fn expiry_and_lru_refill_are_fresh_without_writes_or_events() {
         let mut fixture = Fixture::new(2).await;
 
-        Arc::get_mut(&mut fixture.library.inner)
+        fixture
+            .library
+            .inner
+            .state
+            .lock()
             .unwrap()
-            .bounds
-            .albums = 1;
+            .cache
+            .album_limit = 1;
 
         let task = fixture.run();
         fixture.library.browse(children(1)).await.unwrap();
@@ -5360,6 +5400,7 @@ mod tests {
                 .state
                 .lock()
                 .unwrap()
+                .cache
                 .albums
                 .contains_key(&Uuid::from_u128(1))
         );
@@ -5384,12 +5425,12 @@ mod tests {
         fixture.expire(Scope::Album(Uuid::from_u128(1)));
 
         let expired =
-            fixture.library.inner.state.lock().unwrap().albums[&Uuid::from_u128(1)].completed;
+            fixture.library.inner.state.lock().unwrap().cache.albums[&Uuid::from_u128(1)].completed;
 
         fixture.library.browse(children(1)).await.unwrap();
 
         assert!(
-            fixture.library.inner.state.lock().unwrap().albums[&Uuid::from_u128(1)].completed
+            fixture.library.inner.state.lock().unwrap().cache.albums[&Uuid::from_u128(1)].completed
                 > expired
         );
 
@@ -5413,7 +5454,7 @@ mod tests {
 
     #[tokio::test]
     async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
-        let mut fixture = Fixture::new(2).await;
+        let fixture = Fixture::new(2).await;
 
         for id in 1..=2 {
             let mut asset = item(id, None, None);
@@ -5443,10 +5484,8 @@ mod tests {
             .await
             .unwrap();
 
-        Arc::get_mut(&mut fixture.library.inner)
-            .unwrap()
-            .bounds
-            .bytes = root.bytes + 2 * contents.bytes;
+        fixture.library.inner.state.lock().unwrap().cache.byte_limit =
+            root.bytes + 2 * contents.bytes;
 
         let task = fixture.run();
         fixture.library.browse(children(1)).await.unwrap();
@@ -5454,12 +5493,13 @@ mod tests {
 
         {
             let state = fixture.library.inner.state.lock().unwrap();
-            assert!(state.root.is_some());
-            assert_eq!(state.albums.len(), 2);
+            assert!(state.cache.root.is_some());
+            assert_eq!(state.cache.albums.len(), 2);
             assert_eq!(state.ledger.albums.len(), 2);
 
             assert!(
                 state
+                    .cache
                     .albums
                     .values()
                     .all(|a| a.snapshot.bytes == contents.bytes)
@@ -5489,12 +5529,12 @@ mod tests {
 
         {
             let state = fixture.library.inner.state.lock().unwrap();
-            let root_bytes = state.root.as_ref().unwrap().snapshot.bytes;
+            let root_bytes = state.cache.root.as_ref().unwrap().snapshot.bytes;
             assert!(root_bytes > root.bytes);
-            assert!(root_bytes + contents.bytes <= fixture.library.inner.bounds.bytes);
-            assert!(root_bytes + 2 * contents.bytes > fixture.library.inner.bounds.bytes);
-            assert_eq!(state.albums.len(), 1);
-            assert!(!state.albums.contains_key(&Uuid::from_u128(1)));
+            assert!(root_bytes + contents.bytes <= state.cache.byte_limit);
+            assert!(root_bytes + 2 * contents.bytes > state.cache.byte_limit);
+            assert_eq!(state.cache.albums.len(), 1);
+            assert!(!state.cache.albums.contains_key(&Uuid::from_u128(1)));
             assert_eq!(state.ledger.albums.len(), 2);
 
             for (id, album) in &state.ledger.albums {
@@ -5669,8 +5709,7 @@ mod tests {
 
         Arc::get_mut(&mut fixture.library.inner)
             .unwrap()
-            .bounds
-            .preparation = Duration::from_millis(150);
+            .preparation_timeout = Duration::from_millis(150);
 
         let task = fixture.run();
 
@@ -5741,6 +5780,7 @@ mod tests {
                 .state
                 .lock()
                 .unwrap()
+                .cache
                 .albums
                 .contains_key(&Uuid::from_u128(1))
         );
@@ -5773,6 +5813,7 @@ mod tests {
                 .state
                 .lock()
                 .unwrap()
+                .cache
                 .albums
                 .contains_key(&Uuid::from_u128(1))
         );
@@ -5875,7 +5916,19 @@ mod tests {
         task.await.unwrap().unwrap();
         assert_eq!(fixture.library.system_update_id(), 2);
         assert_eq!(fixture.library.inner.permits.available_permits(), 4);
-        assert!(fixture.library.inner.state.lock().unwrap().root.is_some());
+
+        assert!(
+            fixture
+                .library
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .cache
+                .root
+                .is_some()
+        );
+
         let events_stop = CancellationToken::new();
 
         let events = tokio::spawn(
@@ -5937,6 +5990,7 @@ mod tests {
             .state
             .lock()
             .unwrap()
+            .cache
             .root
             .as_mut()
             .unwrap()
@@ -5947,7 +6001,7 @@ mod tests {
         *library.inner.publication.lock().unwrap() = Some(barrier.clone());
         let mut caller = browse(&library, action("0", false, 0, 0, None));
         barrier.entered().await;
-        let directory = &library.inner.config.state_directory;
+        let directory = Path::new(&directory);
 
         let committed: Ledger =
             serde_json::from_slice(&fs::read(directory.join("revisions.json")).unwrap()).unwrap();
@@ -5960,7 +6014,7 @@ mod tests {
             assert_eq!(state.ledger, before);
 
             assert_eq!(
-                state.root.as_ref().unwrap().snapshot.albums[&Uuid::from_u128(1)]
+                state.cache.root.as_ref().unwrap().snapshot.albums[&Uuid::from_u128(1)]
                     .object
                     .title,
                 "Album"
@@ -6155,18 +6209,27 @@ mod tests {
         assert_eq!(fixture.library.system_update_id(), 2);
         assert_eq!(fixture.disk(), before);
         assert_eq!(fixture.fake.upstream.lock().unwrap().requests.len(), calls);
-        assert!(fixture.library.inner.state.lock().unwrap().root.is_some());
+
+        assert!(
+            fixture
+                .library
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .cache
+                .root
+                .is_some()
+        );
+
         fixture.stop(task).await;
     }
 
     #[tokio::test]
     async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
-        let mut fixture = Fixture::new(2).await;
+        let fixture = Fixture::new(2).await;
 
-        Arc::get_mut(&mut fixture.library.inner)
-            .unwrap()
-            .bounds
-            .bytes = 2 * SNAPSHOT_BYTES;
+        fixture.library.inner.state.lock().unwrap().cache.byte_limit = 2 * SNAPSHOT_BYTES;
 
         {
             let mut upstream = fixture.fake.upstream.lock().unwrap();
@@ -6209,7 +6272,7 @@ mod tests {
 
         let (album_id, system_id, a_bytes) = {
             let state = fixture.library.inner.state.lock().unwrap();
-            let bytes = state.albums[&Uuid::from_u128(1)].snapshot.bytes;
+            let bytes = state.cache.albums[&Uuid::from_u128(1)].snapshot.bytes;
             assert!(bytes > SNAPSHOT_BYTES - 8192 && bytes <= SNAPSHOT_BYTES);
 
             (
@@ -6223,15 +6286,15 @@ mod tests {
 
         {
             let state = fixture.library.inner.state.lock().unwrap();
-            let b_bytes = state.albums[&Uuid::from_u128(2)].snapshot.bytes;
+            let b_bytes = state.cache.albums[&Uuid::from_u128(2)].snapshot.bytes;
             assert!(b_bytes > SNAPSHOT_BYTES - 8192 && b_bytes <= SNAPSHOT_BYTES);
 
             assert!(
-                a_bytes + b_bytes + state.root.as_ref().unwrap().snapshot.bytes
+                a_bytes + b_bytes + state.cache.root.as_ref().unwrap().snapshot.bytes
                     > 2 * SNAPSHOT_BYTES
             );
 
-            assert!(!state.albums.contains_key(&Uuid::from_u128(1)));
+            assert!(!state.cache.albums.contains_key(&Uuid::from_u128(1)));
         }
 
         let result = children_waiter.await.unwrap();
@@ -6344,6 +6407,7 @@ mod tests {
                 .state
                 .lock()
                 .unwrap()
+                .cache
                 .albums
                 .contains_key(&Uuid::from_u128(1))
         );
