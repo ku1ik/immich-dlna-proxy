@@ -22,7 +22,7 @@ use immich_dlna_proxy::{
     catalog::{BrowseResult, Catalog, ObjectId, parse_id},
     config::{is_unicast, resolve_interface},
     eventing::Subscriptions,
-    lifecycle, limits,
+    lifecycle::{self, SHUTDOWN_GRACE},
     media::MediaProxy,
     protocol::{BrowseArguments, Fault, Object},
     server::Server,
@@ -596,7 +596,9 @@ impl Bound {
         let http_stop = stop.clone();
 
         let http = async move {
-            let primary = self.server.run(self.http, http_stop.clone());
+            let primary = self
+                .server
+                .run(self.http, http_stop.clone(), SHUTDOWN_GRACE);
 
             if let Some((listener, media)) = self.seek {
                 // The shared upstream must outlive admitted streams on both listeners.
@@ -739,7 +741,7 @@ async fn supervise(
                 stop.cancel();
                 // Reservations can become owed after admission stops. Keep their scheduler
                 // alive for the remainder of this one grace period, even if HTTP finishes early.
-                deadline = Some(Instant::now() + limits::SHUTDOWN_GRACE);
+                deadline = Some(Instant::now() + SHUTDOWN_GRACE);
             }
 
             _ = expired => {
@@ -927,14 +929,11 @@ mod tests {
         async fn finish(mut self) {
             self.stop.cancel();
 
-            tokio::time::timeout(
-                limits::SHUTDOWN_GRACE + Duration::from_secs(2),
-                &mut self.task,
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            tokio::time::timeout(SHUTDOWN_GRACE + Duration::from_secs(2), &mut self.task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
         }
     }
 
@@ -2207,7 +2206,7 @@ mod tests {
             let budget = if fatal {
                 Duration::from_secs(1)
             } else {
-                limits::SHUTDOWN_GRACE
+                SHUTDOWN_GRACE
             };
 
             assert!(started.elapsed() <= budget);
@@ -2276,6 +2275,6 @@ mod tests {
         upstream_stop.cancelled().await;
         supervisor.await.unwrap().unwrap();
         assert!(subscriptions_stop.is_cancelled());
-        assert!(started.elapsed() <= limits::SHUTDOWN_GRACE);
+        assert!(started.elapsed() <= SHUTDOWN_GRACE);
     }
 }

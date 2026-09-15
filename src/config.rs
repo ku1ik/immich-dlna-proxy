@@ -18,7 +18,7 @@ use serde::Deserialize;
 use url::Url;
 use uuid::Uuid;
 
-use crate::limits;
+const KEY_BYTES: u64 = 8 * 1024;
 
 #[derive(clap::Parser)]
 #[command(version, about)]
@@ -182,19 +182,19 @@ fn read_key(path: &Path) -> anyhow::Result<HeaderValue> {
     let metadata = file.metadata().context("cannot inspect API key file")?;
 
     ensure!(
-        metadata.is_file() && metadata.len() <= limits::KEY_BYTES,
+        metadata.is_file() && metadata.len() <= KEY_BYTES,
         "API key must be a regular file of at most 8 KiB"
     );
 
     let mut bytes = Vec::new();
 
     (&file)
-        .take(limits::KEY_BYTES)
+        .take(KEY_BYTES)
         .read_to_end(&mut bytes)
         .context("cannot read API key file")?;
 
     ensure!(
-        file.metadata()?.len() <= limits::KEY_BYTES,
+        file.metadata()?.len() <= KEY_BYTES,
         "API key file exceeds 8 KiB"
     );
 
@@ -469,9 +469,9 @@ state_directory = "/var/lib/immich-dlna-proxy"
             assert!(read_key(&path).is_err());
         }
 
-        fs::write(&path, vec![b'x'; limits::KEY_BYTES as usize]).unwrap();
+        fs::write(&path, vec![b'x'; KEY_BYTES as usize]).unwrap();
         assert!(read_key(&path).is_ok());
-        fs::write(&path, vec![b'x'; limits::KEY_BYTES as usize + 1]).unwrap();
+        fs::write(&path, vec![b'x'; KEY_BYTES as usize + 1]).unwrap();
         assert!(read_key(&path).is_err());
         assert!(read_key(&directory.path().join("absent")).is_err());
         assert!(read_key(directory.path()).is_err());

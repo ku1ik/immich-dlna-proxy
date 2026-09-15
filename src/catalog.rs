@@ -36,9 +36,24 @@ use crate::{
     deadline::Budget,
     eventing::Subscriptions,
     immich::{self, Asset, AssetFilter, Client},
-    limits::{self, COMMIT_TIMEOUT, CURRENT_ALBUMS, RETAINED_ALBUMS, REVISION_BYTES},
     protocol::{BrowseArguments, Fault, Object, Resource},
 };
+
+const CATALOG_FRESHNESS: Duration = Duration::from_secs(60);
+const RESIDENT_ALBUMS: usize = 32;
+const CACHE_BYTES: usize = 64 * 1024 * 1024;
+const SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+const ALBUM_ITEMS: usize = 20_000;
+const MAX_ALBUMS: usize = 4_096;
+const RETAINED_ALBUMS: usize = 16_384;
+const REVISION_BYTES: usize = 8 * 1024 * 1024;
+const SEARCH_PAGES: usize = 50;
+const SEARCH_RECORDS: usize = 50_000;
+const REFRESHES: usize = 4;
+const REFRESH_PREPARATION_TIMEOUT: Duration = Duration::from_secs(20);
+// The outer commit includes publication; persistence also runs independently at startup.
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+const PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Select, sort and paginate objects, capturing their revision together.
 pub trait Catalog: Send + Sync + 'static {
@@ -185,7 +200,7 @@ impl Source {
         };
 
         let mut albums = BTreeMap::new();
-        let mut bytes = 2 + encoded_size(&root_object, limits::SNAPSHOT_BYTES - 2)?;
+        let mut bytes = 2 + encoded_size(&root_object, SNAPSHOT_BYTES - 2)?;
         let mut bad_dates = 0;
 
         for dto in records {
@@ -211,7 +226,7 @@ impl Source {
                 digest: String::new(),
             };
 
-            let mut projection = Projection::new(limits::SNAPSHOT_BYTES);
+            let mut projection = Projection::new(SNAPSHOT_BYTES);
             projection.json(&album)?;
             let (digest, size) = projection.finish();
             album.digest = digest;
@@ -221,15 +236,12 @@ impl Source {
                 continue;
             }
 
-            ensure!(
-                albums.len() < limits::CURRENT_ALBUMS,
-                "Immich root exceeds album limit"
-            );
+            ensure!(albums.len() < MAX_ALBUMS, "Immich root exceeds album limit");
 
             bytes += 1 + size;
 
             ensure!(
-                bytes <= limits::SNAPSHOT_BYTES,
+                bytes <= SNAPSHOT_BYTES,
                 "Immich root exceeds projected byte limit"
             );
 
@@ -238,7 +250,7 @@ impl Source {
 
         budget.check()?;
         log_dates(bad_dates);
-        let mut projection = Projection::new(limits::SNAPSHOT_BYTES);
+        let mut projection = Projection::new(SNAPSHOT_BYTES);
         projection.write_all(b"[")?;
         projection.json(&root_object)?;
 
@@ -288,7 +300,7 @@ impl Source {
                 budget.check()?;
 
                 ensure!(
-                    pages < limits::SEARCH_PAGES && records < limits::SEARCH_RECORDS,
+                    pages < SEARCH_PAGES && records < SEARCH_RECORDS,
                     "Immich album traversal limit exceeded"
                 );
 
@@ -306,7 +318,7 @@ impl Source {
                     .await?;
 
                 ensure!(
-                    result.items.len() <= limits::SEARCH_RECORDS - records,
+                    result.items.len() <= SEARCH_RECORDS - records,
                     "Immich album record limit exceeded"
                 );
 
@@ -337,16 +349,13 @@ impl Source {
                                 continue;
                             }
 
-                            ensure!(
-                                items.len() < limits::ALBUM_ITEMS,
-                                "Immich album exceeds item limit"
-                            );
+                            ensure!(items.len() < ALBUM_ITEMS, "Immich album exceeds item limit");
 
                             bytes += usize::from(!items.is_empty())
-                                + encoded_size(&item, limits::SNAPSHOT_BYTES - bytes)?;
+                                + encoded_size(&item, SNAPSHOT_BYTES - bytes)?;
 
                             ensure!(
-                                bytes <= limits::SNAPSHOT_BYTES,
+                                bytes <= SNAPSHOT_BYTES,
                                 "Immich album exceeds projected byte limit"
                             );
 
@@ -382,7 +391,7 @@ impl Source {
             if let Some(item) = items.get_mut(&id)
                 && item.object.class == "object.item.videoItem"
             {
-                let old_size = encoded_size(item, limits::SNAPSHOT_BYTES)?;
+                let old_size = encoded_size(item, SNAPSHOT_BYTES)?;
 
                 item.object.resources.push(Resource {
                     uri: self.media_url(id, "playback"),
@@ -392,13 +401,13 @@ impl Source {
                 });
 
                 bytes -= old_size;
-                bytes += encoded_size(item, limits::SNAPSHOT_BYTES - bytes)?;
+                bytes += encoded_size(item, SNAPSHOT_BYTES - bytes)?;
             }
         }
 
         budget.check()?;
         log_dates(bad_dates);
-        let mut projection = Projection::new(limits::SNAPSHOT_BYTES);
+        let mut projection = Projection::new(SNAPSHOT_BYTES);
         projection.write_all(b"[")?;
 
         for (index, item) in items.values().enumerate() {
@@ -725,7 +734,7 @@ impl Ledger {
         );
 
         ensure!(
-            self.albums.values().filter(|album| album.present).count() <= CURRENT_ALBUMS,
+            self.albums.values().filter(|album| album.present).count() <= MAX_ALBUMS,
             "revision state exceeds 4096 present albums"
         );
 
@@ -768,7 +777,7 @@ impl Ledger {
         albums: &BTreeMap<Uuid, String>,
     ) -> anyhow::Result<Option<Self>> {
         ensure!(
-            albums.len() <= CURRENT_ALBUMS,
+            albums.len() <= MAX_ALBUMS,
             "root exceeds 4096 present albums"
         );
 
@@ -1014,7 +1023,7 @@ impl Store {
         }
 
         let guard = Commit;
-        let deadline = tokio::time::Instant::now() + COMMIT_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + PERSIST_TIMEOUT;
         let inner = Arc::clone(&self.inner);
 
         let worker = tokio::task::spawn_blocking(move || {
@@ -1034,7 +1043,7 @@ impl Store {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
 
-            tokio::time::advance(COMMIT_TIMEOUT + std::time::Duration::from_millis(1)).await;
+            tokio::time::advance(PERSIST_TIMEOUT + std::time::Duration::from_millis(1)).await;
         }
 
         match tokio::time::timeout_at(deadline, worker).await {
@@ -1164,8 +1173,8 @@ const MISSING: Fault = Fault { code: 701 };
 
 // Eviction always has room for the retained root and the album being published.
 const _: () = {
-    assert!(2 * limits::SNAPSHOT_BYTES <= limits::CACHE_BYTES);
-    assert!(limits::RESIDENT_ALBUMS > 0);
+    assert!(2 * SNAPSHOT_BYTES <= CACHE_BYTES);
+    assert!(RESIDENT_ALBUMS > 0);
 };
 
 #[derive(Clone)]
@@ -1348,7 +1357,7 @@ impl Library {
                     flights: BTreeMap::new(),
                 }),
                 commit: AsyncMutex::new(()),
-                permits: Arc::new(Semaphore::new(limits::REFRESHES)),
+                permits: Arc::new(Semaphore::new(REFRESHES)),
                 supervisor: Mutex::new(Supervisor {
                     tasks: JoinSet::new(),
                     running: false,
@@ -1356,10 +1365,10 @@ impl Library {
                 }),
                 wake: Notify::new(),
                 bounds: Bounds {
-                    freshness: limits::CATALOG_FRESHNESS,
-                    albums: limits::RESIDENT_ALBUMS,
-                    bytes: limits::CACHE_BYTES,
-                    preparation: limits::REFRESH_PREPARATION_TIMEOUT,
+                    freshness: CATALOG_FRESHNESS,
+                    albums: RESIDENT_ALBUMS,
+                    bytes: CACHE_BYTES,
+                    preparation: REFRESH_PREPARATION_TIMEOUT,
                 },
                 #[cfg(test)]
                 publication: Mutex::new(None),
@@ -1585,7 +1594,7 @@ impl Library {
             "catalog preparation stopped or expired"
         );
 
-        let deadline = Instant::now() + limits::COMMIT_TIMEOUT;
+        let deadline = Instant::now() + COMMIT_TIMEOUT;
 
         let ledger = {
             let state = self.inner.state.lock().unwrap();
@@ -1903,7 +1912,7 @@ mod snapshot_tests {
 
     fn budget() -> Budget {
         Budget {
-            deadline: Instant::now() + limits::REFRESH_PREPARATION_TIMEOUT,
+            deadline: Instant::now() + REFRESH_PREPARATION_TIMEOUT,
             stop: CancellationToken::new(),
         }
     }
@@ -2249,7 +2258,7 @@ mod snapshot_tests {
             assert_eq!(request.uri, "/prefix/api/search/metadata");
             assert_eq!(request.body["albumIds"], json!([ALBUM]));
             assert_eq!(request.body["page"], json!(expected_page));
-            assert_eq!(request.body["size"], json!(limits::SEARCH_PAGE_SIZE));
+            assert_eq!(request.body["size"], json!(immich::SEARCH_PAGE_SIZE));
             assert_eq!(request.body["withDeleted"], false);
             assert_eq!(request.body["withExif"], false);
             assert_eq!(request.body["withPeople"], false);
@@ -2425,7 +2434,7 @@ mod snapshot_tests {
         );
         assert_eq!(baseline.digest.len(), 64);
         let item = baseline.items.values().next().unwrap();
-        let mut original = Projection::new(limits::SNAPSHOT_BYTES);
+        let mut original = Projection::new(SNAPSHOT_BYTES);
         original.json(item).unwrap();
         let original = original.finish().0;
 
@@ -2445,20 +2454,20 @@ mod snapshot_tests {
             };
 
             let changed = project(&fake.source, changed);
-            let mut digest = Projection::new(limits::SNAPSHOT_BYTES);
+            let mut digest = Projection::new(SNAPSHOT_BYTES);
             digest.json(&changed).unwrap();
             assert_ne!(original, digest.finish().0, "{field}");
         }
 
         let mut reversed = item.clone();
         reversed.object.resources.reverse();
-        let mut digest = Projection::new(limits::SNAPSHOT_BYTES);
+        let mut digest = Projection::new(SNAPSHOT_BYTES);
         digest.json(&reversed).unwrap();
         assert_ne!(original, digest.finish().0);
 
         for item in baseline.items.values() {
             let size = serde_json::to_vec(item).unwrap().len();
-            assert_eq!(encoded_size(item, limits::SNAPSHOT_BYTES).unwrap(), size);
+            assert_eq!(encoded_size(item, SNAPSHOT_BYTES).unwrap(), size);
             assert_eq!(encoded_size(item, size).unwrap(), size);
             assert!(encoded_size(item, size - 1).is_err());
         }
@@ -2486,12 +2495,12 @@ mod snapshot_tests {
         for finish in [false, true] {
             let mut replies = vec![page(vec![asset(1, "VIDEO")], None)];
 
-            for number in 1..limits::SEARCH_PAGES {
+            for number in 1..SEARCH_PAGES {
                 let next = (number + 1).to_string();
 
                 replies.push(page(
                     vec![asset(number as u128, "VIDEO")],
-                    if finish && number == limits::SEARCH_PAGES - 1 {
+                    if finish && number == SEARCH_PAGES - 1 {
                         None
                     } else {
                         Some(&next)
@@ -2501,7 +2510,7 @@ mod snapshot_tests {
 
             let fake = SnapshotFixture::new(replies).await;
             assert_eq!(fake.source.contents(ALBUM, &budget()).await.is_ok(), finish);
-            assert_eq!(fake.requests.lock().unwrap().len(), limits::SEARCH_PAGES);
+            assert_eq!(fake.requests.lock().unwrap().len(), SEARCH_PAGES);
         }
     }
 
@@ -2510,9 +2519,7 @@ mod snapshot_tests {
         let excluded = json!({"id": Uuid::from_u128(1), "type": "AUDIO", "visibility": "hidden", "isTrashed": false, "isEdited": false});
 
         // Raw records count even when identical and excluded; pages need not be full.
-        let fake =
-            SnapshotFixture::new(vec![page(vec![excluded; limits::SEARCH_RECORDS + 1], None)])
-                .await;
+        let fake = SnapshotFixture::new(vec![page(vec![excluded; SEARCH_RECORDS + 1], None)]).await;
 
         assert!(
             fake.source
@@ -2528,7 +2535,7 @@ mod snapshot_tests {
 
             let fake = SnapshotFixture::new(vec![
                 page(vec![asset(1, "VIDEO")], None),
-                page(vec![encoded; limits::SEARCH_RECORDS - 1 + extra], None),
+                page(vec![encoded; SEARCH_RECORDS - 1 + extra], None),
             ])
             .await;
 
@@ -2542,13 +2549,13 @@ mod snapshot_tests {
 
         let mut replies = Vec::new();
 
-        for page_number in 0..=limits::ALBUM_ITEMS / limits::SEARCH_PAGE_SIZE {
-            let start = page_number * limits::SEARCH_PAGE_SIZE + 1;
+        for page_number in 0..=ALBUM_ITEMS / immich::SEARCH_PAGE_SIZE {
+            let start = page_number * immich::SEARCH_PAGE_SIZE + 1;
 
-            let count = if start > limits::ALBUM_ITEMS {
+            let count = if start > ALBUM_ITEMS {
                 1
             } else {
-                limits::SEARCH_PAGE_SIZE
+                immich::SEARCH_PAGE_SIZE
             };
 
             let next = (page_number + 2).to_string();
@@ -2575,7 +2582,7 @@ mod snapshot_tests {
         let fake = SnapshotFixture::new(vec![
             version(),
             reply(json!(
-                (0..=limits::CURRENT_ALBUMS)
+                (0..=MAX_ALBUMS)
                     .map(|id| album(Uuid::from_u128(id as u128)))
                     .collect::<Vec<_>>()
             )),
@@ -2592,7 +2599,7 @@ mod snapshot_tests {
         );
 
         let mut big = asset(1, "IMAGE");
-        big["checksum"] = json!("x".repeat(limits::SNAPSHOT_BYTES / 2));
+        big["checksum"] = json!("x".repeat(SNAPSHOT_BYTES / 2));
         let mut bigger = big.clone();
         bigger["id"] = json!(Uuid::from_u128(2));
 
@@ -2920,7 +2927,7 @@ mod revision_tests {
 
     #[test]
     fn replacement_at_current_capacity_retains_history_and_exhaustion_is_recoverable() {
-        let mut albums: BTreeMap<_, _> = (1..=CURRENT_ALBUMS)
+        let mut albums: BTreeMap<_, _> = (1..=MAX_ALBUMS)
             .map(|number| (id(number as u128), digest(1)))
             .collect();
 
@@ -2930,25 +2937,22 @@ mod revision_tests {
             .unwrap();
 
         albums.remove(&id(1));
-        albums.insert(id(CURRENT_ALBUMS as u128 + 1), digest(1));
+        albums.insert(id(MAX_ALBUMS as u128 + 1), digest(1));
 
         let replacement = ledger
             .root_transition(&digest(2), &albums)
             .unwrap()
             .unwrap();
 
-        assert_eq!(replacement.albums.len(), CURRENT_ALBUMS + 1);
+        assert_eq!(replacement.albums.len(), MAX_ALBUMS + 1);
         assert!(!replacement.albums[&id(1)].present);
         assert_eq!(replacement.albums[&id(1)].update_id, 1);
 
-        assert_eq!(
-            replacement.albums[&id(CURRENT_ALBUMS as u128 + 1)].update_id,
-            0
-        );
+        assert_eq!(replacement.albums[&id(MAX_ALBUMS as u128 + 1)].update_id, 0);
 
-        albums.insert(id(CURRENT_ALBUMS as u128 + 2), digest(1));
+        albums.insert(id(MAX_ALBUMS as u128 + 2), digest(1));
         assert!(replacement.root_transition(&digest(3), &albums).is_err());
-        assert_eq!(replacement.albums.len(), CURRENT_ALBUMS + 1);
+        assert_eq!(replacement.albums.len(), MAX_ALBUMS + 1);
         let mut full = populated();
 
         for number in 1..=RETAINED_ALBUMS {
@@ -3396,7 +3400,7 @@ mod revision_tests {
                 id(number as u128),
                 AlbumRevision {
                     update_id: 0,
-                    present: number <= CURRENT_ALBUMS,
+                    present: number <= MAX_ALBUMS,
                     metadata_digest: digest(1),
                     contents_digest: Some(digest(2)),
                 },
@@ -3409,7 +3413,7 @@ mod revision_tests {
 
         ledger
             .albums
-            .get_mut(&id(CURRENT_ALBUMS as u128 + 1))
+            .get_mut(&id(MAX_ALBUMS as u128 + 1))
             .unwrap()
             .present = true;
 
@@ -3418,7 +3422,7 @@ mod revision_tests {
 
         ledger
             .albums
-            .get_mut(&id(CURRENT_ALBUMS as u128 + 1))
+            .get_mut(&id(MAX_ALBUMS as u128 + 1))
             .unwrap()
             .present = false;
 
@@ -3809,7 +3813,7 @@ mod revision_tests {
             assert_eq!(status.code(), Some(1), "{mode}");
 
             if mode == "hang" {
-                assert!(started.elapsed() >= COMMIT_TIMEOUT);
+                assert!(started.elapsed() >= PERSIST_TIMEOUT);
             }
 
             assert!(started.elapsed() < Duration::from_secs(8));
@@ -4271,10 +4275,10 @@ mod tests {
             let mut state = self.library.inner.state.lock().unwrap();
 
             match scope {
-                Scope::Root => state.root.as_mut().unwrap().completed -= limits::CATALOG_FRESHNESS,
+                Scope::Root => state.root.as_mut().unwrap().completed -= CATALOG_FRESHNESS,
 
                 Scope::Album(id) => {
-                    state.albums.get_mut(&id).unwrap().completed -= limits::CATALOG_FRESHNESS
+                    state.albums.get_mut(&id).unwrap().completed -= CATALOG_FRESHNESS
                 }
             }
         }
@@ -4299,10 +4303,7 @@ mod tests {
 
             assert!(self.library.inner.state.lock().unwrap().flights.is_empty());
 
-            assert_eq!(
-                self.library.inner.permits.available_permits(),
-                limits::REFRESHES
-            );
+            assert_eq!(self.library.inner.permits.available_permits(), REFRESHES);
         }
     }
 
@@ -4564,7 +4565,11 @@ mod tests {
         let catalog_task = fixture.run();
         let events_task = tokio::spawn(events.clone().run(events_stop.clone()));
         let server = Server::new(name, uuid, fixture.library.clone(), media, events);
-        let server_task = tokio::spawn(server.run(listener, server_stop.clone()));
+        let server_task = tokio::spawn(server.run(
+            listener,
+            server_stop.clone(),
+            crate::lifecycle::SHUTDOWN_GRACE,
+        ));
 
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -4859,7 +4864,7 @@ mod tests {
 
         // Root, initial contents, and the changed refresh coalesce while SEQ=0 is in flight.
         tokio::time::pause();
-        tokio::time::advance(limits::EVENT_MODERATION).await;
+        tokio::time::advance(crate::eventing::EVENT_MODERATION).await;
         tokio::time::resume();
         fixture.fake.upstream.lock().unwrap().notification_gate = None;
         callback_gate.release.add_permits(1);
@@ -5424,7 +5429,7 @@ mod tests {
         }
 
         let budget = Budget {
-            deadline: Instant::now() + limits::REFRESH_PREPARATION_TIMEOUT,
+            deadline: Instant::now() + REFRESH_PREPARATION_TIMEOUT,
             stop: fixture.library.inner.stop.clone(),
         };
 
@@ -5935,7 +5940,7 @@ mod tests {
             .root
             .as_mut()
             .unwrap()
-            .completed -= limits::CATALOG_FRESHNESS;
+            .completed -= CATALOG_FRESHNESS;
 
         let mut barrier = Barrier::new();
         Arc::get_mut(&mut barrier).unwrap().panic = mode == "panic";
@@ -5988,7 +5993,7 @@ mod tests {
 
             _ = fake.notifications.recv() => std::process::exit(93),
 
-            _ = tokio::time::sleep(limits::COMMIT_TIMEOUT + Duration::from_secs(1)) => {
+            _ = tokio::time::sleep(COMMIT_TIMEOUT + Duration::from_secs(1)) => {
                 std::process::exit(94);
             }
         }
@@ -6145,7 +6150,7 @@ mod tests {
         let before = fixture.disk();
         let calls = fixture.fake.upstream.lock().unwrap().requests.len();
         tokio::time::pause();
-        tokio::time::advance(limits::CATALOG_FRESHNESS).await;
+        tokio::time::advance(CATALOG_FRESHNESS).await;
         tokio::time::resume();
         assert_eq!(fixture.library.system_update_id(), 2);
         assert_eq!(fixture.disk(), before);
@@ -6161,7 +6166,7 @@ mod tests {
         Arc::get_mut(&mut fixture.library.inner)
             .unwrap()
             .bounds
-            .bytes = 2 * limits::SNAPSHOT_BYTES;
+            .bytes = 2 * SNAPSHOT_BYTES;
 
         {
             let mut upstream = fixture.fake.upstream.lock().unwrap();
@@ -6169,7 +6174,7 @@ mod tests {
 
             for id in 1..=2 {
                 let mut asset = item(id, None, None);
-                asset["checksum"] = json!("x".repeat(limits::SNAPSHOT_BYTES - 4096));
+                asset["checksum"] = json!("x".repeat(SNAPSHOT_BYTES - 4096));
                 upstream.contents.insert(Uuid::from_u128(id), vec![asset]);
             }
         }
@@ -6205,7 +6210,7 @@ mod tests {
         let (album_id, system_id, a_bytes) = {
             let state = fixture.library.inner.state.lock().unwrap();
             let bytes = state.albums[&Uuid::from_u128(1)].snapshot.bytes;
-            assert!(bytes > limits::SNAPSHOT_BYTES - 8192 && bytes <= limits::SNAPSHOT_BYTES);
+            assert!(bytes > SNAPSHOT_BYTES - 8192 && bytes <= SNAPSHOT_BYTES);
 
             (
                 state.ledger.albums[&Uuid::from_u128(1)].update_id,
@@ -6219,11 +6224,11 @@ mod tests {
         {
             let state = fixture.library.inner.state.lock().unwrap();
             let b_bytes = state.albums[&Uuid::from_u128(2)].snapshot.bytes;
-            assert!(b_bytes > limits::SNAPSHOT_BYTES - 8192 && b_bytes <= limits::SNAPSHOT_BYTES);
+            assert!(b_bytes > SNAPSHOT_BYTES - 8192 && b_bytes <= SNAPSHOT_BYTES);
 
             assert!(
                 a_bytes + b_bytes + state.root.as_ref().unwrap().snapshot.bytes
-                    > 2 * limits::SNAPSHOT_BYTES
+                    > 2 * SNAPSHOT_BYTES
             );
 
             assert!(!state.albums.contains_key(&Uuid::from_u128(1)));

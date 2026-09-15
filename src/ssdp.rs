@@ -12,12 +12,18 @@ use tokio::{io::Interest, net::UdpSocket, time::Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::limits;
+const SSDP_MAX_AGE: u64 = 1800;
+const SSDP_ANNOUNCEMENT_INTERVAL: Duration = Duration::from_secs(900);
+const SSDP_TTL: u32 = 2;
+const SSDP_DATAGRAM_BYTES: usize = 8 * 1024;
+const SSDP_PENDING_RESPONSES: usize = 256;
+const SSDP_RESPONSES_PER_SECOND: u32 = 50;
+const SSDP_RESPONSE_BURST: u32 = 100;
 
 const MULTICAST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 1900);
 const STARTUP_REPEAT: Duration = Duration::from_secs(1);
 const RESPONSE_SPACING: Duration =
-    Duration::from_nanos(1_000_000_000 / limits::SSDP_RESPONSES_PER_SECOND as u64);
+    Duration::from_nanos(1_000_000_000 / SSDP_RESPONSES_PER_SECOND as u64);
 
 pub struct Discovery {
     socket: UdpSocket,
@@ -103,7 +109,7 @@ impl Discovery {
         let mut announcement = start + STARTUP_REPEAT;
         let mut startup_repeat = true;
         let mut responses = Responses::new(start);
-        let mut buffer = [0; limits::SSDP_DATAGRAM_BYTES];
+        let mut buffer = [0; SSDP_DATAGRAM_BYTES];
 
         loop {
             let now = Instant::now();
@@ -120,9 +126,9 @@ impl Discovery {
                     announcement = if startup_repeat {
                         startup_repeat = false;
 
-                        start + limits::SSDP_ANNOUNCEMENT_INTERVAL
+                        start + SSDP_ANNOUNCEMENT_INTERVAL
                     } else {
-                        Instant::now() + limits::SSDP_ANNOUNCEMENT_INTERVAL
+                        Instant::now() + SSDP_ANNOUNCEMENT_INTERVAL
                     };
                 }
 
@@ -216,7 +222,7 @@ impl Discovery {
         if !matches!(kind, Message::Byebye) {
             message.push_str(&format!(
                 "CACHE-CONTROL: max-age={}\r\nLOCATION: {}\r\nSERVER: {}\r\n",
-                limits::SSDP_MAX_AGE,
+                SSDP_MAX_AGE,
                 self.location,
                 crate::server_header(),
             ));
@@ -252,7 +258,7 @@ struct Search {
 }
 
 fn parse_search(bytes: &[u8], targets: &[String; 5]) -> Option<Search> {
-    if bytes.len() > limits::SSDP_DATAGRAM_BYTES || !bytes.is_ascii() {
+    if bytes.len() > SSDP_DATAGRAM_BYTES || !bytes.is_ascii() {
         return None;
     }
 
@@ -343,8 +349,8 @@ struct Responses {
 impl Responses {
     fn new(now: Instant) -> Self {
         Self {
-            pending: Vec::with_capacity(limits::SSDP_PENDING_RESPONSES),
-            credit: RESPONSE_SPACING * limits::SSDP_RESPONSE_BURST,
+            pending: Vec::with_capacity(SSDP_PENDING_RESPONSES),
+            credit: RESPONSE_SPACING * SSDP_RESPONSE_BURST,
             updated: now,
         }
     }
@@ -360,7 +366,7 @@ impl Responses {
 
         let count = if search.target.is_some() { 1 } else { 5 };
 
-        if self.pending.len() + count > limits::SSDP_PENDING_RESPONSES {
+        if self.pending.len() + count > SSDP_PENDING_RESPONSES {
             return;
         }
 
@@ -382,7 +388,7 @@ impl Responses {
         self.pending.retain(|response| response.expires > now);
 
         self.credit = (self.credit + now.duration_since(self.updated))
-            .min(RESPONSE_SPACING * limits::SSDP_RESPONSE_BURST);
+            .min(RESPONSE_SPACING * SSDP_RESPONSE_BURST);
 
         self.updated = now;
 
@@ -440,7 +446,7 @@ fn make_socket(address: SocketAddrV4) -> io::Result<Socket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     socket.set_multicast_all_v4(false)?;
-    socket.set_multicast_ttl_v4(limits::SSDP_TTL)?;
+    socket.set_multicast_ttl_v4(SSDP_TTL)?;
     socket.set_nonblocking(true)?;
     let enabled: libc::c_int = 1;
 
@@ -552,7 +558,7 @@ fn send(
     address: Ipv4Addr,
     interface_index: u32,
 ) -> io::Result<()> {
-    if bytes.len() > limits::SSDP_DATAGRAM_BYTES {
+    if bytes.len() > SSDP_DATAGRAM_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "SSDP datagram too large",
@@ -723,9 +729,9 @@ mod tests {
     fn parser_enforces_exact_datagram_bound() {
         let valid = search("ssdp:all", "1");
         let prefix = valid.strip_suffix("\r\n").unwrap();
-        let padding = "a".repeat(limits::SSDP_DATAGRAM_BYTES - prefix.len() - 7);
+        let padding = "a".repeat(SSDP_DATAGRAM_BYTES - prefix.len() - 7);
         let packet = format!("{prefix}X: {padding}\r\n\r\n");
-        assert_eq!(packet.len(), limits::SSDP_DATAGRAM_BYTES);
+        assert_eq!(packet.len(), SSDP_DATAGRAM_BYTES);
         assert!(parse_search(packet.as_bytes(), &targets(UUID)).is_some());
         assert!(parse_search(packet.replace("X: ", "X: aa").as_bytes(), &targets(UUID)).is_none());
     }
@@ -765,7 +771,7 @@ mod tests {
             || 0,
         );
 
-        assert_eq!(responses.pending.len(), limits::SSDP_PENDING_RESPONSES);
+        assert_eq!(responses.pending.len(), SSDP_PENDING_RESPONSES);
 
         responses.enqueue(
             Search {
@@ -777,7 +783,7 @@ mod tests {
             || 0,
         );
 
-        assert_eq!(responses.pending.len(), limits::SSDP_PENDING_RESPONSES);
+        assert_eq!(responses.pending.len(), SSDP_PENDING_RESPONSES);
         assert_eq!(responses.next_deadline(now + all.mx), None);
         responses.enqueue(all, LOCAL, now + all.mx, || 0);
         assert_eq!(responses.pending.len(), 5);
@@ -809,11 +815,11 @@ mod tests {
 
         let now = now + Duration::from_secs(10);
 
-        for _ in 0..limits::SSDP_PENDING_RESPONSES {
+        for _ in 0..SSDP_PENDING_RESPONSES {
             responses.enqueue(request, LOCAL, now, || 0);
         }
 
-        for _ in 0..limits::SSDP_RESPONSE_BURST {
+        for _ in 0..SSDP_RESPONSE_BURST {
             assert!(responses.pop_due(now).is_some());
         }
 
@@ -829,7 +835,7 @@ mod tests {
         assert!(responses.pop_due(now + RESPONSE_SPACING).is_some());
         assert!(responses.pop_due(now + RESPONSE_SPACING).is_none());
 
-        for tick in 2..=limits::SSDP_RESPONSES_PER_SECOND {
+        for tick in 2..=SSDP_RESPONSES_PER_SECOND {
             assert!(responses.pop_due(now + RESPONSE_SPACING * tick).is_some());
             assert!(responses.pop_due(now + RESPONSE_SPACING * tick).is_none());
         }
@@ -892,7 +898,7 @@ mod tests {
                 assert!(message.contains(&format!("USN: {usn}\r\n")));
                 assert!(message.ends_with("\r\n\r\n"));
                 assert!(!message.replace("\r\n", "").contains(['\r', '\n']));
-                assert!(message.len() <= limits::SSDP_DATAGRAM_BYTES);
+                assert!(message.len() <= SSDP_DATAGRAM_BYTES);
                 assert!(!message.contains("BOOTID"));
                 assert!(!message.contains("CONFIGID"));
 
@@ -922,7 +928,7 @@ mod tests {
         let discovery = loopback();
         let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let destination = discovery.socket.local_addr().unwrap();
-        let mut buffer = [0; limits::SSDP_DATAGRAM_BYTES];
+        let mut buffer = [0; SSDP_DATAGRAM_BYTES];
         peer.send_to(b"probe", destination).await.unwrap();
 
         let packet = tokio::time::timeout(
@@ -970,7 +976,7 @@ mod tests {
         assert_eq!(source.ip(), selected_source);
         assert_eq!(source.port(), destination.port());
 
-        peer.send_to(&vec![b'x'; limits::SSDP_DATAGRAM_BYTES + 1], destination)
+        peer.send_to(&vec![b'x'; SSDP_DATAGRAM_BYTES + 1], destination)
             .await
             .unwrap();
 
@@ -988,7 +994,7 @@ mod tests {
 
         assert!(
             discovery
-                .send(&vec![0; limits::SSDP_DATAGRAM_BYTES + 1], LOCAL)
+                .send(&vec![0; SSDP_DATAGRAM_BYTES + 1], LOCAL)
                 .is_err()
         );
     }
@@ -999,7 +1005,7 @@ mod tests {
         let address = first.local_addr().unwrap();
         let second = make_socket(address.as_socket_ipv4().unwrap()).unwrap();
         assert_eq!(second.local_addr().unwrap(), address);
-        assert_eq!(first.multicast_ttl_v4().unwrap(), limits::SSDP_TTL);
+        assert_eq!(first.multicast_ttl_v4().unwrap(), SSDP_TTL);
         assert!(!first.multicast_all_v4().unwrap());
         let socket = UdpSocket::from_std(first.into()).unwrap();
 
@@ -1043,7 +1049,7 @@ mod tests {
 
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(discovery.run_to(shutdown.clone(), destination));
-        let mut buffer = [0; limits::SSDP_DATAGRAM_BYTES];
+        let mut buffer = [0; SSDP_DATAGRAM_BYTES];
 
         peer.send_to(search("ssdp:all", "1").as_bytes(), address)
             .await
@@ -1094,15 +1100,12 @@ mod tests {
 
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(discovery.run_to(shutdown.clone(), destination));
-        let mut buffer = [0; limits::SSDP_DATAGRAM_BYTES];
+        let mut buffer = [0; SSDP_DATAGRAM_BYTES];
 
         for (advance, nts) in [
             (Duration::ZERO, "ssdp:alive"),
             (STARTUP_REPEAT, "ssdp:alive"),
-            (
-                limits::SSDP_ANNOUNCEMENT_INTERVAL - STARTUP_REPEAT,
-                "ssdp:alive",
-            ),
+            (SSDP_ANNOUNCEMENT_INTERVAL - STARTUP_REPEAT, "ssdp:alive"),
             (Duration::ZERO, "ssdp:byebye"),
         ] {
             if nts == "ssdp:byebye" {

@@ -7,9 +7,10 @@ use http::{HeaderValue, Method, StatusCode, header};
 use hyper_util::{rt::TokioIo, service::TowerToHyperService};
 use immich_dlna_proxy::{
     deadline::timeout_at,
-    limits,
+    lifecycle::SHUTDOWN_GRACE,
     media::MediaProxy,
-    transport::{self, WriteDeadline},
+    server::{CONNECTIONS, HEADER_TIMEOUT, WRITE_IDLE_TIMEOUT},
+    transport::{self, HEADER_BYTES, WriteDeadline},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -45,7 +46,7 @@ pub async fn response(media: &MediaProxy, request: Request) -> Response {
                 .map(|(name, value)| name.as_str().len() + value.len() + 4)
                 .sum::<usize>();
 
-        if header_bytes > limits::HEADER_BYTES {
+        if header_bytes > HEADER_BYTES {
             return empty(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
         }
 
@@ -161,7 +162,7 @@ pub async fn run(
                 }
 
                 // Completed but unreaped tasks count too, bounding the results backlog.
-                if tasks.len() >= limits::CONNECTIONS {
+                if tasks.len() >= CONNECTIONS {
                     let _ = socket.try_write(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
                     continue;
                 }
@@ -177,7 +178,7 @@ pub async fn run(
         tasks.abort_all();
     }
 
-    let deadline = Instant::now() + limits::SHUTDOWN_GRACE;
+    let deadline = Instant::now() + SHUTDOWN_GRACE;
 
     while !tasks.is_empty() {
         match timeout_at(deadline, tasks.join_next()).await {
@@ -233,9 +234,9 @@ async fn connection<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(io: T, m
         }
     });
 
-    let transport = WriteDeadline::new(io, limits::STREAM_IDLE_TIMEOUT);
+    let transport = WriteDeadline::new(io, WRITE_IDLE_TIMEOUT);
 
-    if transport::http1(limits::HEADER_TIMEOUT)
+    if transport::http1(HEADER_TIMEOUT)
         .serve_connection(TokioIo::new(transport), TowerToHyperService::new(router))
         .await
         .is_err()
@@ -251,6 +252,7 @@ async fn connection<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(io: T, m
 #[cfg(test)]
 mod tests {
     use super::*;
+    use immich_dlna_proxy::media::MEDIA_OPERATIONS;
     use std::{
         io,
         net::{Ipv4Addr, SocketAddr},
@@ -632,7 +634,7 @@ mod tests {
 
             let request = Request::builder()
                 .uri(path)
-                .header("x-large", "a".repeat(limits::HEADER_BYTES))
+                .header("x-large", "a".repeat(HEADER_BYTES))
                 .body(Body::empty())
                 .unwrap();
 
@@ -650,7 +652,7 @@ mod tests {
         let upstream = Upstream::start().await;
         let mut held = Vec::new();
 
-        for _ in 0..limits::MEDIA_OPERATIONS {
+        for _ in 0..MEDIA_OPERATIONS {
             let result = upstream
                 .media
                 .serve(ASSET, "original", Method::GET, HeaderMap::new())
@@ -667,10 +669,7 @@ mod tests {
             assert!(!result.headers().contains_key(CAPABILITY));
         }
 
-        assert_eq!(
-            upstream.requests.lock().unwrap().len(),
-            limits::MEDIA_OPERATIONS
-        );
+        assert_eq!(upstream.requests.lock().unwrap().len(), MEDIA_OPERATIONS);
 
         held.pop();
 
@@ -689,7 +688,7 @@ mod tests {
         let upstream = Upstream::start().await;
         let mut held = Vec::new();
 
-        for _ in 0..limits::MEDIA_OPERATIONS {
+        for _ in 0..MEDIA_OPERATIONS {
             let request = Request::builder()
                 .method(Method::HEAD)
                 .uri("/byte-seek")
@@ -732,7 +731,7 @@ mod tests {
                 let upstream = Upstream::start().await;
                 let mut connections = Vec::new();
 
-                for _ in 0..limits::MEDIA_OPERATIONS {
+                for _ in 0..MEDIA_OPERATIONS {
                     let (mut client, io) = tokio::io::duplex(1);
                     let task = tokio::spawn(connection(io, upstream.media.clone()));
 
@@ -811,7 +810,7 @@ mod tests {
                 // All slots, not only the most recent connection's slot, must return.
                 let mut held = Vec::new();
 
-                for _ in 0..limits::MEDIA_OPERATIONS {
+                for _ in 0..MEDIA_OPERATIONS {
                     let result = upstream
                         .media
                         .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
@@ -847,7 +846,7 @@ mod tests {
             let task = tokio::spawn(run(listener, upstream.media.clone(), stop.clone()));
             let mut clients = Vec::new();
 
-            for count in 1..=limits::MEDIA_OPERATIONS {
+            for count in 1..=MEDIA_OPERATIONS {
                 let mut client = TcpStream::connect(address).await.unwrap();
 
                 client
@@ -895,7 +894,7 @@ mod tests {
             let mut held = Vec::new();
 
             timeout(Duration::from_secs(2), async {
-                while held.len() < limits::MEDIA_OPERATIONS {
+                while held.len() < MEDIA_OPERATIONS {
                     let result = upstream
                         .media
                         .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
@@ -1017,7 +1016,7 @@ mod tests {
                 upstream.release.cancel();
             }
 
-            timeout(limits::SHUTDOWN_GRACE + Duration::from_secs(1), task)
+            timeout(SHUTDOWN_GRACE + Duration::from_secs(1), task)
                 .await
                 .unwrap()
                 .unwrap()
@@ -1026,7 +1025,7 @@ mod tests {
             if !finish {
                 // Tokio rounds absolute deadlines up to its millisecond timer tick.
                 assert!(
-                    (limits::SHUTDOWN_GRACE..=limits::SHUTDOWN_GRACE + Duration::from_millis(1))
+                    (SHUTDOWN_GRACE..=SHUTDOWN_GRACE + Duration::from_millis(1))
                         .contains(&started.elapsed())
                 );
 

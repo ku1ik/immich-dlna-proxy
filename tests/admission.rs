@@ -4,6 +4,7 @@ use http::HeaderValue;
 use immich_dlna_proxy::{
     catalog::{BrowseResult, Catalog},
     eventing::Subscriptions,
+    lifecycle::SHUTDOWN_GRACE,
     media::MediaProxy,
     protocol::{BrowseArguments, Fault},
     server::Server,
@@ -121,7 +122,7 @@ async fn media_admission_survives_body_eof_until_tcp_completion() {
         let server_shutdown = shutdown.clone();
 
         tasks.spawn(async move {
-            server.run(listener, server_shutdown).await.unwrap();
+            server.run(listener, server_shutdown, SHUTDOWN_GRACE).await.unwrap();
         });
 
         let mut clients = Vec::new();

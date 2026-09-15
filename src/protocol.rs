@@ -6,7 +6,11 @@ use quick_xml::{
     name::{Namespace, NamespaceResolver, PrefixDeclaration, ResolveResult},
 };
 
-use crate::limits::{HEADER_BYTES, SOAP_BODY_BYTES, SOAP_RESPONSE_BYTES, XML_DEPTH};
+use crate::transport::HEADER_BYTES;
+
+pub(crate) const SOAP_BODY_BYTES: usize = 64 * 1024;
+pub(crate) const SOAP_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const XML_DEPTH: usize = 32;
 
 pub const CONTENT_DIRECTORY: &str = "urn:schemas-upnp-org:service:ContentDirectory:1";
 pub const CONNECTION_MANAGER: &str = "urn:schemas-upnp-org:service:ConnectionManager:1";

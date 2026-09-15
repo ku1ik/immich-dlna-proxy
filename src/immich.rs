@@ -3,7 +3,7 @@
 #[cfg(test)]
 pub(crate) mod tests;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow, ensure};
 use http::{HeaderValue, header};
@@ -12,10 +12,12 @@ use tokio::{sync::OnceCell, time::Instant};
 use url::Url;
 use uuid::Uuid;
 
-use crate::{
-    deadline::{self, Budget},
-    limits,
-};
+use crate::deadline::{self, Budget};
+
+pub(crate) const SEARCH_PAGE_SIZE: usize = 1_000;
+const JSON_BYTES: usize = 16 * 1024 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct Client {
@@ -160,7 +162,7 @@ impl Client {
             .no_brotli()
             .no_deflate()
             .no_zstd()
-            .connect_timeout(limits::CONNECT_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|_| anyhow!("cannot initialize Immich HTTP client"))?;
 
@@ -197,7 +199,7 @@ impl Client {
 
         let header_deadline = budget
             .deadline
-            .min(Instant::now() + limits::UPSTREAM_HEADER_TIMEOUT);
+            .min(Instant::now() + RESPONSE_HEADER_TIMEOUT);
 
         let response = deadline::timeout_at(header_deadline, async { request.send().await }).await;
 
@@ -216,7 +218,7 @@ impl Client {
         ensure!(
             response
                 .content_length()
-                .is_none_or(|length| length <= limits::JSON_BYTES as u64),
+                .is_none_or(|length| length <= JSON_BYTES as u64),
             "Immich JSON response exceeds byte limit"
         );
 
@@ -236,7 +238,7 @@ impl Client {
             budget.check()?;
 
             ensure!(
-                chunk.len() <= limits::JSON_BYTES - body.len(),
+                chunk.len() <= JSON_BYTES - body.len(),
                 "Immich JSON response exceeds byte limit"
             );
 
@@ -306,7 +308,7 @@ impl Client {
         let query = Search {
             album_ids: [album],
             page,
-            size: limits::SEARCH_PAGE_SIZE,
+            size: SEARCH_PAGE_SIZE,
             with_deleted: false,
             with_exif: false,
             with_people: false,

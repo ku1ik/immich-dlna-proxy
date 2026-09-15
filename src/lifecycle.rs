@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Context;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::{net::TcpListener, task::JoinSet, time::Instant};
@@ -7,11 +9,12 @@ use crate::{
     catalog::{Library, Store},
     config::Config,
     eventing::Subscriptions,
-    limits,
     media::MediaProxy,
     server::Server,
     ssdp::Discovery,
 };
+
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let signal = shutdown_signal()?;
@@ -39,7 +42,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let token = events_stop.clone();
     tasks.spawn(async move { ("eventing", events.run(token).await) });
     let token = stop.clone();
-    tasks.spawn(async move { ("HTTP", server.run(http, token).await) });
+    tasks.spawn(async move { ("HTTP", server.run(http, token, SHUTDOWN_GRACE).await) });
     let token = stop.clone();
     tasks.spawn(async move { ("SSDP", discovery.run(token).await) });
     tracing::info!(%address, %uuid, "service started");
@@ -84,14 +87,14 @@ async fn supervise(
                     tracing::error!(%error, "essential service failure");
                     failure.get_or_insert(error);
                     stop.cancel();
-                    deadline.get_or_insert_with(|| Instant::now() + limits::SHUTDOWN_GRACE);
+                    deadline.get_or_insert_with(|| Instant::now() + SHUTDOWN_GRACE);
                 }
             }
 
             _ = &mut signal, if deadline.is_none() => {
                 tracing::info!("shutdown requested; withdrawing discovery and draining admitted work");
                 stop.cancel();
-                deadline = Some(Instant::now() + limits::SHUTDOWN_GRACE);
+                deadline = Some(Instant::now() + SHUTDOWN_GRACE);
             }
 
             _ = expired => {
@@ -169,7 +172,7 @@ mod tests {
         use std::{net::Ipv4Addr, time::Duration};
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-        tokio::time::timeout(limits::SHUTDOWN_GRACE + Duration::from_secs(3), async {
+        tokio::time::timeout(SHUTDOWN_GRACE + Duration::from_secs(3), async {
             let callback = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             let subscriptions = Subscriptions::new().unwrap();
             subscriptions.publish(42);
@@ -256,7 +259,7 @@ mod tests {
             // An unanswered callback has a 30-second timeout; shutdown must cut it short.
             supervisor.await.unwrap().unwrap();
             assert!(events_stop.is_cancelled());
-            assert!(started.elapsed() < limits::SHUTDOWN_GRACE + Duration::from_secs(1));
+            assert!(started.elapsed() < SHUTDOWN_GRACE + Duration::from_secs(1));
             let mut remaining = Vec::new();
             callback.read_to_end(&mut remaining).await.unwrap();
             assert!(remaining.is_empty());
@@ -309,7 +312,7 @@ mod tests {
 
         assert!(
             (std::time::Duration::from_secs(4)
-                ..=limits::SHUTDOWN_GRACE + std::time::Duration::from_millis(10))
+                ..=SHUTDOWN_GRACE + std::time::Duration::from_millis(10))
                 .contains(&before.elapsed())
         );
     }

@@ -14,7 +14,17 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{deadline, limits, protocol::Service};
+use crate::{deadline, protocol::Service, transport::HEADER_BYTES};
+
+pub(crate) const SUBSCRIPTIONS: usize = 32;
+const CALLBACK_URLS: usize = 4;
+const SUBSCRIPTION_LEASE: Duration = Duration::from_secs(1800);
+const NOTIFICATION_DELIVERIES: usize = 4;
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
+const CALLBACK_BODY_BYTES: usize = 8 * 1024;
+pub(crate) const EVENT_MODERATION: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct Subscriptions {
@@ -94,8 +104,8 @@ impl Subscriptions {
             .no_brotli()
             .no_deflate()
             .no_zstd()
-            .connect_timeout(limits::CONNECT_TIMEOUT)
-            .timeout(limits::CALLBACK_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(CALLBACK_TIMEOUT)
             .build()?;
 
         Ok(Self {
@@ -142,7 +152,7 @@ impl Subscriptions {
                 .iter()
                 .map(|(name, value)| name.as_str().len() + value.len() + 4)
                 .sum::<usize>()
-                > limits::HEADER_BYTES
+                > HEADER_BYTES
             {
                 return Err(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
             }
@@ -222,7 +232,7 @@ impl Subscriptions {
             let now = Instant::now();
             state.expire(now);
 
-            if state.stopped || state.entries.len() >= limits::SUBSCRIPTIONS {
+            if state.stopped || state.entries.len() >= SUBSCRIPTIONS {
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
 
@@ -351,7 +361,7 @@ impl Subscriptions {
                 let now = Instant::now();
                 state.expire(now);
 
-                while deliveries.len() < limits::NOTIFICATION_DELIVERIES {
+                while deliveries.len() < NOTIFICATION_DELIVERIES {
                     let Some(index) = state.entries.iter().position(|entry| {
                         !entry.delivering
                             && (entry.initial == Initial::Owed
@@ -376,7 +386,7 @@ impl Subscriptions {
                     // Allocate once at preparation, including failures and the initial attempt.
                     let seq = entry.next_seq;
                     entry.next_seq = seq.wrapping_add(1).max(1);
-                    entry.next_attempt = now + limits::EVENT_MODERATION;
+                    entry.next_attempt = now + EVENT_MODERATION;
                     entry.delivering = true;
 
                     deliveries.push(deliver(
@@ -397,7 +407,7 @@ impl Subscriptions {
                     .filter(|entry| entry.active)
                     .flat_map(|entry| {
                         // A ready event waits on completion when all delivery slots are full.
-                        let moderation = (deliveries.len() < limits::NOTIFICATION_DELIVERIES
+                        let moderation = (deliveries.len() < NOTIFICATION_DELIVERIES
                             && entry.initial == Initial::Finished
                             && !entry.delivering
                             && entry.pending.is_some())
@@ -468,11 +478,11 @@ fn decimal(value: &str) -> Option<u64> {
 
 fn lease(value: Option<&str>) -> Result<Duration, StatusCode> {
     let Some(value) = value else {
-        return Ok(limits::SUBSCRIPTION_LEASE);
+        return Ok(SUBSCRIPTION_LEASE);
     };
 
     if value == "Second-infinite" {
-        return Ok(limits::SUBSCRIPTION_LEASE);
+        return Ok(SUBSCRIPTION_LEASE);
     }
 
     let seconds = value
@@ -481,7 +491,7 @@ fn lease(value: Option<&str>) -> Result<Duration, StatusCode> {
         .filter(|seconds| *seconds > 0)
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    Ok(Duration::from_secs(seconds).min(limits::SUBSCRIPTION_LEASE))
+    Ok(Duration::from_secs(seconds).min(SUBSCRIPTION_LEASE))
 }
 
 fn callbacks(value: &str, peer: Ipv4Addr) -> Option<Vec<Url>> {
@@ -493,7 +503,7 @@ fn callbacks(value: &str, peer: Ipv4Addr) -> Option<Vec<Url>> {
     let mut urls = Vec::new();
 
     while !remaining.is_empty() {
-        if urls.len() == limits::CALLBACK_URLS {
+        if urls.len() == CALLBACK_URLS {
             return None;
         }
 
@@ -564,8 +574,8 @@ async fn deliver(
 ) -> (Uuid, bool) {
     for url in callbacks {
         let started = Instant::now();
-        let header_deadline = started + limits::UPSTREAM_HEADER_TIMEOUT;
-        let deadline = started + limits::CALLBACK_TIMEOUT;
+        let header_deadline = started + RESPONSE_HEADER_TIMEOUT;
+        let deadline = started + CALLBACK_TIMEOUT;
 
         let attempt = async {
             let request = client
@@ -593,7 +603,7 @@ async fn deliver(
 
             if response
                 .content_length()
-                .is_some_and(|length| length > limits::CALLBACK_BODY_BYTES as u64)
+                .is_some_and(|length| length > CALLBACK_BODY_BYTES as u64)
             {
                 return None;
             }
@@ -601,7 +611,7 @@ async fn deliver(
             let mut bytes = 0;
 
             while let Some(chunk) = response.chunk().await.ok()? {
-                if chunk.len() > limits::CALLBACK_BODY_BYTES - bytes {
+                if chunk.len() > CALLBACK_BODY_BYTES - bytes {
                     return None;
                 }
 
@@ -933,7 +943,7 @@ mod tests {
             SERVICE,
             PEER,
             &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-            &headers(&[("x-large", &"a".repeat(limits::HEADER_BYTES))]),
+            &headers(&[("x-large", &"a".repeat(HEADER_BYTES))]),
         );
 
         assert_eq!(
@@ -1115,7 +1125,7 @@ mod tests {
         let subscriptions = Subscriptions::new().unwrap();
         let mut tokens = Vec::new();
 
-        for index in 0..limits::SUBSCRIPTIONS {
+        for index in 0..SUBSCRIPTIONS {
             let (_, sid) = subscribe(&subscriptions, None);
 
             assert_eq!(
@@ -1142,7 +1152,7 @@ mod tests {
 
         assert_eq!(
             subscriptions.state.lock().unwrap().entries.len(),
-            limits::SUBSCRIPTIONS
+            SUBSCRIPTIONS
         );
 
         subscriptions.response_complete(tokens[1], false);
@@ -1150,7 +1160,7 @@ mod tests {
 
         assert_eq!(
             subscriptions.state.lock().unwrap().entries.len(),
-            limits::SUBSCRIPTIONS
+            SUBSCRIPTIONS
         );
 
         let subscriptions = Subscriptions::new().unwrap();
@@ -1191,7 +1201,7 @@ mod tests {
                 async move {
                     let (parts, body) = request.into_parts();
                     let path = parts.uri.path().to_owned();
-                    let body = to_bytes(body, limits::CALLBACK_BODY_BYTES).await.unwrap();
+                    let body = to_bytes(body, CALLBACK_BODY_BYTES).await.unwrap();
 
                     sender
                         .send((parts, String::from_utf8(body.to_vec()).unwrap()))
@@ -1218,12 +1228,12 @@ mod tests {
                             .unwrap(),
 
                         "/oversized" => {
-                            Response::new(Body::from(vec![b'x'; limits::CALLBACK_BODY_BYTES + 1]))
+                            Response::new(Body::from(vec![b'x'; CALLBACK_BODY_BYTES + 1]))
                         }
 
                         "/chunked" => {
                             Response::new(Body::from_stream(futures_util::stream::iter([
-                                Ok::<_, std::io::Error>(vec![b'x'; limits::CALLBACK_BODY_BYTES]),
+                                Ok::<_, std::io::Error>(vec![b'x'; CALLBACK_BODY_BYTES]),
                                 Ok(vec![b'x']),
                             ])))
                         }
@@ -1443,7 +1453,7 @@ mod tests {
         }
 
         tokio::time::pause();
-        tokio::time::advance(limits::EVENT_MODERATION).await;
+        tokio::time::advance(EVENT_MODERATION).await;
         tokio::time::resume();
 
         // Even an overdue change cannot overlap the still-running initial attempt.
@@ -1552,7 +1562,7 @@ mod tests {
             }
 
             tokio::time::pause();
-            tokio::time::advance(limits::EVENT_MODERATION).await;
+            tokio::time::advance(EVENT_MODERATION).await;
             tokio::time::resume();
         }
 
@@ -1570,10 +1580,10 @@ mod tests {
     async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
         let subscriptions = Subscriptions::new().unwrap();
         let mut callback = Callback::new().await;
-        callback.release.add_permits(limits::SUBSCRIPTIONS);
+        callback.release.add_permits(SUBSCRIPTIONS);
         let mut tokens = Vec::new();
 
-        for _ in 0..limits::SUBSCRIPTIONS {
+        for _ in 0..SUBSCRIPTIONS {
             let sid = callback.register(&subscriptions, SERVICE, &["/gated"]);
             subscriptions.response_complete(sid, true);
             tokens.push(sid);
@@ -1592,7 +1602,7 @@ mod tests {
 
         subscriptions.publish(1);
         tokio::time::pause();
-        tokio::time::advance(limits::EVENT_MODERATION).await;
+        tokio::time::advance(EVENT_MODERATION).await;
         tokio::time::resume();
 
         let mut sequences: std::collections::BTreeMap<_, u32> = tokens
@@ -1600,7 +1610,7 @@ mod tests {
             .map(|sid| (format!("uuid:{sid}"), 0))
             .collect();
 
-        for _ in 0..limits::NOTIFICATION_DELIVERIES {
+        for _ in 0..NOTIFICATION_DELIVERIES {
             let (request, body) = callback.next().await;
             assert_eq!(request.headers["seq"], "1");
             assert_eq!(body, event_body(SERVICE, 1));
@@ -1630,7 +1640,7 @@ mod tests {
                     .iter()
                     .filter(|entry| entry.delivering)
                     .count(),
-                limits::NOTIFICATION_DELIVERIES
+                NOTIFICATION_DELIVERIES
             );
 
             assert!(state.entries.iter().all(|entry| entry.pending == Some(2)));
@@ -1638,7 +1648,7 @@ mod tests {
 
         // Every subscriber gets the coalesced change, without a global FIFO contract.
         tokio::time::pause();
-        tokio::time::advance(limits::EVENT_MODERATION).await;
+        tokio::time::advance(EVENT_MODERATION).await;
         tokio::time::resume();
         let mut seen = std::collections::BTreeSet::new();
 
@@ -1661,7 +1671,7 @@ mod tests {
                     .iter()
                     .filter(|entry| entry.delivering)
                     .count(),
-                limits::NOTIFICATION_DELIVERIES
+                NOTIFICATION_DELIVERIES
             );
         }
 
@@ -1785,7 +1795,7 @@ mod tests {
                         .iter()
                         .filter(|entry| entry.delivering)
                         .count(),
-                    limits::NOTIFICATION_DELIVERIES
+                    NOTIFICATION_DELIVERIES
                 );
             }
 
@@ -1812,7 +1822,7 @@ mod tests {
                     finished(&subscriptions, sid).await;
                     subscriptions.publish(1);
                     tokio::time::pause();
-                    tokio::time::advance(limits::EVENT_MODERATION).await;
+                    tokio::time::advance(EVENT_MODERATION).await;
                     tokio::time::resume();
                     assert_eq!(callback.next().await.0.headers["seq"], "1");
                 }
@@ -2029,7 +2039,7 @@ mod tests {
         let subscriptions = Subscriptions::new().unwrap();
         let mut callback = Callback::new().await;
 
-        for _ in 0..limits::SUBSCRIPTIONS {
+        for _ in 0..SUBSCRIPTIONS {
             let sid = callback.register(&subscriptions, SERVICE, &["/slow-headers"]);
             subscriptions.response_complete(sid, true);
 
@@ -2050,7 +2060,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
 
-        for _ in 0..limits::NOTIFICATION_DELIVERIES {
+        for _ in 0..NOTIFICATION_DELIVERIES {
             callback.next().await;
         }
 
@@ -2062,7 +2072,7 @@ mod tests {
 
         {
             let state = subscriptions.state.lock().unwrap();
-            assert_eq!(state.entries.len(), limits::SUBSCRIPTIONS);
+            assert_eq!(state.entries.len(), SUBSCRIPTIONS);
 
             assert_eq!(
                 state
@@ -2070,7 +2080,7 @@ mod tests {
                     .iter()
                     .filter(|entry| entry.initial == Initial::Delivering)
                     .count(),
-                limits::NOTIFICATION_DELIVERIES
+                NOTIFICATION_DELIVERIES
             );
         }
 
@@ -2108,8 +2118,8 @@ mod tests {
     #[tokio::test]
     async fn callback_header_and_total_deadlines_are_per_url_and_keep_active_leases() {
         for (path, deadline) in [
-            ("/slow-headers", limits::UPSTREAM_HEADER_TIMEOUT),
-            ("/slow-body", limits::CALLBACK_TIMEOUT),
+            ("/slow-headers", RESPONSE_HEADER_TIMEOUT),
+            ("/slow-body", CALLBACK_TIMEOUT),
         ] {
             let subscriptions = Subscriptions::new().unwrap();
             let mut callback = Callback::new().await;
@@ -2151,9 +2161,9 @@ mod tests {
         });
 
         for (body_pending, status, limit) in [
-            (false, 412, limits::UPSTREAM_HEADER_TIMEOUT),
-            (false, 200, limits::UPSTREAM_HEADER_TIMEOUT),
-            (true, 200, limits::CALLBACK_TIMEOUT),
+            (false, 412, RESPONSE_HEADER_TIMEOUT),
+            (false, 200, RESPONSE_HEADER_TIMEOUT),
+            (true, 200, CALLBACK_TIMEOUT),
         ] {
             for elapsed in [
                 limit - Duration::from_secs(1),
@@ -2345,7 +2355,7 @@ mod tests {
         let mut sockets = Vec::new();
 
         // Keep listeners bound so every subscription uses a distinct callback origin.
-        for _ in 0..limits::SUBSCRIPTIONS + limits::NOTIFICATION_DELIVERIES {
+        for _ in 0..SUBSCRIPTIONS + NOTIFICATION_DELIVERIES {
             listeners.push(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
         }
 
@@ -2435,7 +2445,7 @@ mod tests {
         let mut callback = Callback::new().await;
         let mut tokens = Vec::new();
 
-        for id in 0..limits::SUBSCRIPTIONS as u32 {
+        for id in 0..SUBSCRIPTIONS as u32 {
             subscriptions.publish(id);
             let sid = callback.register(&subscriptions, SERVICE, &["/ok"]);
             tokens.push(sid);
@@ -2446,7 +2456,7 @@ mod tests {
         }
 
         tokio::time::pause();
-        tokio::time::advance(limits::SUBSCRIPTION_LEASE).await;
+        tokio::time::advance(SUBSCRIPTION_LEASE).await;
         tokio::time::resume();
 
         for sid in &tokens {
@@ -2457,7 +2467,7 @@ mod tests {
         let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
         let mut seen = std::collections::BTreeSet::new();
 
-        for _ in 0..limits::SUBSCRIPTIONS {
+        for _ in 0..SUBSCRIPTIONS {
             let (request, _) = callback.next().await;
             assert!(seen.insert(request.headers["sid"].to_str().unwrap().to_owned()));
             assert_eq!(request.headers["seq"], "0");

@@ -10,6 +10,7 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
     catalog::{BrowseResult, Catalog},
     eventing::Subscriptions,
+    lifecycle::SHUTDOWN_GRACE,
     media::MediaProxy,
     protocol::{self, BrowseArguments, Fault, Object, Service},
     server::Server,
@@ -190,7 +191,7 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
         let stop = shutdown.clone();
 
         tasks.spawn(async move {
-            server.run(listener, stop).await.unwrap();
+            server.run(listener, stop, SHUTDOWN_GRACE).await.unwrap();
         });
 
         let namespace = protocol::CONTENT_DIRECTORY;

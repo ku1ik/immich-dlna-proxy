@@ -20,11 +20,18 @@ use uuid::Uuid;
 use crate::{
     catalog::Catalog,
     eventing::Subscriptions,
-    limits,
     media::MediaProxy,
-    protocol::{self, Action, Fault, Service},
-    transport::{self, WriteDeadline},
+    protocol::{self, Action, Fault, SOAP_BODY_BYTES, Service},
+    transport::{self, HEADER_BYTES, WriteDeadline},
 };
+
+const BROWSES: usize = 8;
+pub const CONNECTIONS: usize = 64;
+pub const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const BODY_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTROL_PROCESSING_TIMEOUT: Duration = Duration::from_secs(25);
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Server<C> {
     catalog: C,
@@ -42,18 +49,16 @@ struct Timing {
     processing: Duration,
     response: Duration,
     write: Duration,
-    shutdown: Duration,
 }
 
 impl Default for Timing {
     fn default() -> Self {
         Self {
-            header: limits::HEADER_TIMEOUT,
-            body: limits::BODY_TIMEOUT,
-            processing: limits::CONTROL_PROCESSING_TIMEOUT,
-            response: limits::CONTROL_RESPONSE_TIMEOUT,
-            write: limits::STREAM_IDLE_TIMEOUT,
-            shutdown: limits::SHUTDOWN_GRACE,
+            header: HEADER_TIMEOUT,
+            body: BODY_TIMEOUT,
+            processing: CONTROL_PROCESSING_TIMEOUT,
+            response: CONTROL_RESPONSE_TIMEOUT,
+            write: WRITE_IDLE_TIMEOUT,
         }
     }
 }
@@ -71,7 +76,7 @@ impl<C: Catalog> Server<C> {
             media,
             subscriptions,
             device: protocol::device_description(&friendly_name, uuid),
-            browses: Arc::new(Semaphore::new(limits::BROWSES)),
+            browses: Arc::new(Semaphore::new(BROWSES)),
             timing: Timing::default(),
         }
     }
@@ -81,6 +86,7 @@ impl<C: Catalog> Server<C> {
         self,
         listener: TcpListener,
         shutdown: CancellationToken,
+        shutdown_grace: Duration,
     ) -> anyhow::Result<()> {
         let server = Arc::new(self);
         let mut tasks = JoinSet::new();
@@ -113,7 +119,7 @@ impl<C: Catalog> Server<C> {
                     }
 
                     // Finished tasks count until reaped: neither live tasks nor results backlog.
-                    if tasks.len() >= limits::CONNECTIONS {
+                    if tasks.len() >= CONNECTIONS {
                         let _ = socket.try_write(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
                         continue;
                     }
@@ -133,7 +139,7 @@ impl<C: Catalog> Server<C> {
             tasks.abort_all();
         }
 
-        let deadline = Instant::now() + server.timing.shutdown;
+        let deadline = Instant::now() + shutdown_grace;
 
         while !tasks.is_empty() {
             match timeout_at(deadline, tasks.join_next()).await {
@@ -188,7 +194,7 @@ impl<C: Catalog> Server<C> {
                 .map(|(name, value)| name.as_str().len() + value.len() + 4)
                 .sum::<usize>();
 
-        if header_bytes > limits::HEADER_BYTES {
+        if header_bytes > HEADER_BYTES {
             return empty(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
         }
 
@@ -300,7 +306,7 @@ impl<C: Catalog> Server<C> {
 
         if single(&headers, "content-length")
             .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|length| length > limits::SOAP_BODY_BYTES as u64)
+            .is_some_and(|length| length > SOAP_BODY_BYTES as u64)
         {
             return soap(Err(Fault { code: 501 }));
         }
@@ -309,7 +315,7 @@ impl<C: Catalog> Server<C> {
 
         let body = match crate::deadline::timeout_at(
             body_deadline,
-            axum::body::to_bytes(body, limits::SOAP_BODY_BYTES),
+            axum::body::to_bytes(body, SOAP_BODY_BYTES),
         )
         .await
         {
@@ -667,7 +673,13 @@ fn soap(result: Result<String, Fault>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{catalog::BrowseResult, protocol::BrowseArguments};
+    use crate::{
+        catalog::BrowseResult,
+        eventing::SUBSCRIPTIONS,
+        lifecycle::SHUTDOWN_GRACE,
+        media::MEDIA_OPERATIONS,
+        protocol::{BrowseArguments, SOAP_RESPONSE_BYTES},
+    };
     use std::{
         io,
         pin::Pin,
@@ -990,7 +1002,7 @@ mod tests {
                     &format!(
                         "Content-Type: text/xml\r\nSOAPAction: \"{}#Browse\"\r\nContent-Length: {}\r\n",
                         protocol::CONTENT_DIRECTORY,
-                        limits::SOAP_BODY_BYTES + 1
+                        SOAP_BODY_BYTES + 1
                     ),
                     "",
                 ),
@@ -1002,7 +1014,7 @@ mod tests {
             status(&response, expected);
         }
 
-        let chunk = " ".repeat(limits::SOAP_BODY_BYTES + 1);
+        let chunk = " ".repeat(SOAP_BODY_BYTES + 1);
 
         let chunked = request(
             "POST",
@@ -1027,7 +1039,7 @@ mod tests {
         let _permits = server
             .browses
             .clone()
-            .try_acquire_many_owned(limits::BROWSES as u32)
+            .try_acquire_many_owned(BROWSES as u32)
             .unwrap();
 
         let valid = "<ObjectID>0</ObjectID><BrowseFlag>BrowseMetadata</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria/>";
@@ -1198,7 +1210,7 @@ mod tests {
             let response = response.await;
             assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
             assert_eq!(server.catalog.calls.load(Ordering::SeqCst), 0);
-            assert_eq!(server.browses.available_permits(), limits::BROWSES);
+            assert_eq!(server.browses.available_permits(), BROWSES);
         }
     }
 
@@ -1242,7 +1254,7 @@ mod tests {
                     }
                 );
 
-                let body = axum::body::to_bytes(response.into_body(), limits::SOAP_RESPONSE_BYTES)
+                let body = axum::body::to_bytes(response.into_body(), SOAP_RESPONSE_BYTES)
                     .await
                     .unwrap();
 
@@ -1261,7 +1273,7 @@ mod tests {
                     usize::from(accepted)
                 );
 
-                assert_eq!(server.browses.available_permits(), limits::BROWSES);
+                assert_eq!(server.browses.available_permits(), BROWSES);
             }
         }
     }
@@ -1271,7 +1283,7 @@ mod tests {
         let server = Arc::new(server(TestCatalog::default()));
 
         for headers in [
-            format!("X-Huge: {}\r\n", "a".repeat(limits::HEADER_BYTES)),
+            format!("X-Huge: {}\r\n", "a".repeat(HEADER_BYTES)),
             (0..90)
                 .map(|i| format!("X-{i}: {}\r\n", "b".repeat(190)))
                 .collect(),
@@ -1344,7 +1356,7 @@ mod tests {
 
         status(&response, 408);
         assert_eq!(server.catalog.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(server.browses.available_permits(), limits::BROWSES);
+        assert_eq!(server.browses.available_permits(), BROWSES);
     }
 
     #[tokio::test]
@@ -1356,7 +1368,7 @@ mod tests {
 
         let mut clients = Vec::new();
 
-        for _ in 0..limits::BROWSES {
+        for _ in 0..BROWSES {
             let (mut client, task) = connect(server.clone(), 4096);
             client.write_all(browse("*").as_bytes()).await.unwrap();
             server.catalog.entered.notified().await;
@@ -1370,14 +1382,14 @@ mod tests {
             200,
         );
 
-        assert_eq!(server.catalog.calls.load(Ordering::SeqCst), limits::BROWSES);
+        assert_eq!(server.catalog.calls.load(Ordering::SeqCst), BROWSES);
 
         server
             .catalog
             .release
             .as_ref()
             .unwrap()
-            .add_permits(limits::BROWSES);
+            .add_permits(BROWSES);
 
         for (mut client, task) in clients {
             let mut bytes = Vec::new();
@@ -1386,7 +1398,7 @@ mod tests {
             task.await.unwrap();
         }
 
-        assert_eq!(server.browses.available_permits(), limits::BROWSES);
+        assert_eq!(server.browses.available_permits(), BROWSES);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1397,7 +1409,7 @@ mod tests {
             let server = Arc::new(server);
             let mut clients = Vec::new();
 
-            for _ in 0..limits::BROWSES {
+            for _ in 0..BROWSES {
                 let (mut client, task) = connect(server.clone(), 64);
                 client.write_all(browse("*").as_bytes()).await.unwrap();
                 status(&read_headers(&mut client).await, 200);
@@ -1437,7 +1449,7 @@ mod tests {
                 assert_eq!(task.await.is_err(), finish == "cancel");
             }
 
-            assert_eq!(server.browses.available_permits(), limits::BROWSES);
+            assert_eq!(server.browses.available_permits(), BROWSES);
             status(&exchange(server.clone(), &browse("*")).await, 200);
         }
     }
@@ -1475,10 +1487,10 @@ mod tests {
                 &read_headers(&mut client).await,
                 if outcome == "success" { 200 } else { 500 },
             );
-            assert_eq!(server.browses.available_permits(), limits::BROWSES - 1);
+            assert_eq!(server.browses.available_permits(), BROWSES - 1);
             release.send(true).unwrap();
             task.await.unwrap();
-            assert_eq!(server.browses.available_permits(), limits::BROWSES);
+            assert_eq!(server.browses.available_permits(), BROWSES);
         }
     }
 
@@ -1510,7 +1522,7 @@ mod tests {
             );
 
             let remote = tokio::spawn(async move {
-                for _ in 0..limits::MEDIA_OPERATIONS {
+                for _ in 0..MEDIA_OPERATIONS {
                     let (mut io, _) = upstream.accept().await.unwrap();
                     read_headers(&mut io).await;
                     io.write_all(wire.as_bytes()).await.unwrap();
@@ -1521,7 +1533,7 @@ mod tests {
             let mut connections = Vec::new();
             let path = format!("/media/assets/{ASSET}/original");
 
-            for _ in 0..limits::MEDIA_OPERATIONS {
+            for _ in 0..MEDIA_OPERATIONS {
                 let (mut client, io) = tokio::io::duplex(4096);
                 let entered = Arc::new(Notify::new());
                 let (release, gate) = oneshot::channel();
@@ -1580,7 +1592,7 @@ mod tests {
             let server = Arc::new(server);
             let mut connections = Vec::new();
 
-            for _ in 0..limits::MEDIA_OPERATIONS {
+            for _ in 0..MEDIA_OPERATIONS {
                 let mut client = TcpStream::connect(listener.local_addr().unwrap())
                     .await
                     .unwrap();
@@ -1685,7 +1697,7 @@ mod tests {
         let response = exchange(server.clone(), &browse("*")).await;
         status(&response, 500);
         assert!(response.contains("<errorCode>501</errorCode>"));
-        assert_eq!(server.browses.available_permits(), limits::BROWSES);
+        assert_eq!(server.browses.available_permits(), BROWSES);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1917,7 +1929,7 @@ mod tests {
                 .unwrap(),
         );
 
-        for _ in 0..limits::SUBSCRIPTIONS {
+        for _ in 0..SUBSCRIPTIONS {
             let (response, token) = server.subscriptions.request(
                 Service::ContentDirectory,
                 Ipv4Addr::LOCALHOST,
@@ -2082,21 +2094,20 @@ mod tests {
 
     #[tokio::test]
     async fn production_listener_overload_and_shutdown_are_bounded() {
-        let mut server = server(TestCatalog {
+        let server = server(TestCatalog {
             release: Some(Semaphore::new(0)),
             ..TestCatalog::default()
         });
 
-        server.timing.shutdown = Duration::from_millis(30);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let shutdown = CancellationToken::new();
-        let task = tokio::spawn(server.run(listener, shutdown.clone()));
+        let task = tokio::spawn(server.run(listener, shutdown.clone(), Duration::from_millis(30)));
         let mut clients = Vec::new();
 
         // An interim response proves each connection has been accepted and is
         // retained in body acquisition, rather than merely in the listen backlog.
-        for _ in 0..limits::CONNECTIONS {
+        for _ in 0..CONNECTIONS {
             let mut client = TcpStream::connect(address).await.unwrap();
 
             let headers = format!(
@@ -2157,7 +2168,8 @@ mod tests {
             ..TestCatalog::default()
         });
 
-        let task = tokio::spawn(panicking_server.run(listener, CancellationToken::new()));
+        let task =
+            tokio::spawn(panicking_server.run(listener, CancellationToken::new(), SHUTDOWN_GRACE));
         let mut client = TcpStream::connect(address).await.unwrap();
         client.write_all(browse("*").as_bytes()).await.unwrap();
 
@@ -2172,7 +2184,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let shutdown = CancellationToken::new();
-        let task = tokio::spawn(server(TestCatalog::default()).run(listener, shutdown.clone()));
+        let task = tokio::spawn(server(TestCatalog::default()).run(
+            listener,
+            shutdown.clone(),
+            SHUTDOWN_GRACE,
+        ));
         let mut client = TcpStream::connect(address).await.unwrap();
         let whole = action(CDS, "GetSystemUpdateID", "");
         let (headers, body) = whole.split_once("\r\n\r\n").unwrap();

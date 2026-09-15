@@ -4,7 +4,6 @@ pub mod deadline;
 pub mod eventing;
 pub mod immich;
 pub mod lifecycle;
-pub mod limits;
 pub mod media;
 mod mime;
 pub mod protocol;

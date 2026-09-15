@@ -6,7 +6,13 @@ use tokio::{sync::Semaphore, time::Instant};
 use url::Url;
 use uuid::Uuid;
 
-use crate::{deadline::timeout_at, limits};
+use crate::deadline::timeout_at;
+
+pub const MEDIA_OPERATIONS: usize = 16;
+const MEDIA_REDIRECTS: usize = 3;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct MediaProxy {
@@ -88,16 +94,16 @@ impl MediaProxy {
             .no_brotli()
             .no_deflate()
             .no_zstd()
-            .connect_timeout(limits::CONNECT_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()?;
 
         Ok(Self {
             client,
             api_base,
             api_key,
-            operations: Arc::new(Semaphore::new(limits::MEDIA_OPERATIONS)),
-            header_timeout: limits::UPSTREAM_HEADER_TIMEOUT,
-            read_timeout: limits::STREAM_IDLE_TIMEOUT,
+            operations: Arc::new(Semaphore::new(MEDIA_OPERATIONS)),
+            header_timeout: RESPONSE_HEADER_TIMEOUT,
+            read_timeout: READ_IDLE_TIMEOUT,
         })
     }
 
@@ -281,7 +287,7 @@ impl MediaProxy {
                 .join(location)
                 .map_err(|_| Failure::Upstream("invalid media redirect"))?;
 
-            if visited.len() > limits::MEDIA_REDIRECTS
+            if visited.len() > MEDIA_REDIRECTS
                 || visited.contains(&target)
                 || !self.allowed_redirect(&initial_url, &target, asset)
             {
@@ -720,7 +726,7 @@ mod tests {
                             }
 
                             request.extend_from_slice(&buffer[..count]);
-                            assert!(request.len() <= limits::HEADER_BYTES);
+                            assert!(request.len() <= crate::transport::HEADER_BYTES);
                         }
 
                         let _ = sender.send(String::from_utf8(request).unwrap());
@@ -973,10 +979,7 @@ mod tests {
         assert!(request_header(&request, "range").is_none());
         assert!(request_header(&request, "if-range").is_none());
 
-        assert_eq!(
-            proxy.operations.available_permits(),
-            limits::MEDIA_OPERATIONS
-        );
+        assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS);
     }
 
     #[tokio::test]
@@ -1272,10 +1275,7 @@ mod tests {
 
             assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
 
-            assert_eq!(
-                proxy.operations.available_permits(),
-                limits::MEDIA_OPERATIONS
-            );
+            assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS);
         }
     }
 
@@ -1584,7 +1584,7 @@ mod tests {
         let proxy = server.proxy();
         let mut responses = Vec::new();
 
-        for _ in 0..limits::MEDIA_OPERATIONS {
+        for _ in 0..MEDIA_OPERATIONS {
             let result = proxy
                 .clone()
                 .serve(ASSET, "original", Method::GET, HeaderMap::new())
@@ -1627,10 +1627,7 @@ mod tests {
         assert_eq!(proxy.operations.available_permits(), 1);
         drop(responses);
 
-        assert_eq!(
-            proxy.operations.available_permits(),
-            limits::MEDIA_OPERATIONS
-        );
+        assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS);
     }
 
     #[tokio::test]
@@ -1682,10 +1679,7 @@ mod tests {
 
                 assert_eq!(result.status(), expected, "{method}: {wire}");
 
-                assert_eq!(
-                    proxy.operations.available_permits(),
-                    limits::MEDIA_OPERATIONS - 1
-                );
+                assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS - 1);
 
                 let (mut parts, body) = result.into_parts();
 
@@ -1697,17 +1691,11 @@ mod tests {
                 drop(parts);
                 to_bytes(body, 1024).await.unwrap();
 
-                assert_eq!(
-                    proxy.operations.available_permits(),
-                    limits::MEDIA_OPERATIONS - 1
-                );
+                assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS - 1);
 
                 drop(permit);
 
-                assert_eq!(
-                    proxy.operations.available_permits(),
-                    limits::MEDIA_OPERATIONS
-                );
+                assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS);
             }
         }
     }
@@ -1734,18 +1722,12 @@ mod tests {
 
             assert_eq!(result.status(), StatusCode::OK);
 
-            assert_eq!(
-                proxy.operations.available_permits(),
-                limits::MEDIA_OPERATIONS - 1
-            );
+            assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS - 1);
 
             let body = to_bytes(result.into_body(), 1024).await;
             assert_eq!(body.is_ok(), succeeds);
 
-            assert_eq!(
-                proxy.operations.available_permits(),
-                limits::MEDIA_OPERATIONS
-            );
+            assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS);
         }
     }
 
@@ -1780,10 +1762,7 @@ mod tests {
                 payload.starts_with('3')
             );
 
-            assert_eq!(
-                proxy.operations.available_permits(),
-                limits::MEDIA_OPERATIONS
-            );
+            assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS);
         }
     }
 
@@ -2009,10 +1988,7 @@ mod tests {
 
                 drop(stream);
 
-                assert_eq!(
-                    proxy.operations.available_permits(),
-                    limits::MEDIA_OPERATIONS
-                );
+                assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS);
 
                 clock_guard.abort();
                 assert!(clock_guard.await.unwrap_err().is_cancelled());
@@ -2038,10 +2014,7 @@ mod tests {
 
         assert_eq!(result.status(), StatusCode::GATEWAY_TIMEOUT);
 
-        assert_eq!(
-            proxy.operations.available_permits(),
-            limits::MEDIA_OPERATIONS - 1
-        );
+        assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS - 1);
 
         assert!(
             result
@@ -2052,10 +2025,7 @@ mod tests {
 
         drop(result);
 
-        assert_eq!(
-            proxy.operations.available_permits(),
-            limits::MEDIA_OPERATIONS
-        );
+        assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS);
 
         server.request().await;
 
@@ -2069,18 +2039,12 @@ mod tests {
 
         server.request().await;
 
-        assert_eq!(
-            proxy.operations.available_permits(),
-            limits::MEDIA_OPERATIONS - 1
-        );
+        assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS - 1);
 
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
 
-        assert_eq!(
-            proxy.operations.available_permits(),
-            limits::MEDIA_OPERATIONS
-        );
+        assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS);
     }
 
     #[tokio::test]
@@ -2103,10 +2067,7 @@ mod tests {
             assert_eq!(result.status(), StatusCode::BAD_GATEWAY);
             assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
 
-            assert_eq!(
-                proxy.operations.available_permits(),
-                limits::MEDIA_OPERATIONS
-            );
+            assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS);
         }
     }
 
@@ -2156,19 +2117,13 @@ mod tests {
         let mut stream = result.into_body().into_data_stream();
         assert_eq!(stream.next().await.unwrap().unwrap(), "a");
 
-        assert_eq!(
-            proxy.operations.available_permits(),
-            limits::MEDIA_OPERATIONS - 1
-        );
+        assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS - 1);
 
         assert_eq!(stream.next().await.unwrap().unwrap(), "b");
         assert_eq!(stream.next().await.unwrap().unwrap(), "c");
         assert!(stream.next().await.is_none());
 
-        assert_eq!(
-            proxy.operations.available_permits(),
-            limits::MEDIA_OPERATIONS
-        );
+        assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS);
     }
 
     #[tokio::test]
@@ -2206,10 +2161,7 @@ mod tests {
                 server.request().await;
                 assert!(server.requests.try_recv().is_err());
 
-                assert_eq!(
-                    proxy.operations.available_permits(),
-                    limits::MEDIA_OPERATIONS
-                );
+                assert_eq!(proxy.operations.available_permits(), MEDIA_OPERATIONS);
             }
         }
     }

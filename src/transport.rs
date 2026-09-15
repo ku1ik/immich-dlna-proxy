@@ -13,7 +13,7 @@ use tokio::{
     time::{Instant, Sleep},
 };
 
-use crate::limits;
+pub const HEADER_BYTES: usize = 16 * 1024;
 
 pub fn http1(header_timeout: Duration) -> http1::Builder {
     let mut builder = http1::Builder::new();
@@ -21,7 +21,7 @@ pub fn http1(header_timeout: Duration) -> http1::Builder {
     builder
         .keep_alive(false)
         .half_close(false)
-        .max_buf_size(limits::HEADER_BYTES)
+        .max_buf_size(HEADER_BYTES)
         .timer(TokioTimer::new())
         .header_read_timeout(header_timeout);
 

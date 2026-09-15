@@ -182,7 +182,7 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
         assert_eq!(request.uri, "/prefix/api/search/metadata");
 
         let mut expected = json!({
-            "albumIds": [ALBUM], "page": index, "size": limits::SEARCH_PAGE_SIZE,
+            "albumIds": [ALBUM], "page": index, "size": SEARCH_PAGE_SIZE,
             "withDeleted": false, "withExif": false, "withPeople": false,
         });
 
@@ -497,12 +497,11 @@ async fn redirects_are_rejected_at_every_endpoint() {
 async fn json_bound_is_enforced_before_parsing_with_and_without_content_length() {
     for chunked in [false, true] {
         let body = if chunked {
-            Body::from_stream(futures_util::stream::iter(
-                (0..=limits::JSON_BYTES / 1024)
-                    .map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[b' '; 1024]))),
-            ))
+            Body::from_stream(futures_util::stream::iter((0..=JSON_BYTES / 1024).map(
+                |_| Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[b' '; 1024])),
+            )))
         } else {
-            Body::from(vec![b' '; limits::JSON_BYTES + 1])
+            Body::from(vec![b' '; JSON_BYTES + 1])
         };
 
         let fake = Fake::new(vec![Response::new(body)]).await;
@@ -591,7 +590,7 @@ async fn ready_headers_before_at_and_after_header_or_request_deadline() {
     });
 
     for duration in [Duration::from_secs(10), Duration::from_secs(20)] {
-        let limit = duration.min(limits::UPSTREAM_HEADER_TIMEOUT);
+        let limit = duration.min(RESPONSE_HEADER_TIMEOUT);
 
         for elapsed in [
             limit - Duration::from_secs(1),
@@ -649,7 +648,7 @@ async fn ready_headers_before_at_and_after_header_or_request_deadline() {
             if elapsed < limit {
                 assert!(result.unwrap().is_empty());
             } else {
-                let expected = if duration <= limits::UPSTREAM_HEADER_TIMEOUT {
+                let expected = if duration <= RESPONSE_HEADER_TIMEOUT {
                     "operation deadline exceeded"
                 } else {
                     "Immich response-header deadline exceeded"
@@ -745,7 +744,7 @@ async fn deadlines_and_cancellation_drop_stalled_header_and_body_reads() {
 
                 "operation cancelled"
             } else {
-                tokio::time::advance(limits::UPSTREAM_HEADER_TIMEOUT).await;
+                tokio::time::advance(RESPONSE_HEADER_TIMEOUT).await;
 
                 if send_headers {
                     assert!(!fetch.is_finished());
