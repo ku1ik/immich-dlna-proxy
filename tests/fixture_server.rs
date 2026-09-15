@@ -19,13 +19,13 @@ use clap::Parser;
 use futures_util::StreamExt;
 use http::{HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
-    catalog::{ObjectId, parse_id},
+    catalog::{BrowseResult, Catalog, ObjectId, parse_id},
     config::{is_unicast, resolve_interface},
     eventing::Subscriptions,
     lifecycle, limits,
     media::MediaProxy,
     protocol::{BrowseArguments, Fault, Object},
-    server::{BrowseResult, Catalog, Server},
+    server::Server,
     ssdp::Discovery,
 };
 use tokio::{

@@ -8,10 +8,11 @@ use std::{
 use axum::{Router, body::Body, extract::Request, response::Response};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
+    catalog::{BrowseResult, Catalog},
     eventing::Subscriptions,
     media::MediaProxy,
     protocol::{self, BrowseArguments, Fault, Object, Service},
-    server::{BrowseResult, Catalog, Server},
+    server::Server,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

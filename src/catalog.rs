@@ -1,17 +1,28 @@
-//! Browse-driven snapshots and service-owned, durably published refreshes.
-
-mod source;
+//! Browse-driven snapshots, durable revision history, and service-owned publication.
+//!
+//! Candidate construction, persistence, publication and notification-state updates
+//! form one serialized, non-cancelable commit. Client deadlines only stop waiting.
+//! History is never automatically pruned; exhausted or lost state requires explicit
+//! recovery with a new server UUID and an empty state directory.
 
 use std::{
     cmp::Ordering,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    net::SocketAddrV4,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     task::Poll,
     time::Duration,
 };
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Deserializer, Serialize, de};
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, watch},
     task::JoinSet,
@@ -24,13 +35,25 @@ use crate::{
     config::Config,
     deadline::Budget,
     eventing::Subscriptions,
-    immich, limits,
-    protocol::{BrowseArguments, Fault, Object},
-    revisions::{AlbumRevision, Ledger, Store},
-    server::{BrowseResult, Catalog},
+    immich::{self, Asset, AssetFilter, Client},
+    limits::{self, COMMIT_TIMEOUT, CURRENT_ALBUMS, RETAINED_ALBUMS, REVISION_BYTES},
+    protocol::{BrowseArguments, Fault, Object, Resource},
 };
 
-use source::{Contents, Root, Source};
+/// Select, sort and paginate objects, capturing their revision together.
+pub trait Catalog: Send + Sync + 'static {
+    fn system_update_id(&self) -> u32;
+    fn browse(
+        &self,
+        arguments: BrowseArguments,
+    ) -> impl Future<Output = Result<BrowseResult, Fault>> + Send;
+}
+
+pub struct BrowseResult {
+    pub objects: Vec<Object>,
+    pub total_matches: u32,
+    pub update_id: u32,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObjectId {
@@ -90,6 +113,1051 @@ fn compare_dates(
         .then_with(|| optional(a_capture, b_capture, descending))
         .then_with(|| a_id.cmp(&b_id))
 }
+
+// Snapshot construction.
+
+#[derive(Clone)]
+struct Source {
+    client: Client,
+    http_address: SocketAddrV4,
+    friendly_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct Album {
+    id: Uuid,
+    object: Object,
+    created_at: Option<DateTime<Utc>>,
+    end_date: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct Item {
+    id: Uuid,
+    object: Object,
+    capture: Option<DateTime<Utc>>,
+    is_edited: bool,
+    checksum: Option<String>,
+    updated_at: Option<String>,
+    thumbhash: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct Root {
+    albums: BTreeMap<Uuid, Album>,
+    digest: String,
+    bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct Contents {
+    items: BTreeMap<Uuid, Item>,
+    digest: String,
+    bytes: usize,
+}
+
+impl Source {
+    fn new(client: Client, http_address: SocketAddrV4, friendly_name: String) -> Self {
+        Self {
+            client,
+            http_address,
+            friendly_name: xml_text(&friendly_name),
+        }
+    }
+
+    /// The caller admits and bounds the whole refresh, including version checking.
+    async fn root(&self, budget: &Budget) -> Result<Root> {
+        budget.check()?;
+        self.client.ensure_supported_version(budget).await?;
+        let records = self.client.albums(budget).await?;
+
+        let root_object = Object {
+            id: "0".into(),
+            parent_id: "-1".into(),
+            title: self.friendly_name.clone(),
+            class: "object.container".into(),
+            date: None,
+            art: None,
+            child_count: None,
+            resources: Vec::new(),
+        };
+
+        let mut albums = BTreeMap::new();
+        let mut bytes = 2 + encoded_size(&root_object, limits::SNAPSHOT_BYTES - 2)?;
+        let mut bad_dates = 0;
+
+        for dto in records {
+            budget.check()?;
+            let created_at = parse_date(dto.created_at.as_deref(), &mut bad_dates);
+
+            let mut album = Album {
+                id: dto.id,
+                object: Object {
+                    id: format!("album:{}", dto.id),
+                    parent_id: "0".into(),
+                    title: title(&dto.album_name, dto.id),
+                    class: "object.container.album".into(),
+                    date: created_at.map(|date| date.format("%Y-%m-%d").to_string()),
+                    art: dto
+                        .album_thumbnail_asset_id
+                        .map(|id| self.media_url(id, "preview")),
+                    child_count: None,
+                    resources: Vec::new(),
+                },
+                created_at,
+                end_date: parse_date(dto.end_date.as_deref(), &mut bad_dates),
+                digest: String::new(),
+            };
+
+            let mut projection = Projection::new(limits::SNAPSHOT_BYTES);
+            projection.json(&album)?;
+            let (digest, size) = projection.finish();
+            album.digest = digest;
+
+            if let Some(previous) = albums.get(&album.id) {
+                ensure!(previous == &album, "conflicting duplicate Immich album");
+                continue;
+            }
+
+            ensure!(
+                albums.len() < limits::CURRENT_ALBUMS,
+                "Immich root exceeds album limit"
+            );
+
+            bytes += 1 + size;
+
+            ensure!(
+                bytes <= limits::SNAPSHOT_BYTES,
+                "Immich root exceeds projected byte limit"
+            );
+
+            albums.insert(album.id, album);
+        }
+
+        budget.check()?;
+        log_dates(bad_dates);
+        let mut projection = Projection::new(limits::SNAPSHOT_BYTES);
+        projection.write_all(b"[")?;
+        projection.json(&root_object)?;
+
+        for album in albums.values() {
+            budget.check()?;
+            projection.write_all(b",")?;
+            projection.json(album)?;
+        }
+
+        projection.write_all(b"]")?;
+        let (digest, bytes) = projection.finish();
+        budget.check()?;
+
+        Ok(Root {
+            albums,
+            digest,
+            bytes,
+        })
+    }
+
+    /// Requires the caller to establish readable root membership first. No version
+    /// request, admission queue, timeout extension, or publication happens here.
+    async fn contents(&self, album: Uuid, budget: &Budget) -> Result<Contents> {
+        budget.check()?;
+        let mut items = BTreeMap::<Uuid, Item>::new();
+        let mut excluded = BTreeSet::new();
+        let mut encoded_ids = BTreeSet::new();
+        let mut pages = 0;
+        let mut records = 0;
+        let mut bytes = 2;
+        let mut bad_dates = 0;
+
+        for encoded in [false, true] {
+            budget.check()?;
+
+            if encoded
+                && !items
+                    .values()
+                    .any(|item| item.object.class == "object.item.videoItem")
+            {
+                break;
+            }
+
+            let mut page = 1;
+
+            loop {
+                budget.check()?;
+
+                ensure!(
+                    pages < limits::SEARCH_PAGES && records < limits::SEARCH_RECORDS,
+                    "Immich album traversal limit exceeded"
+                );
+
+                pages += 1;
+
+                let filter = if encoded {
+                    AssetFilter::EncodedVideos
+                } else {
+                    AssetFilter::All
+                };
+
+                let result = self
+                    .client
+                    .search_album(album, page, filter, budget)
+                    .await?;
+
+                ensure!(
+                    result.items.len() <= limits::SEARCH_RECORDS - records,
+                    "Immich album record limit exceeded"
+                );
+
+                records += result.items.len();
+                let mut advanced = false;
+
+                for dto in result.items {
+                    budget.check()?;
+
+                    if encoded {
+                        advanced |= encoded_ids.insert(dto.id);
+                        continue;
+                    }
+
+                    let id = dto.id;
+                    let item = self.project(album, dto, &mut bad_dates)?;
+                    budget.check()?;
+
+                    match item {
+                        Some(item) => {
+                            ensure!(
+                                !excluded.contains(&id),
+                                "conflicting duplicate Immich asset eligibility"
+                            );
+
+                            if let Some(previous) = items.get(&id) {
+                                ensure!(previous == &item, "conflicting duplicate Immich asset");
+                                continue;
+                            }
+
+                            ensure!(
+                                items.len() < limits::ALBUM_ITEMS,
+                                "Immich album exceeds item limit"
+                            );
+
+                            bytes += usize::from(!items.is_empty())
+                                + encoded_size(&item, limits::SNAPSHOT_BYTES - bytes)?;
+
+                            ensure!(
+                                bytes <= limits::SNAPSHOT_BYTES,
+                                "Immich album exceeds projected byte limit"
+                            );
+
+                            items.insert(id, item);
+                            advanced = true;
+                        }
+
+                        None => {
+                            ensure!(
+                                !items.contains_key(&id),
+                                "conflicting duplicate Immich asset eligibility"
+                            );
+
+                            advanced |= excluded.insert(id);
+                        }
+                    }
+                }
+
+                budget.check()?;
+
+                let Some(next) = result.next_page else {
+                    break;
+                };
+
+                ensure!(advanced, "Immich search continuation made no progress");
+                page = next;
+            }
+        }
+
+        for id in encoded_ids {
+            budget.check()?;
+
+            if let Some(item) = items.get_mut(&id)
+                && item.object.class == "object.item.videoItem"
+            {
+                let old_size = encoded_size(item, limits::SNAPSHOT_BYTES)?;
+
+                item.object.resources.push(Resource {
+                    uri: self.media_url(id, "playback"),
+                    mime: "video/mp4".into(),
+                    duration: None,
+                    byte_seek: true,
+                });
+
+                bytes -= old_size;
+                bytes += encoded_size(item, limits::SNAPSHOT_BYTES - bytes)?;
+            }
+        }
+
+        budget.check()?;
+        log_dates(bad_dates);
+        let mut projection = Projection::new(limits::SNAPSHOT_BYTES);
+        projection.write_all(b"[")?;
+
+        for (index, item) in items.values().enumerate() {
+            budget.check()?;
+
+            if index != 0 {
+                projection.write_all(b",")?;
+            }
+
+            projection.json(item)?;
+        }
+
+        projection.write_all(b"]")?;
+        let (digest, bytes) = projection.finish();
+        budget.check()?;
+
+        Ok(Contents {
+            items,
+            digest,
+            bytes,
+        })
+    }
+
+    fn media_url(&self, id: Uuid, representation: &str) -> String {
+        format!(
+            "http://{}/media/assets/{id}/{representation}",
+            self.http_address
+        )
+    }
+
+    fn project(&self, album: Uuid, dto: Asset, bad_dates: &mut usize) -> Result<Option<Item>> {
+        if !matches!(dto.kind.as_str(), "IMAGE" | "VIDEO")
+            || !matches!(dto.visibility.as_str(), "timeline" | "archive")
+            || dto.is_trashed
+        {
+            return Ok(None);
+        }
+
+        let name = dto
+            .original_file_name
+            .ok_or_else(|| anyhow!("eligible Immich asset is missing originalFileName"))?;
+
+        let video = dto.kind == "VIDEO";
+        let mime = dto.original_mime_type.as_deref().and_then(media_type);
+
+        let (representation, mime) = if video {
+            (
+                "original",
+                mime.unwrap_or_else(|| "application/octet-stream".into()),
+            )
+        } else if !dto.is_edited
+            && mime
+                .as_deref()
+                .is_some_and(|mime| matches!(mime, "image/jpeg" | "image/png" | "image/gif"))
+        {
+            ("original", mime.expect("checked original image MIME"))
+        } else {
+            ("display", "image/jpeg".into())
+        };
+
+        let duration = dto
+            .duration
+            .filter(|ms| (0..=i32::MAX as i64).contains(ms))
+            .filter(|_| video)
+            .map(|ms| {
+                format!(
+                    "{}:{:02}:{:02}.{:03}",
+                    ms / 3_600_000,
+                    ms / 60_000 % 60,
+                    ms / 1000 % 60,
+                    ms % 1000
+                )
+            });
+
+        let mut resources = vec![Resource {
+            uri: self.media_url(dto.id, representation),
+            mime,
+            duration,
+            byte_seek: video,
+        }];
+
+        if !video {
+            resources.push(Resource {
+                uri: self.media_url(dto.id, "preview"),
+                mime: "image/jpeg".into(),
+                duration: None,
+                byte_seek: false,
+            });
+        }
+
+        let capture = parse_date(dto.file_created_at.as_deref(), bad_dates);
+
+        let date = dto
+            .local_date_time
+            .as_deref()
+            .and_then(|date| DateTime::parse_from_rfc3339(date).ok())
+            .map(|date| date.format("%Y-%m-%d").to_string());
+
+        *bad_dates += usize::from(date.is_none());
+
+        Ok(Some(Item {
+            id: dto.id,
+            object: Object {
+                id: format!("album:{album}:asset:{}", dto.id),
+                parent_id: format!("album:{album}"),
+                title: title(&name, dto.id),
+                class: if video {
+                    "object.item.videoItem"
+                } else {
+                    "object.item.imageItem.photo"
+                }
+                .into(),
+                date,
+                art: Some(self.media_url(dto.id, "preview")),
+                child_count: None,
+                resources,
+            },
+            capture,
+            is_edited: dto.is_edited,
+            checksum: dto.checksum,
+            updated_at: dto.updated_at,
+            thumbhash: dto.thumbhash,
+        }))
+    }
+}
+
+fn parse_date(value: Option<&str>, bad_dates: &mut usize) -> Option<DateTime<Utc>> {
+    let parsed = value
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|date| date.with_timezone(&Utc));
+
+    *bad_dates += usize::from(parsed.is_none());
+
+    parsed
+}
+
+fn log_dates(count: usize) {
+    if count != 0 {
+        tracing::debug!(
+            count,
+            "Immich catalog omitted missing or invalid optional dates"
+        );
+    }
+}
+
+fn xml_text(value: &str) -> String {
+    value.chars().map(|c| {
+        if matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}') {
+            c
+        } else {
+            '\u{fffd}'
+        }
+    }).collect()
+}
+
+fn title(value: &str, id: Uuid) -> String {
+    if value.is_empty() {
+        id.to_string()
+    } else {
+        xml_text(value)
+    }
+}
+
+struct ByteCount {
+    bytes: usize,
+    limit: usize,
+}
+
+impl Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit - self.bytes {
+            return Err(std::io::Error::other(
+                "catalog projected byte limit exceeded",
+            ));
+        }
+
+        self.bytes += bytes.len();
+
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// Hash and count the same canonical JSON without allocating a serialized snapshot.
+struct Projection {
+    hash: Sha256,
+    count: ByteCount,
+}
+
+impl Projection {
+    fn new(limit: usize) -> Self {
+        Self {
+            hash: Sha256::new(),
+            count: ByteCount { bytes: 0, limit },
+        }
+    }
+
+    fn json(&mut self, value: &impl Serialize) -> Result<()> {
+        serde_json::to_writer(self, value)
+            .map_err(|_| anyhow!("catalog projected byte limit exceeded"))
+    }
+
+    fn finish(self) -> (String, usize) {
+        (format!("{:x}", self.hash.finalize()), self.count.bytes)
+    }
+}
+
+impl Write for Projection {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.count.write_all(bytes)?;
+        self.hash.update(bytes);
+
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encoded_size(value: &impl Serialize, limit: usize) -> Result<usize> {
+    let mut count = ByteCount { bytes: 0, limit };
+
+    serde_json::to_writer(&mut count, value)
+        .map_err(|_| anyhow!("catalog projected byte limit exceeded"))?;
+
+    Ok(count.bytes)
+}
+
+fn media_type(value: &str) -> Option<String> {
+    crate::mime::parse(value).map(str::to_ascii_lowercase)
+}
+
+// Revision history and durable storage.
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Ledger {
+    pub server_uuid: Uuid,
+    pub system_update_id: u32,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub root_digest: Option<String>,
+    #[serde(deserialize_with = "deserialize_albums")]
+    pub albums: BTreeMap<Uuid, AlbumRevision>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AlbumRevision {
+    pub update_id: u32,
+    pub present: bool,
+    pub metadata_digest: String,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub contents_digest: Option<String>,
+}
+
+fn deserialize_albums<'de, D>(deserializer: D) -> Result<BTreeMap<Uuid, AlbumRevision>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct Albums;
+
+    impl<'de> de::Visitor<'de> for Albums {
+        type Value = BTreeMap<Uuid, AlbumRevision>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded map of distinct album UUIDs")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::MapAccess<'de>,
+        {
+            let mut albums = BTreeMap::new();
+
+            while let Some(id) = map.next_key::<Uuid>()? {
+                if albums.contains_key(&id) {
+                    return Err(de::Error::custom("duplicate album UUID"));
+                }
+
+                if albums.len() == RETAINED_ALBUMS {
+                    return Err(de::Error::custom(
+                        "revision history exceeds 16384 identities",
+                    ));
+                }
+
+                albums.insert(id, map.next_value()?);
+            }
+
+            Ok(albums)
+        }
+    }
+
+    deserializer.deserialize_map(Albums)
+}
+
+fn validate_digest(digest: &str) -> anyhow::Result<()> {
+    ensure!(
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "revision digest must be 64 lowercase hexadecimal characters"
+    );
+
+    Ok(())
+}
+
+impl Ledger {
+    fn validate(&self, uuid: Uuid) -> anyhow::Result<()> {
+        ensure!(!uuid.is_nil(), "server UUID must not be nil");
+
+        ensure!(
+            self.server_uuid == uuid,
+            "revision state has the wrong server UUID"
+        );
+
+        ensure!(
+            self.albums.len() <= RETAINED_ALBUMS,
+            "revision history exceeds 16384 identities; use a new server UUID and empty state directory"
+        );
+
+        ensure!(
+            self.albums.values().filter(|album| album.present).count() <= CURRENT_ALBUMS,
+            "revision state exceeds 4096 present albums"
+        );
+
+        ensure!(
+            self.root_digest.is_some() || self.albums.is_empty(),
+            "revision state with retained albums requires a root digest"
+        );
+
+        if let Some(digest) = &self.root_digest {
+            validate_digest(digest)?;
+        }
+
+        for album in self.albums.values() {
+            validate_digest(&album.metadata_digest)?;
+
+            if let Some(digest) = &album.contents_digest {
+                validate_digest(digest)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Invalidate every retained counter once, without forgetting any digest.
+    /// Persist this transition before binding listeners or announcing the device.
+    pub fn restart(&mut self) {
+        self.system_update_id = self.system_update_id.wrapping_add(1);
+
+        for album in self.albums.values_mut() {
+            album.update_id = album.update_id.wrapping_add(1);
+        }
+    }
+
+    /// `albums` is the complete present map with internally generated metadata digests.
+    /// The ledger is validated on load and again before persistence.
+    /// `None` means no revision write, even when a snapshot needs a cache refill.
+    fn root_transition(
+        &self,
+        root_digest: &str,
+        albums: &BTreeMap<Uuid, String>,
+    ) -> anyhow::Result<Option<Self>> {
+        ensure!(
+            albums.len() <= CURRENT_ALBUMS,
+            "root exceeds 4096 present albums"
+        );
+
+        let new_identities = albums
+            .keys()
+            .filter(|id| !self.albums.contains_key(id))
+            .count();
+
+        ensure!(
+            self.albums.len() + new_identities <= RETAINED_ALBUMS,
+            "revision history exhausted; stop the service, archive state, and use a new server UUID and empty private directory"
+        );
+
+        let mut next = self.clone();
+        let mut changed = self.root_digest.as_deref() != Some(root_digest);
+
+        for (id, album) in &mut next.albums {
+            let metadata = albums.get(id);
+            let present = metadata.is_some();
+            let metadata_changed = metadata.is_some_and(|digest| digest != &album.metadata_digest);
+
+            if album.present != present || metadata_changed {
+                album.update_id = album.update_id.wrapping_add(1);
+                album.present = present;
+                changed = true;
+
+                if let Some(digest) = metadata {
+                    album.metadata_digest.clone_from(digest);
+                }
+            }
+        }
+
+        for (id, metadata_digest) in albums {
+            if !next.albums.contains_key(id) {
+                next.albums.insert(
+                    *id,
+                    AlbumRevision {
+                        update_id: 0,
+                        present: true,
+                        metadata_digest: metadata_digest.clone(),
+                        contents_digest: None,
+                    },
+                );
+
+                changed = true;
+            }
+        }
+
+        if !changed {
+            return Ok(None);
+        }
+
+        next.root_digest = Some(root_digest.to_owned());
+        next.system_update_id = next.system_update_id.wrapping_add(1);
+
+        Ok(Some(next))
+    }
+
+    fn contents_transition(&self, id: Uuid, digest: &str) -> anyhow::Result<Option<Self>> {
+        let album = self.albums.get(&id).filter(|album| album.present);
+        let album = album.context("contents transition requires a present album")?;
+
+        if album.contents_digest.as_deref() == Some(digest) {
+            return Ok(None);
+        }
+
+        let mut next = self.clone();
+
+        let album = next
+            .albums
+            .get_mut(&id)
+            .expect("validated album exists in clone");
+
+        album.update_id = album.update_id.wrapping_add(1);
+        album.contents_digest = Some(digest.to_owned());
+        next.system_update_id = next.system_update_id.wrapping_add(1);
+
+        Ok(Some(next))
+    }
+}
+
+/// Owns the exclusive directory lock, also retained by every disk worker.
+#[derive(Clone)]
+pub struct Store {
+    inner: Arc<StoreInner>,
+}
+
+struct StoreInner {
+    directory: File,
+    path: PathBuf,
+    uuid: Uuid,
+    #[cfg(test)]
+    fault: Option<revision_tests::Fault>,
+}
+
+fn check_private(metadata: &fs::Metadata, directory: bool) -> anyhow::Result<()> {
+    // SAFETY: geteuid has no preconditions and does not modify process state.
+    ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "state is not owned by this user"
+    );
+
+    if directory {
+        ensure!(metadata.is_dir(), "state directory is not a directory");
+
+        ensure!(
+            metadata.mode() & 0o777 == 0o700,
+            "state directory must be mode 0700"
+        );
+    } else {
+        ensure!(metadata.is_file(), "revision files must be regular files");
+
+        ensure!(
+            metadata.mode() & 0o777 == 0o600,
+            "revision files must be mode 0600"
+        );
+
+        ensure!(
+            metadata.nlink() == 1,
+            "revision files must not be hard links"
+        );
+    }
+
+    Ok(())
+}
+
+impl Store {
+    /// Lock and load synchronously; never perform the startup revision write here.
+    /// The existing directory must be private, writable, trusted local storage.
+    /// Resolve a configured symlink once, as used by systemd DynamicUser. The
+    /// directory and its parent paths must not be moved or replaced while running.
+    pub fn open(directory: &Path, uuid: Uuid) -> anyhow::Result<(Self, Ledger)> {
+        ensure!(!uuid.is_nil(), "server UUID must not be nil");
+
+        let path = directory
+            .canonicalize()
+            .context("resolve revision directory")?;
+
+        let directory_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK)
+            .open(&path)
+            .context("open revision directory")?;
+
+        check_private(&directory_file.metadata()?, true)?;
+
+        // Lock before loading state or removing an uncommitted temporary file.
+        directory_file
+            .try_lock()
+            .context("revision directory is already locked or cannot be locked")?;
+
+        // O_NONBLOCK lets file-type validation reject a FIFO without hanging.
+        let committed = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path.join("revisions.json"));
+
+        let ledger = match committed {
+            Ok(file) => {
+                check_private(&file.metadata()?, false)?;
+
+                ensure!(
+                    file.metadata()?.len() <= REVISION_BYTES as u64,
+                    "revision file exceeds 8 MiB"
+                );
+
+                let mut bytes = Vec::new();
+
+                file.take(REVISION_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+
+                ensure!(bytes.len() <= REVISION_BYTES, "revision file exceeds 8 MiB");
+
+                let ledger: Ledger = serde_json::from_slice(&bytes).map_err(|error| {
+                    anyhow::anyhow!(
+                        "invalid revision JSON at line {}, column {}",
+                        error.line(),
+                        error.column()
+                    )
+                })?;
+
+                ledger.validate(uuid)?;
+
+                match fs::remove_file(path.join("revisions.tmp")) {
+                    Ok(()) => {}
+
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+
+                    Err(error) => {
+                        return Err(error).context("remove uncommitted revision temporary file");
+                    }
+                }
+
+                ledger
+            }
+
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut entries = fs::read_dir(&path).context("inspect new revision directory")?;
+
+                ensure!(
+                    entries.next().transpose()?.is_none(),
+                    "revision state is missing in a nonempty directory; restore state or use a new server UUID"
+                );
+
+                Ledger {
+                    server_uuid: uuid,
+                    system_update_id: 0,
+                    root_digest: None,
+                    albums: BTreeMap::new(),
+                }
+            }
+
+            Err(error) => return Err(error).context("open committed revision state"),
+        };
+
+        let store = Self {
+            inner: Arc::new(StoreInner {
+                directory: directory_file,
+                path,
+                uuid,
+                #[cfg(test)]
+                fault: None,
+            }),
+        };
+
+        Ok((store, ledger))
+    }
+
+    /// Durably replace state or exit(1), including on cancellation after polling.
+    ///
+    /// PRECONDITION: a service-owned, non-cancelable task holds commit serialization
+    /// from candidate construction through this call AND subsequent publication and
+    /// subscriber updates. This method does not serialize callers or publish state.
+    /// Never wrap it in a client/request timeout. The blocking worker retains the
+    /// process lock; failure/timeout exits without waiting for worker/runtime drop.
+    pub async fn persist(&self, ledger: Ledger) {
+        struct Commit;
+
+        impl Drop for Commit {
+            fn drop(&mut self) {
+                fail_stop("revision commit cancelled before durable completion");
+            }
+        }
+
+        let guard = Commit;
+        let deadline = tokio::time::Instant::now() + COMMIT_TIMEOUT;
+        let inner = Arc::clone(&self.inner);
+
+        let worker = tokio::task::spawn_blocking(move || {
+            let result = inner.write(ledger);
+            drop(inner);
+
+            result
+        });
+
+        #[cfg(test)]
+        if matches!(
+            self.inner.fault,
+            Some(revision_tests::Fault::LateObservation)
+        ) {
+            // Observe a ready worker only once the commit deadline has elapsed.
+            while !worker.is_finished() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+
+            tokio::time::advance(COMMIT_TIMEOUT + std::time::Duration::from_millis(1)).await;
+        }
+
+        match tokio::time::timeout_at(deadline, worker).await {
+            Ok(Ok(Ok(()))) if tokio::time::Instant::now() < deadline => std::mem::forget(guard),
+
+            Ok(Ok(Err(error))) => {
+                tracing::error!(
+                    operation = error.operation,
+                    kind = ?error.kind,
+                    os_code = ?error.os_code,
+                    "revision persistence failed; terminating without publishing candidate state"
+                );
+
+                std::process::exit(1);
+            }
+
+            Ok(Err(_)) => fail_stop("revision persistence worker failed"),
+            Ok(Ok(Ok(()))) | Err(_) => fail_stop("revision commit exceeded five seconds"),
+        }
+    }
+}
+
+fn fail_stop(message: &'static str) -> ! {
+    // Log only a fixed diagnostic, never JSON, paths or source data.
+    tracing::error!("{message}; terminating without publishing candidate state");
+
+    std::process::exit(1);
+}
+
+#[derive(Debug)]
+struct PersistenceError {
+    operation: &'static str,
+    kind: Option<io::ErrorKind>,
+    os_code: Option<i32>,
+}
+
+struct BoundedBytes(Vec<u8>);
+
+impl Write for BoundedBytes {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > REVISION_BYTES - self.0.len() {
+            return Err(io::Error::other("serialized revision file exceeds 8 MiB"));
+        }
+
+        self.0.extend_from_slice(bytes);
+
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl StoreInner {
+    fn write(&self, ledger: Ledger) -> Result<(), PersistenceError> {
+        let mut operation = "validate revision state";
+
+        let result = (|| {
+            ledger.validate(self.uuid)?;
+            let mut bytes = BoundedBytes(Vec::new());
+            operation = "serialize bounded revision state";
+            serde_json::to_writer(&mut bytes, &ledger)?;
+            operation = "create private revision temporary file";
+
+            let mut temporary = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(self.path.join("revisions.tmp"))?;
+
+            operation = "inspect revision temporary file";
+            check_private(&temporary.metadata()?, false)?;
+            let (first, second) = bytes.0.split_at(bytes.0.len() / 2);
+            operation = "write revision state";
+            temporary.write_all(first)?;
+            #[cfg(test)]
+            self.inject(revision_tests::Stage::Write)?;
+            temporary.write_all(second)?;
+            operation = "flush revision state";
+            temporary.flush()?;
+            operation = "sync revision state";
+            #[cfg(test)]
+            self.inject(revision_tests::Stage::FileSync)?;
+            temporary.sync_all()?;
+            operation = "replace revision state";
+            #[cfg(test)]
+            self.inject(revision_tests::Stage::Rename)?;
+
+            fs::rename(
+                self.path.join("revisions.tmp"),
+                self.path.join("revisions.json"),
+            )?;
+
+            operation = "sync revision directory";
+            #[cfg(test)]
+            self.inject(revision_tests::Stage::DirectorySync)?;
+            self.directory.sync_all()?;
+
+            Ok(())
+        })();
+
+        // Discard all source text before returning to the logging task.
+        result.map_err(|error: anyhow::Error| {
+            let io = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<io::Error>());
+
+            PersistenceError {
+                operation,
+                kind: io.map(io::Error::kind),
+                os_code: io.and_then(io::Error::raw_os_error),
+            }
+        })
+    }
+}
+
+// Fork temporarily inherits flock descriptors even with CLOEXEC. All subprocess
+// tests share this guard with close/reopen tests until exec closes those copies.
+#[cfg(test)]
+static SPAWN_OR_REOPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Refresh coordination, publication, and browsing.
 
 const FAILED: Fault = Fault { code: 501 };
 const MISSING: Fault = Fault { code: 701 };
@@ -819,6 +1887,1952 @@ impl Catalog for Library {
             total_matches,
             update_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use axum::response::Response;
+    use http::Method;
+    use serde_json::{Value, json};
+
+    use crate::immich::tests::{Fake as Api, Received, album, asset, page, reply, version};
+
+    const ALBUM: Uuid = Uuid::from_u128(100_000);
+
+    fn budget() -> Budget {
+        Budget {
+            deadline: Instant::now() + limits::REFRESH_PREPARATION_TIMEOUT,
+            stop: CancellationToken::new(),
+        }
+    }
+
+    struct SnapshotFixture {
+        source: Source,
+        requests: Arc<Mutex<Vec<Received>>>,
+        _api: Api,
+    }
+
+    impl SnapshotFixture {
+        async fn new(replies: Vec<Response>) -> Self {
+            let api = Api::new(replies).await;
+
+            let source = Source::new(
+                api.client.clone(),
+                "192.0.2.1:8200".parse().unwrap(),
+                "Photos".into(),
+            );
+
+            Self {
+                source,
+                requests: api.requests.clone(),
+                _api: api,
+            }
+        }
+    }
+
+    fn project(source: &Source, value: Value) -> Item {
+        source
+            .project(ALBUM, serde_json::from_value(value).unwrap(), &mut 0)
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn processing_boundary(cancel: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        for stage in 0..6 {
+            let replies = match stage {
+                0 => vec![version(), reply(json!([]))],
+                1 => vec![page(vec![asset(1, "IMAGE")], Some("2")), page(vec![], None)],
+                2 => vec![page(vec![asset(1, "VIDEO")], None), page(vec![], None)],
+
+                3 => vec![
+                    page(vec![asset(1, "VIDEO")], None),
+                    page(vec![asset(1, "VIDEO")], Some("2")),
+                    page(vec![], None),
+                ],
+
+                4 => vec![version(), reply(json!([album(ALBUM)]))],
+                _ => vec![page(vec![asset(1, "IMAGE")], None)],
+            };
+
+            let mut fake = SnapshotFixture::new(replies).await;
+
+            let budget = Budget {
+                deadline: Instant::now() + Duration::from_secs(1),
+                ..budget()
+            };
+
+            let deadline = budget.deadline;
+            let cancelled = budget.stop.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let allowed = if matches!(stage, 3 | 4) { 2 } else { 1 };
+
+            fake.source.client.after_json = Some(Arc::new(move || {
+                if observed.fetch_add(1, AtomicOrdering::SeqCst) + 1 == allowed {
+                    if cancel {
+                        let cancelled = cancelled.clone();
+
+                        std::thread::spawn(move || cancelled.cancel())
+                            .join()
+                            .unwrap();
+                    } else {
+                        // Block synchronously, as parsing can, without yielding to a timer.
+                        std::thread::sleep(
+                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        );
+                    }
+                }
+            }));
+
+            let failed = if matches!(stage, 0 | 4) {
+                fake.source.root(&budget).await.is_err()
+            } else {
+                fake.source.contents(ALBUM, &budget).await.is_err()
+            };
+
+            assert_eq!(
+                fake.requests.lock().unwrap().len(),
+                allowed,
+                "stage {stage} started a request after processing exhausted the budget"
+            );
+
+            assert!(failed);
+            assert_eq!(calls.load(AtomicOrdering::SeqCst), allowed);
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_during_processing_does_not_start_next_request() {
+        processing_boundary(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_during_processing_does_not_start_next_request() {
+        processing_boundary(true).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_budget_rejects_snapshot_preparation() {
+        for checked in [false, true] {
+            for cancel in [false, true] {
+                let fake = SnapshotFixture::new(vec![version(), reply(json!([]))]).await;
+
+                if checked {
+                    fake.source.root(&budget()).await.unwrap();
+                }
+
+                let mut budget = budget();
+
+                if cancel {
+                    budget.stop.cancel();
+                } else {
+                    budget.deadline = Instant::now();
+                }
+
+                let expected = if cancel {
+                    "operation cancelled"
+                } else {
+                    "operation deadline exceeded"
+                };
+
+                assert_eq!(
+                    fake.source.root(&budget).await.unwrap_err().to_string(),
+                    expected
+                );
+
+                assert_eq!(
+                    fake.source
+                        .contents(ALBUM, &budget)
+                        .await
+                        .unwrap_err()
+                        .to_string(),
+                    expected
+                );
+
+                assert_eq!(
+                    fake.requests.lock().unwrap().len(),
+                    if checked { 2 } else { 0 }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resources_dates_and_optional_hints() {
+        let fake = SnapshotFixture::new(vec![]).await;
+
+        for (mime, edited, representation, expected) in [
+            (
+                Some("IMAGE/JPEG; quality=90"),
+                false,
+                "original",
+                "image/jpeg",
+            ),
+            (Some("image/png"), false, "original", "image/png"),
+            (Some("image/jpeg; q =90"), false, "original", "image/jpeg"),
+            (Some("image/jpeg; q= 90"), false, "original", "image/jpeg"),
+            (
+                Some("IMAGE/JPEG;; q \t=\t \"90\"; ; x = y;"),
+                false,
+                "original",
+                "image/jpeg",
+            ),
+            (Some("image/gif"), false, "original", "image/gif"),
+            (Some("image/jpeg"), true, "display", "image/jpeg"),
+            (Some("image/heic"), false, "display", "image/jpeg"),
+            (Some("image/webp"), false, "display", "image/jpeg"),
+            (Some("image/jpeg;broken"), false, "display", "image/jpeg"),
+            (Some("image/jpeg; q = "), false, "display", "image/jpeg"),
+            (
+                Some("image/jpeg; q = \"90\"oops"),
+                false,
+                "display",
+                "image/jpeg",
+            ),
+            (
+                Some("image/jpeg; q = \"bad\u{7f}\""),
+                false,
+                "display",
+                "image/jpeg",
+            ),
+            (None, false, "display", "image/jpeg"),
+        ] {
+            let mut dto = asset(1, "IMAGE");
+            dto["originalMimeType"] = json!(mime);
+            dto["isEdited"] = json!(edited);
+            dto["originalFileName"] = json!("A\u{0001}&B");
+            let item = project(&fake.source, dto);
+            assert_eq!(item.object.title, "A\u{fffd}&B");
+            assert_eq!(item.object.date.as_deref(), Some("2024-01-01"));
+
+            assert_eq!(
+                item.capture.unwrap().to_rfc3339(),
+                "2023-12-31T22:30:00+00:00"
+            );
+
+            assert_eq!(item.object.resources.len(), 2);
+            assert!(item.object.resources[0].uri.ends_with(representation));
+            assert_eq!(item.object.resources[0].mime, expected);
+            assert!(item.object.resources[1].uri.ends_with("preview"));
+
+            assert!(
+                item.object
+                    .resources
+                    .iter()
+                    .all(|r| !r.byte_seek && r.duration.is_none())
+            );
+        }
+
+        for (duration, expected) in [
+            (0, Some("0:00:00.000")),
+            (3_661_007, Some("1:01:01.007")),
+            (i32::MAX as i64, Some("596:31:23.647")),
+            (-1, None),
+            (i32::MAX as i64 + 1, None),
+        ] {
+            let mut dto = asset(1, "VIDEO");
+            dto["originalMimeType"] = Value::Null;
+            dto["duration"] = json!(duration);
+            dto["localDateTime"] = json!("2024-01-01T23:00:00-12:00");
+            let item = project(&fake.source, dto);
+            assert_eq!(item.object.date.as_deref(), Some("2024-01-01"));
+            assert_eq!(item.object.resources[0].duration.as_deref(), expected);
+            assert_eq!(item.object.resources[0].mime, "application/octet-stream");
+            assert!(item.object.resources[0].byte_seek);
+            assert!(item.object.art.unwrap().ends_with("preview"));
+        }
+
+        let mut dto = asset(1, "IMAGE");
+        dto["originalFileName"] = json!("");
+        dto["fileCreatedAt"] = json!("2024-01-01T12:00:00");
+        dto["localDateTime"] = json!("not a date");
+        dto["checksum"] = json!("one");
+        dto["updatedAt"] = json!("opaque hint");
+        dto["thumbhash"] = json!("two");
+        dto["exifInfo"] = json!(["ignored unsupported structure"]);
+        let item = project(&fake.source, dto);
+        assert_eq!(item.object.title, Uuid::from_u128(1).to_string());
+        assert!(item.capture.is_none() && item.object.date.is_none());
+        assert_eq!(item.checksum.as_deref(), Some("one"));
+        assert_eq!(item.updated_at.as_deref(), Some("opaque hint"));
+        assert_eq!(item.thumbhash.as_deref(), Some("two"));
+
+        for invalid in [Value::Null, json!(123), json!(false), json!({"date": []})] {
+            let mut dto = asset(1, "IMAGE");
+            dto["fileCreatedAt"] = invalid.clone();
+            dto["localDateTime"] = invalid.clone();
+            let item = project(&fake.source, dto);
+            assert!(item.capture.is_none() && item.object.date.is_none());
+            let mut dto = album(ALBUM);
+            dto["createdAt"] = invalid;
+            let album: crate::immich::Album = serde_json::from_value(dto).unwrap();
+            assert!(parse_date(album.created_at.as_deref(), &mut 0).is_none());
+        }
+
+        assert!(fake.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn complete_pagination_and_scoped_encoded_intersection_without_probes() {
+        let mut archived = asset(1001, "VIDEO");
+        archived["visibility"] = json!("archive");
+        archived["originalMimeType"] = json!("Video/QuickTime");
+        let mut changed_encoded = archived.clone();
+        changed_encoded["originalFileName"] = json!("changed between searches");
+
+        let fake = SnapshotFixture::new(vec![
+            version(),
+            reply(json!([album(ALBUM)])),
+            page((1..=1000).map(|id| asset(id, "IMAGE")).collect(), Some("2")),
+            page(vec![archived], None),
+            page(
+                vec![
+                    changed_encoded.clone(),
+                    changed_encoded,
+                    asset(9999, "VIDEO"),
+                ],
+                None,
+            ),
+            reply(json!([])),
+        ])
+        .await;
+
+        let root = fake.source.root(&budget()).await.unwrap();
+
+        assert_eq!(
+            root.albums[&ALBUM].object.date.as_deref(),
+            Some("2023-12-31")
+        );
+
+        assert!(
+            root.albums[&ALBUM]
+                .object
+                .art
+                .as_ref()
+                .unwrap()
+                .contains(&Uuid::from_u128(777).to_string())
+        );
+
+        assert!(root.albums[&ALBUM].object.child_count.is_none());
+        let contents = fake.source.contents(ALBUM, &budget()).await.unwrap();
+        assert_eq!(contents.items.len(), 1001);
+        let video = &contents.items[&Uuid::from_u128(1001)].object;
+        assert_eq!(video.resources.len(), 2);
+        assert_eq!(video.resources[0].mime, "video/quicktime");
+        assert_eq!(video.resources[1].mime, "video/mp4");
+        assert!(video.resources.iter().all(|r| r.byte_seek));
+        assert!(video.resources[1].duration.is_none());
+
+        assert!(
+            fake.source
+                .clone()
+                .root(&budget())
+                .await
+                .unwrap()
+                .albums
+                .is_empty()
+        );
+
+        let requests = fake.requests.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(requests[0].uri, "/prefix/api/server/version");
+        assert_eq!(requests[1].uri, "/prefix/api/albums");
+        assert_eq!(requests[5].uri, "/prefix/api/albums");
+
+        for (index, expected_page) in [(2, 1), (3, 2), (4, 1)] {
+            let request = &requests[index];
+            assert_eq!(request.method, Method::POST);
+            assert_eq!(request.uri, "/prefix/api/search/metadata");
+            assert_eq!(request.body["albumIds"], json!([ALBUM]));
+            assert_eq!(request.body["page"], json!(expected_page));
+            assert_eq!(request.body["size"], json!(limits::SEARCH_PAGE_SIZE));
+            assert_eq!(request.body["withDeleted"], false);
+            assert_eq!(request.body["withExif"], false);
+            assert_eq!(request.body["withPeople"], false);
+            assert!(request.body.get("withStacked").is_none());
+
+            assert_eq!(
+                request.body.get("isEncoded"),
+                (index == 4).then_some(&Value::Bool(true))
+            );
+
+            assert_eq!(
+                request.body.get("type"),
+                (index == 4).then_some(&json!("VIDEO"))
+            );
+        }
+
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.headers["x-api-key"] == "private-test-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn eligible_assets_require_original_file_name() {
+        for null in [false, true] {
+            let mut dto = asset(1, "IMAGE");
+
+            if null {
+                dto["originalFileName"] = Value::Null;
+            } else {
+                dto.as_object_mut().unwrap().remove("originalFileName");
+            }
+
+            let fake = SnapshotFixture::new(vec![page(vec![dto], None)]).await;
+
+            assert_eq!(
+                fake.source
+                    .contents(ALBUM, &budget())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "eligible Immich asset is missing originalFileName"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicates_compare_only_normalized_member_data_and_eligibility() {
+        let first = asset(1, "IMAGE");
+
+        for field in [
+            "originalFileName",
+            "checksum",
+            "updatedAt",
+            "thumbhash",
+            "localDateTime",
+            "fileCreatedAt",
+            "isEdited",
+            "visibility",
+            "isTrashed",
+            "type",
+        ] {
+            let mut second = first.clone();
+
+            second[field] = match field {
+                "isEdited" | "isTrashed" => json!(true),
+                "visibility" => json!("hidden"),
+                "type" => json!("VIDEO"),
+                "localDateTime" | "fileCreatedAt" => json!("2025-01-01T00:00:00Z"),
+                _ => json!("changed"),
+            };
+
+            for reversed in [false, true] {
+                let records = if reversed {
+                    vec![second.clone(), first.clone()]
+                } else {
+                    vec![first.clone(), second.clone()]
+                };
+
+                let fake = SnapshotFixture::new(vec![page(records, None)]).await;
+
+                assert!(
+                    fake.source.contents(ALBUM, &budget()).await.is_err(),
+                    "{field}"
+                );
+            }
+        }
+
+        let mut irrelevant = first.clone();
+        irrelevant["originalPath"] = json!("private ignored path");
+        irrelevant["visibility"] = json!("archive");
+        let mut excluded = asset(2, "VIDEO");
+        excluded["visibility"] = json!("future-visibility");
+        excluded.as_object_mut().unwrap().remove("originalFileName");
+        let mut excluded_changed = excluded.clone();
+        excluded_changed["originalFileName"] = json!("irrelevant name".repeat(1000));
+        excluded_changed["checksum"] = json!("irrelevant hint".repeat(1000));
+        excluded_changed["isEdited"] = json!(true);
+
+        let fake = SnapshotFixture::new(vec![page(
+            vec![first, irrelevant, excluded, excluded_changed],
+            None,
+        )])
+        .await;
+
+        let result = fake.source.contents(ALBUM, &budget()).await.unwrap();
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(fake.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn root_duplicates_titles_covers_and_canonical_digests() {
+        let mut empty = album(ALBUM);
+        empty["albumName"] = json!("");
+        empty["albumThumbnailAssetId"] = Value::Null;
+        let other = album(Uuid::from_u128(2));
+
+        let fake = SnapshotFixture::new(vec![
+            version(),
+            reply(json!([empty.clone(), other.clone(), empty.clone()])),
+            reply(json!([other, empty.clone()])),
+            reply(json!([empty.clone(), {"id": ALBUM, "albumName": "changed"}])),
+            reply(json!([{"id": ALBUM}])),
+            reply(json!([{"id": ALBUM, "albumName": "valid", "albumThumbnailAssetId": "invalid"}])),
+        ])
+        .await;
+
+        let first = fake.source.root(&budget()).await.unwrap();
+        let second = fake.source.root(&budget()).await.unwrap();
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(first.bytes, second.bytes);
+        assert_eq!(first.albums[&ALBUM].object.title, ALBUM.to_string());
+        assert!(first.albums[&ALBUM].object.art.is_none());
+
+        for _ in 0..3 {
+            assert!(fake.source.root(&budget()).await.is_err());
+        }
+
+        let renamed = SnapshotFixture::new(vec![version(), reply(json!([empty.clone()]))]).await;
+        let baseline = renamed.source.root(&budget()).await.unwrap();
+        let mut changed = SnapshotFixture::new(vec![version(), reply(json!([empty]))]).await;
+        changed.source.friendly_name = "Another title".into();
+        let changed = changed.source.root(&budget()).await.unwrap();
+        assert_ne!(baseline.digest, changed.digest);
+        assert_eq!(
+            baseline.albums[&ALBUM].digest,
+            changed.albums[&ALBUM].digest
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
+        let mut first = asset(2, "IMAGE");
+        first["originalFileName"] = json!("Zażółć \"photo\"\\name\n.jpg");
+        let second = asset(1, "IMAGE");
+
+        let fake = SnapshotFixture::new(vec![
+            page(vec![first.clone(), second.clone()], None),
+            page(vec![second.clone(), first.clone(), second], None),
+        ])
+        .await;
+
+        let baseline = fake.source.contents(ALBUM, &budget()).await.unwrap();
+        let reordered = fake.source.contents(ALBUM, &budget()).await.unwrap();
+        assert_eq!(baseline.digest, reordered.digest);
+        assert_eq!(baseline.bytes, reordered.bytes);
+        let serialized = serde_json::to_vec(&baseline.items.values().collect::<Vec<_>>()).unwrap();
+        assert_eq!(baseline.bytes, serialized.len());
+        assert_eq!(
+            baseline.digest,
+            format!("{:x}", Sha256::digest(&serialized))
+        );
+        assert_eq!(baseline.digest.len(), 64);
+        let item = baseline.items.values().next().unwrap();
+        let mut original = Projection::new(limits::SNAPSHOT_BYTES);
+        original.json(item).unwrap();
+        let original = original.finish().0;
+
+        for field in [
+            "checksum",
+            "updatedAt",
+            "thumbhash",
+            "fileCreatedAt",
+            "isEdited",
+        ] {
+            let mut changed = asset(1, "IMAGE");
+
+            changed[field] = match field {
+                "fileCreatedAt" => json!("2024-01-01T00:30:01+02:00"),
+                "isEdited" => json!(true),
+                _ => json!("changed"),
+            };
+
+            let changed = project(&fake.source, changed);
+            let mut digest = Projection::new(limits::SNAPSHOT_BYTES);
+            digest.json(&changed).unwrap();
+            assert_ne!(original, digest.finish().0, "{field}");
+        }
+
+        let mut reversed = item.clone();
+        reversed.object.resources.reverse();
+        let mut digest = Projection::new(limits::SNAPSHOT_BYTES);
+        digest.json(&reversed).unwrap();
+        assert_ne!(original, digest.finish().0);
+
+        for item in baseline.items.values() {
+            let size = serde_json::to_vec(item).unwrap().len();
+            assert_eq!(encoded_size(item, limits::SNAPSHOT_BYTES).unwrap(), size);
+            assert_eq!(encoded_size(item, size).unwrap(), size);
+            assert!(encoded_size(item, size - 1).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn traversal_progress_and_combined_page_budget() {
+        for repeated in [false, true] {
+            let mut replies = vec![page(vec![asset(1, "IMAGE")], Some("2"))];
+
+            replies.push(page(
+                if repeated {
+                    vec![asset(1, "IMAGE")]
+                } else {
+                    vec![]
+                },
+                Some("3"),
+            ));
+
+            let fake = SnapshotFixture::new(replies).await;
+            assert!(fake.source.contents(ALBUM, &budget()).await.is_err());
+            assert_eq!(fake.requests.lock().unwrap().len(), 2);
+        }
+
+        for finish in [false, true] {
+            let mut replies = vec![page(vec![asset(1, "VIDEO")], None)];
+
+            for number in 1..limits::SEARCH_PAGES {
+                let next = (number + 1).to_string();
+
+                replies.push(page(
+                    vec![asset(number as u128, "VIDEO")],
+                    if finish && number == limits::SEARCH_PAGES - 1 {
+                        None
+                    } else {
+                        Some(&next)
+                    },
+                ));
+            }
+
+            let fake = SnapshotFixture::new(replies).await;
+            assert_eq!(fake.source.contents(ALBUM, &budget()).await.is_ok(), finish);
+            assert_eq!(fake.requests.lock().unwrap().len(), limits::SEARCH_PAGES);
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_record_item_album_and_projected_payload_limits() {
+        let excluded = json!({"id": Uuid::from_u128(1), "type": "AUDIO", "visibility": "hidden", "isTrashed": false, "isEdited": false});
+
+        // Raw records count even when identical and excluded; pages need not be full.
+        let fake =
+            SnapshotFixture::new(vec![page(vec![excluded; limits::SEARCH_RECORDS + 1], None)])
+                .await;
+
+        assert!(
+            fake.source
+                .contents(ALBUM, &budget())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("record limit")
+        );
+
+        for extra in [0, 1] {
+            let encoded = json!({"id": Uuid::from_u128(1), "type": "VIDEO", "visibility": "timeline", "isTrashed": false, "isEdited": false});
+
+            let fake = SnapshotFixture::new(vec![
+                page(vec![asset(1, "VIDEO")], None),
+                page(vec![encoded; limits::SEARCH_RECORDS - 1 + extra], None),
+            ])
+            .await;
+
+            assert_eq!(
+                fake.source.contents(ALBUM, &budget()).await.is_ok(),
+                extra == 0
+            );
+
+            assert_eq!(fake.requests.lock().unwrap().len(), 2);
+        }
+
+        let mut replies = Vec::new();
+
+        for page_number in 0..=limits::ALBUM_ITEMS / limits::SEARCH_PAGE_SIZE {
+            let start = page_number * limits::SEARCH_PAGE_SIZE + 1;
+
+            let count = if start > limits::ALBUM_ITEMS {
+                1
+            } else {
+                limits::SEARCH_PAGE_SIZE
+            };
+
+            let next = (page_number + 2).to_string();
+
+            replies.push(page(
+                (start..start + count)
+                    .map(|id| asset(id as u128, "IMAGE"))
+                    .collect(),
+                (count != 1).then_some(next.as_str()),
+            ));
+        }
+
+        let fake = SnapshotFixture::new(replies).await;
+
+        let error = fake
+            .source
+            .contents(ALBUM, &budget())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("item limit"), "{error}");
+
+        let fake = SnapshotFixture::new(vec![
+            version(),
+            reply(json!(
+                (0..=limits::CURRENT_ALBUMS)
+                    .map(|id| album(Uuid::from_u128(id as u128)))
+                    .collect::<Vec<_>>()
+            )),
+        ])
+        .await;
+
+        assert!(
+            fake.source
+                .root(&budget())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("album limit")
+        );
+
+        let mut big = asset(1, "IMAGE");
+        big["checksum"] = json!("x".repeat(limits::SNAPSHOT_BYTES / 2));
+        let mut bigger = big.clone();
+        bigger["id"] = json!(Uuid::from_u128(2));
+
+        let fake =
+            SnapshotFixture::new(vec![page(vec![big], Some("2")), page(vec![bigger], None)]).await;
+
+        assert!(
+            fake.source
+                .contents(ALBUM, &budget())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("byte limit")
+        );
+    }
+
+    #[test]
+    fn mime_normalization_accepts_parameter_whitespace_but_rejects_garbage() {
+        for value in [
+            " IMAGE/JPEG ; q=90",
+            "image/jpeg; q =90",
+            "image/jpeg; q= 90",
+            "IMAGE/JPEG;; q \t=\t \"90\"; ; x = y;",
+        ] {
+            assert_eq!(
+                media_type(value).as_deref(),
+                Some("image/jpeg"),
+                "{value:?}"
+            );
+        }
+
+        for value in [
+            "image/jpeg; q = ",
+            "image/jpeg; q = \"90\"oops",
+            "image/jpeg; q\n=90",
+            "image/jpeg; q=\n90",
+            "image/jpeg; q = \"bad\u{7f}\"",
+        ] {
+            assert_eq!(media_type(value), None, "{value:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+    use std::{
+        os::fd::AsRawFd,
+        os::unix::{
+            fs::{PermissionsExt, symlink},
+            net::UnixStream,
+            process::CommandExt,
+        },
+        process::{Child, Command, ExitStatus, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    use tempfile::TempDir;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Stage {
+        Write,
+        FileSync,
+        Rename,
+        DirectorySync,
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) enum Fault {
+        Error(Stage),
+        SensitiveError(Stage),
+        Crash(Stage),
+        Hang,
+        Panic,
+        LateObservation,
+    }
+
+    impl StoreInner {
+        pub(super) fn inject(&self, stage: Stage) -> anyhow::Result<()> {
+            match self.fault {
+                Some(Fault::Error(at)) if at == stage => {
+                    return Err(io::Error::from_raw_os_error(libc::EIO))
+                        .context("/private/state/api-key=secret ledger=private");
+                }
+
+                Some(Fault::SensitiveError(at)) if at == stage => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "/private/state/api-key=secret ledger=private",
+                    ))
+                    .context("private error context");
+                }
+
+                Some(Fault::Crash(at)) if at == stage => std::process::exit(42),
+
+                Some(Fault::Hang) if stage == Stage::Write => loop {
+                    thread::park();
+                },
+
+                Some(Fault::Panic) if stage == Stage::Write => panic!("injected worker failure"),
+
+                _ => {}
+            }
+
+            Ok(())
+        }
+    }
+
+    fn id(number: u128) -> Uuid {
+        Uuid::from_u128(number)
+    }
+
+    fn digest(number: u32) -> String {
+        format!("{number:064x}")
+    }
+
+    fn empty() -> Ledger {
+        Ledger {
+            server_uuid: id(1),
+            system_update_id: 0,
+            root_digest: None,
+            albums: BTreeMap::new(),
+        }
+    }
+
+    fn populated() -> Ledger {
+        empty()
+            .root_transition(&digest(1), &BTreeMap::from([(id(2), digest(2))]))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn private_directory() -> TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        directory
+    }
+
+    fn put(directory: &Path, name: &str, bytes: &[u8]) {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(directory.join(name))
+            .unwrap();
+
+        file.write_all(bytes).unwrap();
+    }
+
+    fn install(directory: &Path, ledger: &Ledger) {
+        put(
+            directory,
+            "revisions.json",
+            &serde_json::to_vec(ledger).unwrap(),
+        );
+    }
+
+    #[test]
+    fn first_installation_creates_no_files_and_restart_wraps_history() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        let directory = private_directory();
+        let (store, mut ledger) = Store::open(directory.path(), id(1)).unwrap();
+        assert_eq!(ledger, empty());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        ledger.restart();
+        assert_eq!(ledger.system_update_id, 1);
+        drop(store);
+        assert_eq!(Store::open(directory.path(), id(1)).unwrap().1, empty());
+        let mut ledger = populated();
+        ledger.system_update_id = u32::MAX;
+        ledger.albums.get_mut(&id(2)).unwrap().update_id = u32::MAX;
+        ledger.albums.get_mut(&id(2)).unwrap().present = false;
+        ledger.albums.get_mut(&id(2)).unwrap().contents_digest = Some(digest(3));
+        let before = ledger.clone();
+        ledger.restart();
+        assert_eq!(ledger.system_update_id, 0);
+        assert_eq!(ledger.albums[&id(2)].update_id, 0);
+        assert_eq!(ledger.root_digest, before.root_digest);
+        assert_eq!(ledger.albums[&id(2)].contents_digest, Some(digest(3)));
+        assert_eq!(ledger.albums[&id(2)].metadata_digest, digest(2));
+        assert!(!ledger.albums[&id(2)].present);
+    }
+
+    #[test]
+    fn concurrent_first_installation_has_one_owner_without_creating_files() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        let directory = private_directory();
+        let start = std::sync::Barrier::new(2);
+
+        let (first, second) = thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                start.wait();
+
+                Store::open(directory.path(), id(1))
+            });
+
+            let second = scope.spawn(|| {
+                start.wait();
+
+                Store::open(directory.path(), id(1))
+            });
+
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        let (store, mut ledger) = match (first, second) {
+            (Ok(owner), Err(error)) | (Err(error), Ok(owner)) => {
+                assert!(matches!(
+                    error.downcast_ref::<std::fs::TryLockError>(),
+                    Some(std::fs::TryLockError::WouldBlock)
+                ));
+
+                owner
+            }
+
+            _ => panic!("exactly one first start must acquire the directory"),
+        };
+
+        assert_eq!(ledger, empty());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        ledger.restart();
+        store.inner.write(ledger.clone()).unwrap();
+        drop(store);
+        let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+        assert_eq!(loaded, ledger);
+    }
+
+    #[test]
+    fn root_transitions_preserve_history_and_increment_each_affected_album_once() {
+        let root = digest(1);
+        let albums = BTreeMap::from([(id(2), digest(2))]);
+        let ledger = populated();
+        assert_eq!(ledger.system_update_id, 1);
+        assert_eq!(ledger.albums[&id(2)].update_id, 0);
+        assert_eq!(ledger.root_transition(&root, &albums).unwrap(), None);
+
+        let projection = ledger
+            .root_transition(&digest(9), &albums)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(projection.system_update_id, 2);
+        assert_eq!(projection.albums, ledger.albums);
+
+        let ledger = ledger
+            .contents_transition(id(2), &digest(3))
+            .unwrap()
+            .unwrap();
+
+        let removed = ledger
+            .root_transition(&root, &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(removed.system_update_id, ledger.system_update_id + 1);
+        assert_eq!(removed.albums[&id(2)].update_id, 2);
+        assert!(!removed.albums[&id(2)].present);
+        assert_eq!(removed.albums[&id(2)].metadata_digest, digest(2));
+        assert_eq!(removed.albums[&id(2)].contents_digest, Some(digest(3)));
+
+        assert_eq!(
+            removed.root_transition(&root, &BTreeMap::new()).unwrap(),
+            None
+        );
+
+        assert!(removed.contents_transition(id(2), &digest(4)).is_err());
+        assert!(removed.contents_transition(id(100), &digest(4)).is_err());
+
+        let reappeared = removed
+            .root_transition(&root, &BTreeMap::from([(id(2), digest(4))]))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(reappeared.albums[&id(2)].update_id, 3);
+        assert_eq!(reappeared.system_update_id, removed.system_update_id + 1);
+        assert!(reappeared.albums[&id(2)].present);
+        assert_eq!(reappeared.albums[&id(2)].metadata_digest, digest(4));
+        assert_eq!(reappeared.albums[&id(2)].contents_digest, Some(digest(3)));
+
+        assert_eq!(
+            reappeared.contents_transition(id(2), &digest(3)).unwrap(),
+            None
+        );
+
+        let renamed = reappeared
+            .root_transition(&root, &BTreeMap::from([(id(2), digest(5))]))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(renamed.albums[&id(2)].update_id, 4);
+        assert_eq!(renamed.system_update_id, reappeared.system_update_id + 1);
+    }
+
+    #[test]
+    fn root_and_contents_counters_wrap_and_unknown_empty_root_advances() {
+        let initial = empty()
+            .root_transition(&digest(0), &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(initial.system_update_id, 1);
+        assert!(initial.albums.is_empty());
+        let mut ledger = populated();
+        ledger.system_update_id = u32::MAX;
+        ledger.albums.get_mut(&id(2)).unwrap().update_id = u32::MAX;
+
+        let contents = ledger
+            .contents_transition(id(2), &digest(1))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(contents.system_update_id, 0);
+        assert_eq!(contents.albums[&id(2)].update_id, 0);
+
+        let removed = ledger
+            .root_transition(&digest(2), &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(removed.system_update_id, 0);
+        assert_eq!(removed.albums[&id(2)].update_id, 0);
+    }
+
+    #[test]
+    fn replacement_at_current_capacity_retains_history_and_exhaustion_is_recoverable() {
+        let mut albums: BTreeMap<_, _> = (1..=CURRENT_ALBUMS)
+            .map(|number| (id(number as u128), digest(1)))
+            .collect();
+
+        let ledger = empty()
+            .root_transition(&digest(1), &albums)
+            .unwrap()
+            .unwrap();
+
+        albums.remove(&id(1));
+        albums.insert(id(CURRENT_ALBUMS as u128 + 1), digest(1));
+
+        let replacement = ledger
+            .root_transition(&digest(2), &albums)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(replacement.albums.len(), CURRENT_ALBUMS + 1);
+        assert!(!replacement.albums[&id(1)].present);
+        assert_eq!(replacement.albums[&id(1)].update_id, 1);
+
+        assert_eq!(
+            replacement.albums[&id(CURRENT_ALBUMS as u128 + 1)].update_id,
+            0
+        );
+
+        albums.insert(id(CURRENT_ALBUMS as u128 + 2), digest(1));
+        assert!(replacement.root_transition(&digest(3), &albums).is_err());
+        assert_eq!(replacement.albums.len(), CURRENT_ALBUMS + 1);
+        let mut full = populated();
+
+        for number in 1..=RETAINED_ALBUMS {
+            full.albums
+                .entry(id(number as u128))
+                .or_insert(AlbumRevision {
+                    update_id: 42,
+                    present: false,
+                    metadata_digest: digest(1),
+                    contents_digest: Some(digest(2)),
+                });
+        }
+
+        full.validate(id(1)).unwrap();
+        let before = full.clone();
+        let new_album = BTreeMap::from([(id(RETAINED_ALBUMS as u128 + 1), digest(1))]);
+        let error = full.root_transition(&digest(2), &new_album).unwrap_err();
+        assert!(error.to_string().contains("new server UUID"));
+        assert_eq!(full, before);
+        let directory = private_directory();
+        install(directory.path(), &full);
+        let (store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+        assert!(loaded.root_transition(&digest(2), &new_album).is_err());
+
+        assert!(
+            loaded
+                .contents_transition(id(2), &digest(8))
+                .unwrap()
+                .is_some()
+        );
+
+        assert!(
+            loaded
+                .root_transition(&digest(3), &BTreeMap::new())
+                .unwrap()
+                .is_some()
+        );
+
+        drop(store);
+        let recovered_directory = private_directory();
+        let (_store, recovered) = Store::open(recovered_directory.path(), id(99)).unwrap();
+
+        let recovered = recovered
+            .root_transition(&digest(1), &new_album)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(recovered.server_uuid, id(99));
+        assert_eq!(recovered.albums.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn first_contents_survive_reload_and_unchanged_transitions_do_not_write() {
+        let directory = private_directory();
+        let (store, mut ledger) = Store::open(directory.path(), id(1)).unwrap();
+        ledger.restart();
+        store.persist(ledger.clone()).await;
+
+        let ledger = ledger
+            .root_transition(&digest(1), &BTreeMap::from([(id(2), digest(2))]))
+            .unwrap()
+            .unwrap();
+
+        store.persist(ledger.clone()).await;
+
+        let ledger = ledger
+            .contents_transition(id(2), &digest(3))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(ledger.system_update_id, 3);
+        assert_eq!(ledger.albums[&id(2)].update_id, 1);
+        store.persist(ledger.clone()).await;
+        let metadata = fs::metadata(directory.path().join("revisions.json")).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert!(!directory.path().join("revisions.tmp").exists());
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        assert_eq!(Arc::strong_count(&store.inner), 1);
+        let ownership = Arc::downgrade(&store.inner);
+        drop(store);
+        assert!(ownership.upgrade().is_none());
+        let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+        assert_eq!(loaded, ledger);
+        assert_eq!(loaded.contents_transition(id(2), &digest(3)).unwrap(), None);
+
+        assert_eq!(
+            loaded
+                .root_transition(&digest(1), &BTreeMap::from([(id(2), digest(2))]))
+                .unwrap(),
+            None
+        );
+
+        let unchanged_metadata = fs::metadata(directory.path().join("revisions.json")).unwrap();
+        assert_eq!(unchanged_metadata.ino(), metadata.ino());
+
+        assert_eq!(
+            unchanged_metadata.modified().unwrap(),
+            metadata.modified().unwrap()
+        );
+
+        let changed = loaded
+            .contents_transition(id(2), &digest(4))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(changed.system_update_id, 4);
+        assert_eq!(changed.albums[&id(2)].update_id, 2);
+    }
+
+    #[test]
+    fn fork_retains_lock_after_worker_and_store_drop_until_exec() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        let directory = private_directory();
+        let (store, mut ledger) = Store::open(directory.path(), id(1)).unwrap();
+        ledger.restart();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(store.persist(ledger.clone()));
+        assert_eq!(Arc::strong_count(&store.inner), 1);
+        let ownership = Arc::downgrade(&store.inner);
+
+        // SAFETY: the store owns a live descriptor; F_GETFD only reads its flags.
+        let flags = unsafe { libc::fcntl(store.inner.directory.as_raw_fd(), libc::F_GETFD) };
+
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        let (mut parent_signal, child_signal) = UnixStream::pair().unwrap();
+
+        parent_signal
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        parent_signal
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let signal_fd = child_signal.as_raw_fd();
+        let child_directory = directory.path().to_owned();
+
+        let test_name = format!(
+            "{}::subprocess_worker",
+            module_path!().split_once("::").unwrap().1
+        );
+
+        let spawn = thread::spawn(move || {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+
+            command
+                .args(["--exact", &test_name])
+                .env("REVISION_TEST_DIRECTORY", child_directory)
+                .env("REVISION_TEST_MODE", "noop")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+
+            // SAFETY: pre_exec uses only async-signal-safe syscalls and stack
+            // storage. The socket stays live until spawn returns. The handshake
+            // holds the forked child before exec without timing-based sleeps.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::write(signal_fd, b"x".as_ptr().cast(), 1) != 1 {
+                        return Err(io::Error::last_os_error());
+                    }
+
+                    let mut poll = libc::pollfd {
+                        fd: signal_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+
+                    if libc::poll(&mut poll, 1, 5_000) != 1 {
+                        return Err(io::Error::from_raw_os_error(libc::ETIMEDOUT));
+                    }
+
+                    let mut release = 0_u8;
+
+                    if libc::read(signal_fd, (&mut release as *mut u8).cast(), 1) != 1 {
+                        return Err(io::Error::last_os_error());
+                    }
+
+                    Ok(())
+                });
+            }
+
+            let child = command.spawn();
+            drop(child_signal);
+
+            child.unwrap()
+        });
+
+        parent_signal.read_exact(&mut [0]).unwrap();
+        drop(store);
+        let ownership_released = ownership.upgrade().is_none();
+        let before_exec = Store::open(directory.path(), id(1));
+        parent_signal.write_all(b"x").unwrap();
+        let mut child = spawn.join().unwrap();
+        let after_exec = Store::open(directory.path(), id(1));
+        let status = wait(&mut child, Duration::from_secs(5));
+        assert!(ownership_released);
+
+        assert!(matches!(
+            before_exec
+                .err()
+                .unwrap()
+                .downcast_ref::<std::fs::TryLockError>(),
+            Some(std::fs::TryLockError::WouldBlock)
+        ));
+
+        assert_eq!(after_exec.unwrap().1, ledger);
+        assert!(status.success());
+    }
+
+    #[test]
+    fn process_lock_is_exclusive_and_retained_by_clones() {
+        let directory = private_directory();
+        install(directory.path(), &empty());
+        let (store, _) = Store::open(directory.path(), id(1)).unwrap();
+        assert!(Store::open(directory.path(), id(1)).is_err());
+        let clone = store.clone();
+        drop(store);
+        assert!(Store::open(directory.path(), id(1)).is_err());
+        let mut child = child(directory.path(), "lock");
+        assert!(wait(&mut child, Duration::from_secs(5)).success());
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        drop(clone);
+        assert!(Store::open(directory.path(), id(1)).is_ok());
+    }
+
+    #[test]
+    fn directory_lock_precedes_loading_and_temporary_cleanup() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        let directory = private_directory();
+        let pinned = File::open(directory.path()).unwrap();
+        pinned.try_lock().unwrap();
+        assert!(Store::open(directory.path(), id(1)).is_err());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        install(directory.path(), &populated());
+        put(directory.path(), "revisions.lock", b"ancillary");
+        put(directory.path(), "revisions.tmp", b"uncommitted");
+
+        let state_inode = fs::metadata(directory.path().join("revisions.json"))
+            .unwrap()
+            .ino();
+
+        let error = Store::open(directory.path(), id(1)).err().unwrap();
+
+        assert!(matches!(
+            error.downcast_ref::<std::fs::TryLockError>(),
+            Some(std::fs::TryLockError::WouldBlock)
+        ));
+
+        assert_eq!(
+            fs::read(directory.path().join("revisions.tmp")).unwrap(),
+            b"uncommitted"
+        );
+
+        assert_eq!(
+            fs::metadata(directory.path().join("revisions.json"))
+                .unwrap()
+                .ino(),
+            state_inode
+        );
+
+        drop(pinned);
+        let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+        assert_eq!(loaded, populated());
+        assert!(!directory.path().join("revisions.tmp").exists());
+
+        assert!(matches!(
+            File::open(directory.path()).unwrap().try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+
+        assert_eq!(
+            fs::read(directory.path().join("revisions.lock")).unwrap(),
+            b"ancillary"
+        );
+    }
+
+    #[test]
+    fn missing_state_with_any_evidence_fails_and_temporary_is_never_promoted() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+
+        for evidence in ["revisions.lock", "revisions.tmp", "unrelated"] {
+            let directory = private_directory();
+
+            put(
+                directory.path(),
+                evidence,
+                &serde_json::to_vec(&populated()).unwrap(),
+            );
+
+            assert!(Store::open(directory.path(), id(1)).is_err(), "{evidence}");
+            assert!(!directory.path().join("revisions.json").exists());
+            assert!(directory.path().join(evidence).exists());
+        }
+
+        let directory = private_directory();
+        install(directory.path(), &populated());
+        put(directory.path(), "revisions.tmp", b"partial");
+        assert!(Store::open(directory.path(), id(9)).is_err());
+        assert!(directory.path().join("revisions.tmp").exists());
+        put(directory.path(), "revisions.json", b"{");
+        assert!(Store::open(directory.path(), id(1)).is_err());
+        assert!(directory.path().join("revisions.tmp").exists());
+        install(directory.path(), &populated());
+        let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+        assert_eq!(loaded, populated());
+        assert!(!directory.path().join("revisions.tmp").exists());
+    }
+
+    #[test]
+    fn null_root_with_retained_albums_rejects_load_without_removing_tmp() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+
+        for present in [true, false] {
+            let directory = private_directory();
+            let mut ledger = populated();
+            ledger.system_update_id = 0;
+            ledger.albums.get_mut(&id(2)).unwrap().present = present;
+            ledger.root_digest = None;
+            install(directory.path(), &ledger);
+            put(directory.path(), "revisions.tmp", b"uncommitted");
+            assert!(Store::open(directory.path(), id(1)).is_err());
+
+            assert_eq!(
+                fs::read(directory.path().join("revisions.tmp")).unwrap(),
+                b"uncommitted"
+            );
+
+            ledger.root_digest = Some(digest(1));
+            install(directory.path(), &ledger);
+            let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+            assert_eq!(loaded, ledger);
+            assert_eq!(loaded.system_update_id, 0);
+            assert_eq!(loaded.albums[&id(2)].update_id, 0);
+            assert!(!directory.path().join("revisions.tmp").exists());
+        }
+    }
+
+    #[test]
+    fn load_rejects_corruption_unknown_missing_fields_and_duplicate_uuid_aliases() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        let valid = serde_json::to_string(&populated()).unwrap();
+        let album = serde_json::to_string(&populated().albums[&id(2)]).unwrap();
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+        let duplicates = format!(
+            "{{\"server_uuid\":\"{}\",\"system_update_id\":0,\"root_digest\":\"{}\",\"albums\":{{\"{uuid}\":{album},\"{}\":{album}}}}}",
+            id(1),
+            digest(1),
+            uuid.to_uppercase()
+        );
+
+        for key in [uuid.to_owned(), uuid.to_uppercase()] {
+            let single = duplicates.replace(&format!(",\"{}\":{album}", uuid.to_uppercase()), "");
+            let single = single.replace(uuid, &key);
+            let directory = private_directory();
+            put(directory.path(), "revisions.json", single.as_bytes());
+            let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+            assert_eq!(loaded.root_digest, Some(digest(1)));
+            assert_eq!(loaded.albums.len(), 1);
+
+            assert_eq!(
+                loaded.albums[&Uuid::parse_str(uuid).unwrap()],
+                populated().albums[&id(2)]
+            );
+        }
+
+        let invalid = [
+            "{".to_owned(),
+            format!("{valid} trailing"),
+            valid.replacen('{', "{\"extra\":0,", 1),
+            valid.replace("\"present\":true", "\"present\":true,\"title\":\"x\""),
+            valid.replace(
+                "\"contents_digest\":null",
+                "\"contents_digest\":null,\"present\":false",
+            ),
+            valid.replace("\"contents_digest\":null", "\"contents_digest\":\"BAD\""),
+            valid.replace(&digest(2), &"A".repeat(64)),
+            valid.replace(&digest(2), &"g".repeat(64)),
+            valid.replace(&digest(2), &"a".repeat(63)),
+            valid.replace("\"system_update_id\":1", "\"system_update_id\":4294967296"),
+            valid.replace("\"system_update_id\":1", "\"system_update_id\":-1"),
+            valid.replace(",\"contents_digest\":null", ""),
+            valid.replace(&format!("\"root_digest\":\"{}\",", digest(1)), ""),
+            valid.replace(&id(2).to_string(), "not-a-uuid"),
+            duplicates.clone(),
+            duplicates.replace(&uuid.to_uppercase(), uuid),
+        ];
+
+        for json in invalid {
+            let directory = private_directory();
+            put(directory.path(), "revisions.json", json.as_bytes());
+
+            assert!(
+                Store::open(directory.path(), id(1)).is_err(),
+                "accepted {json}"
+            );
+        }
+
+        let directory = private_directory();
+        install(directory.path(), &populated());
+        assert!(Store::open(directory.path(), id(99)).is_err());
+        assert!(Store::open(directory.path(), Uuid::nil()).is_err());
+    }
+
+    #[test]
+    fn explicit_load_serialization_and_identity_bounds() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        let directory = private_directory();
+        install(directory.path(), &empty());
+
+        let file = OpenOptions::new()
+            .write(true)
+            .open(directory.path().join("revisions.json"))
+            .unwrap();
+
+        file.set_len(REVISION_BYTES as u64 + 1).unwrap();
+
+        assert!(
+            Store::open(directory.path(), id(1))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("8 MiB")
+        );
+
+        let mut bytes = serde_json::to_vec(&empty()).unwrap();
+        bytes.resize(REVISION_BYTES, b' ');
+        put(directory.path(), "revisions.json", &bytes);
+        assert!(Store::open(directory.path(), id(1)).is_ok());
+        let mut bounded = BoundedBytes(Vec::new());
+        bounded.write_all(&bytes).unwrap();
+        assert!(bounded.write_all(b" ").is_err());
+        assert_eq!(bounded.0.len(), REVISION_BYTES);
+        let mut ledger = empty();
+        ledger.root_digest = Some(digest(1));
+
+        for number in 1..=RETAINED_ALBUMS + 1 {
+            ledger.albums.insert(
+                id(number as u128),
+                AlbumRevision {
+                    update_id: 0,
+                    present: number <= CURRENT_ALBUMS,
+                    metadata_digest: digest(1),
+                    contents_digest: Some(digest(2)),
+                },
+            );
+        }
+
+        install(directory.path(), &ledger);
+        assert!(Store::open(directory.path(), id(1)).is_err());
+        ledger.albums.remove(&id(RETAINED_ALBUMS as u128 + 1));
+
+        ledger
+            .albums
+            .get_mut(&id(CURRENT_ALBUMS as u128 + 1))
+            .unwrap()
+            .present = true;
+
+        install(directory.path(), &ledger);
+        assert!(Store::open(directory.path(), id(1)).is_err());
+
+        ledger
+            .albums
+            .get_mut(&id(CURRENT_ALBUMS as u128 + 1))
+            .unwrap()
+            .present = false;
+
+        install(directory.path(), &ledger);
+        let (store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+        assert_eq!(loaded, ledger);
+        store.inner.write(ledger.clone()).unwrap();
+        assert!(!directory.path().join("revisions.tmp").exists());
+        assert!(serde_json::to_vec(&ledger).unwrap().len() < REVISION_BYTES);
+    }
+
+    #[test]
+    fn dynamic_user_directory_symlink_locks_persists_and_reloads_private_target() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        let layout = private_directory();
+        fs::set_permissions(layout.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let private = layout.path().join("private");
+        let actual = private.join("unit");
+        let configured = layout.path().join("unit");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&actual).unwrap();
+        fs::set_permissions(&actual, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink("private/unit", &configured).unwrap();
+        let symlink_inode = fs::symlink_metadata(&configured).unwrap().ino();
+        let (store, mut ledger) = Store::open(&configured, id(1)).unwrap();
+        assert_eq!(ledger, empty());
+        assert_eq!(fs::read_dir(&actual).unwrap().count(), 0);
+        assert!(Store::open(&actual, id(1)).is_err());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        ledger.restart();
+        runtime.block_on(store.persist(ledger.clone()));
+        let first_inode = fs::metadata(actual.join("revisions.json")).unwrap().ino();
+
+        let ledger = ledger
+            .root_transition(&digest(1), &BTreeMap::from([(id(2), digest(2))]))
+            .unwrap()
+            .unwrap();
+
+        runtime.block_on(store.persist(ledger.clone()));
+        let committed = fs::metadata(actual.join("revisions.json")).unwrap();
+        assert_ne!(committed.ino(), first_inode);
+        assert_eq!(committed.mode() & 0o777, 0o600);
+        assert!(!actual.join("revisions.tmp").exists());
+
+        assert_eq!(
+            fs::read(actual.join("revisions.json")).unwrap(),
+            serde_json::to_vec(&ledger).unwrap()
+        );
+
+        assert_eq!(
+            fs::read(configured.join("revisions.json")).unwrap(),
+            fs::read(actual.join("revisions.json")).unwrap()
+        );
+
+        drop(store);
+        let (store, loaded) = Store::open(&configured, id(1)).unwrap();
+        assert_eq!(loaded, ledger);
+        assert!(Store::open(&actual, id(1)).is_err());
+        drop(store);
+        let (_store, loaded) = Store::open(&actual, id(1)).unwrap();
+        assert_eq!(loaded, ledger);
+        let link = fs::symlink_metadata(&configured).unwrap();
+        assert!(link.is_symlink());
+        assert_eq!(link.ino(), symlink_inode);
+        assert_eq!(
+            fs::read_link(&configured).unwrap(),
+            Path::new("private/unit")
+        );
+    }
+
+    #[test]
+    fn loss_of_only_revision_file_is_indistinguishable_from_first_installation() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        let directory = private_directory();
+        let (store, mut ledger) = Store::open(directory.path(), id(1)).unwrap();
+        ledger.restart();
+        store.inner.write(ledger).unwrap();
+        drop(store);
+        fs::remove_file(directory.path().join("revisions.json")).unwrap();
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+        assert_eq!(loaded, empty());
+    }
+
+    #[test]
+    fn rejects_nonprivate_symlink_nonregular_and_hardlinked_files_without_blocking() {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+        let directory = private_directory();
+        assert!(Store::open(&directory.path().join("absent"), id(1)).is_err());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(Store::open(directory.path(), id(1)).is_err());
+        let parent = private_directory();
+        symlink(directory.path(), parent.path().join("link")).unwrap();
+        assert!(Store::open(&parent.path().join("link"), id(1)).is_err());
+        let directory = private_directory();
+        let path = directory.path().join("revisions.json");
+        let valid = serde_json::to_vec(&empty()).unwrap();
+        put(directory.path(), "target", &valid);
+        symlink(directory.path().join("target"), &path).unwrap();
+        assert!(Store::open(directory.path(), id(1)).is_err());
+        assert_eq!(fs::read(directory.path().join("target")).unwrap(), valid);
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(directory.path().join("target"), &path).unwrap();
+        assert!(Store::open(directory.path(), id(1)).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(Store::open(directory.path(), id(1)).is_err());
+        fs::remove_dir(&path).unwrap();
+        let name_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+
+        // SAFETY: the path is NUL-terminated and refers to this test's directory.
+        assert_eq!(unsafe { libc::mkfifo(name_c.as_ptr(), 0o600) }, 0);
+        let start = Instant::now();
+        assert!(Store::open(directory.path(), id(1)).is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        fs::remove_file(&path).unwrap();
+        install(directory.path(), &empty());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Store::open(directory.path(), id(1)).is_err());
+    }
+
+    fn child(directory: &Path, mode: &str) -> Child {
+        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+
+        let test_name = format!(
+            "{}::subprocess_worker",
+            module_path!().split_once("::").unwrap().1
+        );
+
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env("REVISION_TEST_DIRECTORY", directory)
+            .env("REVISION_TEST_MODE", mode)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait(child: &mut Child, timeout: Duration) -> ExitStatus {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("revision subprocess failed to terminate before watchdog deadline");
+            }
+
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn subprocess_worker() {
+        let Some(directory) = std::env::var_os("REVISION_TEST_DIRECTORY") else {
+            return;
+        };
+
+        let directory = Path::new(&directory);
+        let mode = std::env::var("REVISION_TEST_MODE").unwrap();
+
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(io::stderr)
+            .init();
+
+        if mode == "noop" {
+            return;
+        }
+
+        if mode == "lock" {
+            assert!(Store::open(directory, id(1)).is_err());
+
+            return;
+        }
+
+        let (mut store, mut ledger) = Store::open(directory, id(1)).unwrap();
+        ledger.restart();
+
+        let stage = match mode.rsplit('-').next().unwrap() {
+            "write" => Stage::Write,
+            "filesync" => Stage::FileSync,
+            "rename" => Stage::Rename,
+            "dirsync" => Stage::DirectorySync,
+            _ => Stage::Write,
+        };
+
+        Arc::get_mut(&mut store.inner).unwrap().fault = match mode.as_str() {
+            "hang" | "cancel" => Some(Fault::Hang),
+            "panic" => Some(Fault::Panic),
+            "late-ready" => Some(Fault::LateObservation),
+            mode if mode.starts_with("error-") => Some(Fault::Error(stage)),
+            mode if mode.starts_with("sensitive-") => Some(Fault::SensitiveError(stage)),
+            mode if mode.starts_with("crash-") => Some(Fault::Crash(stage)),
+            _ => None,
+        };
+
+        if mode == "invalid" {
+            ledger = ledger
+                .root_transition(
+                    &"x".repeat(REVISION_BYTES + 1),
+                    &BTreeMap::from([(id(2), digest(2))]),
+                )
+                .unwrap()
+                .unwrap();
+        }
+
+        if mode == "temp-collision" {
+            put(directory, "revisions.tmp", b"do not truncate");
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            if mode == "late-ready" {
+                tokio::time::pause();
+            }
+
+            if mode == "cancel" {
+                let task = tokio::spawn(async move { store.persist(ledger).await });
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                task.abort();
+                let _ = task.await;
+            } else {
+                store.persist(ledger).await;
+            }
+        });
+    }
+
+    #[test]
+    fn io_failures_and_crashes_leave_only_old_or_new_committed_state_and_bounded_temp() {
+        for action in ["error", "crash"] {
+            for stage in ["write", "filesync", "rename", "dirsync"] {
+                let directory = private_directory();
+                let old = populated();
+                install(directory.path(), &old);
+                let mut child = child(directory.path(), &format!("{action}-{stage}"));
+                let status = wait(&mut child, Duration::from_secs(5));
+                assert_eq!(status.code(), Some(if action == "error" { 1 } else { 42 }));
+                let mut expected = old.clone();
+
+                if stage == "dirsync" {
+                    expected.restart();
+                }
+
+                let committed: Ledger = serde_json::from_slice(
+                    &fs::read(directory.path().join("revisions.json")).unwrap(),
+                )
+                .unwrap();
+
+                assert_eq!(committed, expected);
+                let temporary = directory.path().join("revisions.tmp");
+
+                if stage != "dirsync" {
+                    let metadata = fs::metadata(&temporary).unwrap();
+                    assert!(metadata.len() <= REVISION_BYTES as u64);
+                    assert_eq!(metadata.mode() & 0o777, 0o600);
+                }
+
+                let (store, recovered) = Store::open(directory.path(), id(1)).unwrap();
+                assert_eq!(recovered, expected);
+                assert!(!temporary.exists());
+                drop(store);
+            }
+        }
+    }
+
+    #[test]
+    fn persistence_diagnostics_exclude_error_payloads() {
+        for (stage, operation) in [
+            ("write", "write revision state"),
+            ("filesync", "sync revision state"),
+            ("rename", "replace revision state"),
+            ("dirsync", "sync revision directory"),
+        ] {
+            for action in ["error", "sensitive"] {
+                let directory = private_directory();
+                let old = populated();
+                install(directory.path(), &old);
+                let mut child = child(directory.path(), &format!("{action}-{stage}"));
+                assert_eq!(wait(&mut child, Duration::from_secs(5)).code(), Some(1));
+                let mut diagnostic = String::new();
+
+                child
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut diagnostic)
+                    .unwrap();
+
+                assert!(diagnostic.contains(operation), "{diagnostic}");
+
+                let (kind, code) = if action == "error" {
+                    (
+                        io::Error::from_raw_os_error(libc::EIO).kind(),
+                        Some(libc::EIO),
+                    )
+                } else {
+                    (io::ErrorKind::PermissionDenied, None)
+                };
+
+                assert!(
+                    diagnostic.contains(&format!("kind=Some({kind:?})")),
+                    "{diagnostic}"
+                );
+
+                assert!(
+                    diagnostic.contains(&format!("os_code={code:?}")),
+                    "{diagnostic}"
+                );
+
+                for private in [
+                    "private",
+                    "api-key",
+                    "secret",
+                    "ledger=",
+                    directory.path().to_str().unwrap(),
+                    &old.server_uuid.to_string(),
+                    &digest(1),
+                ] {
+                    assert!(!diagnostic.contains(private), "{diagnostic}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn startup_crash_never_promotes_temp_or_resets_identity() {
+        for stage in ["write", "filesync", "rename", "dirsync"] {
+            let directory = private_directory();
+            let mut child = child(directory.path(), &format!("crash-{stage}"));
+            assert_eq!(wait(&mut child, Duration::from_secs(5)).code(), Some(42));
+
+            if stage == "dirsync" {
+                let (_store, ledger) = Store::open(directory.path(), id(1)).unwrap();
+                assert_eq!(ledger.system_update_id, 1);
+            } else {
+                assert!(Store::open(directory.path(), id(1)).is_err());
+                assert!(directory.path().join("revisions.tmp").exists());
+                assert!(!directory.path().join("revisions.json").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn ready_worker_first_observed_after_deadline_fail_stops() {
+        let directory = private_directory();
+        let mut expected = populated();
+        install(directory.path(), &expected);
+        expected.restart();
+        let mut child = child(directory.path(), "late-ready");
+        let status = wait(&mut child, Duration::from_secs(5));
+
+        assert_eq!(
+            fs::read(directory.path().join("revisions.json")).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+
+        assert!(!directory.path().join("revisions.tmp").exists());
+        assert_eq!(status.code(), Some(1));
+    }
+
+    #[test]
+    fn hung_worker_cancellation_panic_and_invalid_replacement_fail_stop() {
+        for mode in ["hang", "cancel", "panic", "invalid", "temp-collision"] {
+            let directory = private_directory();
+            let old = populated();
+            install(directory.path(), &old);
+            let started = Instant::now();
+            let mut child = child(directory.path(), mode);
+            let status = wait(&mut child, Duration::from_secs(8));
+            assert_eq!(status.code(), Some(1), "{mode}");
+
+            if mode == "hang" {
+                assert!(started.elapsed() >= COMMIT_TIMEOUT);
+            }
+
+            assert!(started.elapsed() < Duration::from_secs(8));
+
+            assert_eq!(
+                fs::read(directory.path().join("revisions.json")).unwrap(),
+                serde_json::to_vec(&old).unwrap()
+            );
+
+            if mode == "invalid" {
+                assert!(!directory.path().join("revisions.tmp").exists());
+            }
+
+            if mode == "temp-collision" {
+                assert_eq!(
+                    fs::read(directory.path().join("revisions.tmp")).unwrap(),
+                    b"do not truncate"
+                );
+            }
+
+            let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+            assert_eq!(loaded, old);
+        }
     }
 }
 
@@ -2990,7 +6004,7 @@ mod tests {
         );
 
         let mut child = {
-            let _spawn = crate::revisions::SPAWN_OR_REOPEN.lock().unwrap();
+            let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
 
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test_name, "--nocapture"])

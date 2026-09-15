@@ -8,7 +8,6 @@ pub mod limits;
 pub mod media;
 mod mime;
 pub mod protocol;
-pub mod revisions;
 pub mod server;
 pub mod ssdp;
 pub mod transport;

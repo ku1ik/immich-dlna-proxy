@@ -4,8 +4,13 @@ use tokio::{net::TcpListener, task::JoinSet, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    catalog::Library, config::Config, eventing::Subscriptions, limits, media::MediaProxy,
-    revisions::Store, server::Server, ssdp::Discovery,
+    catalog::{Library, Store},
+    config::Config,
+    eventing::Subscriptions,
+    limits,
+    media::MediaProxy,
+    server::Server,
+    ssdp::Discovery,
 };
 
 pub async fn run(config: Config) -> anyhow::Result<()> {

@@ -2,10 +2,11 @@ use std::{net::SocketAddr, time::Duration};
 
 use http::HeaderValue;
 use immich_dlna_proxy::{
+    catalog::{BrowseResult, Catalog},
     eventing::Subscriptions,
     media::MediaProxy,
     protocol::{BrowseArguments, Fault},
-    server::{BrowseResult, Catalog, Server},
+    server::Server,
 };
 use socket2::SockRef;
 use tokio::{

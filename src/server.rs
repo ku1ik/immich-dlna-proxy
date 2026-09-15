@@ -1,5 +1,4 @@
 use std::{
-    future::Future,
     net::Ipv4Addr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -19,27 +18,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
+    catalog::Catalog,
     eventing::Subscriptions,
     limits,
     media::MediaProxy,
-    protocol::{self, Action, BrowseArguments, Fault, Service},
+    protocol::{self, Action, Fault, Service},
     transport::{self, WriteDeadline},
 };
-
-/// The catalog selects, sorts and paginates objects, capturing their revision together.
-pub trait Catalog: Send + Sync + 'static {
-    fn system_update_id(&self) -> u32;
-    fn browse(
-        &self,
-        arguments: BrowseArguments,
-    ) -> impl Future<Output = Result<BrowseResult, Fault>> + Send;
-}
-
-pub struct BrowseResult {
-    pub objects: Vec<protocol::Object>,
-    pub total_matches: u32,
-    pub update_id: u32,
-}
 
 pub struct Server<C> {
     catalog: C,
@@ -682,6 +667,7 @@ fn soap(result: Result<String, Fault>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{catalog::BrowseResult, protocol::BrowseArguments};
     use std::{
         io,
         pin::Pin,
