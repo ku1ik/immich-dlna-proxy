@@ -981,7 +981,7 @@ impl Store {
     /// subscriber updates. This method does not serialize callers or publish state.
     /// Never wrap it in a client/request timeout. The blocking worker retains the
     /// process lock; failure/timeout exits without waiting for worker/runtime drop.
-    pub(crate) async fn persist(&self, ledger: Ledger) {
+    pub(crate) async fn persist(&self, ledger: Ledger) -> Ledger {
         struct Commit;
 
         impl Drop for Commit {
@@ -995,10 +995,10 @@ impl Store {
         let inner = Arc::clone(&self.inner);
 
         let worker = tokio::task::spawn_blocking(move || {
-            let result = inner.write(ledger);
+            let result = inner.write(&ledger);
             drop(inner);
 
-            result
+            result.map(|()| ledger)
         });
 
         #[cfg(test)]
@@ -1015,7 +1015,11 @@ impl Store {
         }
 
         match tokio::time::timeout_at(deadline, worker).await {
-            Ok(Ok(Ok(()))) if tokio::time::Instant::now() < deadline => std::mem::forget(guard),
+            Ok(Ok(Ok(ledger))) if tokio::time::Instant::now() < deadline => {
+                std::mem::forget(guard);
+
+                ledger
+            }
 
             Ok(Ok(Err(error))) => {
                 tracing::error!(
@@ -1029,7 +1033,7 @@ impl Store {
             }
 
             Ok(Err(_)) => fail_stop("revision persistence worker failed"),
-            Ok(Ok(Ok(()))) | Err(_) => fail_stop("revision commit exceeded five seconds"),
+            Ok(Ok(Ok(_))) | Err(_) => fail_stop("revision commit exceeded five seconds"),
         }
     }
 }
@@ -1067,14 +1071,14 @@ impl Write for BoundedBytes {
 }
 
 impl StoreInner {
-    fn write(&self, ledger: Ledger) -> Result<(), PersistenceError> {
+    fn write(&self, ledger: &Ledger) -> Result<(), PersistenceError> {
         let mut operation = "validate revision state";
 
         let result = (|| {
             ledger.validate(self.uuid)?;
             let mut bytes = BoundedBytes(Vec::new());
             operation = "serialize bounded revision state";
-            serde_json::to_writer(&mut bytes, &ledger)?;
+            serde_json::to_writer(&mut bytes, ledger)?;
             operation = "create private revision temporary file";
 
             let mut temporary = OpenOptions::new()
@@ -1666,9 +1670,10 @@ impl Library {
         let guard = if changed { Some(Publication) } else { None };
 
         let publish = async {
-            if let Some(next) = &next {
-                self.inner.store.persist(next.clone()).await;
-            }
+            let next = match next {
+                Some(next) => Some(self.inner.store.persist(next).await),
+                None => None,
+            };
 
             #[cfg(test)]
             {
@@ -2608,7 +2613,7 @@ mod revision_tests {
         assert_eq!(ledger, empty());
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
         ledger.restart();
-        store.inner.write(ledger.clone()).unwrap();
+        store.inner.write(&ledger).unwrap();
         drop(store);
         let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
         assert_eq!(loaded, ledger);
@@ -3214,7 +3219,7 @@ mod revision_tests {
         install(directory.path(), &ledger);
         let (store, loaded) = Store::open(directory.path(), id(1)).unwrap();
         assert_eq!(loaded, ledger);
-        store.inner.write(ledger.clone()).unwrap();
+        store.inner.write(&ledger).unwrap();
         assert!(!directory.path().join("revisions.tmp").exists());
         assert!(serde_json::to_vec(&ledger).unwrap().len() < REVISION_BYTES);
     }
@@ -3290,7 +3295,7 @@ mod revision_tests {
         let directory = private_directory();
         let (store, mut ledger) = Store::open(directory.path(), id(1)).unwrap();
         ledger.restart();
-        store.inner.write(ledger).unwrap();
+        store.inner.write(&ledger).unwrap();
         drop(store);
         fs::remove_file(directory.path().join("revisions.json")).unwrap();
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);

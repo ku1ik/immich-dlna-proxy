@@ -13,7 +13,7 @@ use crate::{
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let (store, mut ledger) = Store::open(&config.state_directory, config.server_uuid)?;
     ledger.restart();
-    store.persist(ledger.clone()).await;
+    ledger = store.persist(ledger).await;
 
     let media = MediaProxy::new(config.api_base.clone(), config.api_key.clone())?;
     let events = Subscriptions::new()?;
