@@ -131,14 +131,13 @@ fn compare_dates(
 
 // Snapshot construction.
 
-#[derive(Clone)]
 struct Source {
     client: Client,
     http_address: SocketAddrV4,
     friendly_name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Debug, Eq, PartialEq, Serialize)]
 struct Album {
     id: Uuid,
     object: Object,
@@ -159,7 +158,7 @@ struct Item {
     thumbhash: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Root {
     object: Object,
     albums: BTreeMap<Uuid, Album>,
@@ -167,7 +166,7 @@ struct Root {
     bytes: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Contents {
     items: BTreeMap<Uuid, Item>,
     digest: String,
@@ -2097,7 +2096,7 @@ mod snapshot_tests {
         assert!(video.resources.iter().all(|r| r.byte_seek));
         assert!(video.resources[1].duration.is_none());
 
-        assert!(fake.source.clone().root().await.unwrap().albums.is_empty());
+        assert!(fake.source.root().await.unwrap().albums.is_empty());
 
         let requests = fake.requests.lock().unwrap();
         assert_eq!(requests.len(), 6);
