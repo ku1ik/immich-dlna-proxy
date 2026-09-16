@@ -161,6 +161,7 @@ struct Item {
 
 #[derive(Clone, Debug)]
 struct Root {
+    object: Object,
     albums: BTreeMap<Uuid, Album>,
     digest: String,
     bytes: usize,
@@ -178,7 +179,7 @@ impl Source {
         Self {
             client,
             http_address,
-            friendly_name: xml_text(&friendly_name),
+            friendly_name,
         }
     }
 
@@ -260,6 +261,7 @@ impl Source {
         let (digest, bytes) = projection.finish();
 
         Ok(Root {
+            object: root_object,
             albums,
             digest,
             bytes,
@@ -1157,7 +1159,6 @@ pub struct Library {
 
 struct Inner {
     source: Source,
-    friendly_name: String,
     collator: CollatorBorrowed<'static>,
     store: Store,
     events: Subscriptions,
@@ -1412,7 +1413,7 @@ impl Library {
         let source = Source::new(
             immich::Client::new(config.api_base, config.api_key)?,
             config.listen_address,
-            config.friendly_name.clone(),
+            config.friendly_name,
         );
 
         events.publish(ledger.system_update_id);
@@ -1420,7 +1421,6 @@ impl Library {
         Ok(Self {
             inner: Arc::new(Inner {
                 source,
-                friendly_name: config.friendly_name,
                 collator: config.collator,
                 store,
                 events,
@@ -1754,7 +1754,7 @@ impl Catalog for Library {
             _ => {}
         }
 
-        view.browse(id, query, &self.inner.friendly_name, &self.inner.collator)
+        view.browse(id, query, &self.inner.collator)
     }
 }
 
@@ -1763,7 +1763,6 @@ impl View {
         &self,
         id: ObjectId,
         query: BrowseArguments,
-        friendly_name: &str,
         collator: &CollatorBorrowed<'_>,
     ) -> Result<BrowseResult, Fault> {
         let Self {
@@ -1790,16 +1789,12 @@ impl View {
 
         if query.metadata {
             let object = match id {
-                ObjectId::Root => Object {
-                    id: "0".into(),
-                    parent_id: "-1".into(),
-                    title: friendly_name.to_owned(),
-                    class: "object.container".into(),
-                    date: None,
-                    art: None,
-                    child_count: Some(root.albums.len()),
-                    resources: Vec::new(),
-                },
+                ObjectId::Root => {
+                    let mut object = root.object.clone();
+                    object.child_count = Some(root.albums.len());
+
+                    object
+                }
 
                 ObjectId::Album(id) => root.albums.get(&id).ok_or(MISSING)?.object.clone(),
 
