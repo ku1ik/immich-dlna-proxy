@@ -83,10 +83,6 @@ impl Discovery {
     }
 
     async fn run_to(self, announcement_destination: SocketAddrV4) -> anyhow::Result<()> {
-        self.serve(announcement_destination).await
-    }
-
-    async fn serve(&self, announcement_destination: SocketAddrV4) -> anyhow::Result<()> {
         self.announce(Message::Alive, announcement_destination)?;
 
         let start = Instant::now();

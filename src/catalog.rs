@@ -1180,7 +1180,6 @@ struct Inner {
 struct Supervisor {
     tasks: JoinSet<()>,
     running: bool,
-    failed: bool,
 }
 
 struct State {
@@ -1439,7 +1438,6 @@ impl Library {
                 supervisor: Mutex::new(Supervisor {
                     tasks: JoinSet::new(),
                     running: false,
-                    failed: false,
                 }),
                 wake: Notify::new(),
                 preparation_timeout: PREPARATION_TIMEOUT,
@@ -1472,14 +1470,13 @@ impl Library {
                 match supervisor.tasks.poll_join_next(cx) {
                     Poll::Ready(Some(result)) => {
                         if result.is_err() {
-                            supervisor.failed = true;
                             self.inner.failure.cancel();
                         }
 
                         Poll::Ready(false)
                     }
 
-                    Poll::Ready(None) if supervisor.failed => Poll::Ready(true),
+                    Poll::Ready(None) if self.inner.failure.is_cancelled() => Poll::Ready(true),
                     _ => Poll::Pending,
                 }
             });
@@ -1487,9 +1484,7 @@ impl Library {
             tokio::select! {
                 done = finished => {
                     if done {
-                        ensure!(!self.inner.supervisor.lock().unwrap().failed, "catalog refresh task failed");
-
-                        return Ok(());
+                        return Err(anyhow!("catalog refresh task failed"));
                     }
                 }
 
@@ -1530,11 +1525,12 @@ impl Library {
                 // Reap on admission too: finished handles cannot accumulate when
                 // Browse traffic runs ahead of the supervisor.
                 while let Some(result) = supervisor.tasks.try_join_next() {
-                    supervisor.failed |= result.is_err();
+                    if result.is_err() {
+                        self.inner.failure.cancel();
+                    }
                 }
 
-                if supervisor.failed {
-                    self.inner.failure.cancel();
+                if self.inner.failure.is_cancelled() {
                     self.inner.wake.notify_one();
 
                     return Err(FAILED);
