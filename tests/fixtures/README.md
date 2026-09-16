@@ -78,10 +78,10 @@ must resume. Image audio/seek checks are not applicable.
 
 ## Catalog Contract
 
-`tests/fixture_catalog.rs` is an integration-test module, also independently
-testable with `nix develop -c cargo test --test fixture_catalog`. Include it in
-the test-only fixture harness using `mod fixture_catalog;` from a sibling test
-file. It imports `immich_dlna_proxy::protocol::{Object, Resource}`.
+`tests/fixtures/catalog.rs` is a module of the test-only fixture harness in
+`tests/fixture_server.rs`. Its tests run with
+`nix develop -c cargo test --test fixture_server`. It imports
+`immich_dlna_proxy::protocol::{Object, Resource}`.
 
 ```rust
 pub fn objects(http_address: std::net::SocketAddrV4) -> Vec<Object>;
@@ -182,7 +182,7 @@ Automated fixture regressions (including counts, sorting, playback-only metadata
 GET/HEAD/ranges, and the seek/JPEG experiments):
 
 ```sh
-nix develop -c cargo test --test fixture_catalog --test fixture_server
+nix develop -c cargo test --test fixture_server
 nix develop -c cargo fmt --all -- --check
 ```
 
@@ -201,7 +201,7 @@ screenshots or observations with the generated-file hashes.
 | | | | |
 
 Baseline failures block the gate pending diagnosis or an explicit project-owner
-acceptance change. Investigate the same sample bytes and transport evidence
+acceptance change. Investigate the same sample bytes and HTTP/range evidence
 before blaming a client; do not silently reclassify a failed baseline. Unavailable
 C4/eARC access is an unverified gate requiring an explicit owner decision.
 

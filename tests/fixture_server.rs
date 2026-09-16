@@ -1,5 +1,6 @@
 //! Runnable fixture server and loopback-only integration tests for the production HTTP stack.
 
+#[path = "fixtures/catalog.rs"]
 mod fixture_catalog;
 
 #[path = "fixtures/seek.rs"]
@@ -553,16 +554,12 @@ impl Bound {
                 .context("fixture upstream failed")
         };
 
-        let http = async move {
-            let primary = self.server.run(self.http);
-
-            if let Some((listener, media)) = self.seek {
-                tokio::try_join!(primary, seek::run(listener, media))?;
-            } else {
-                primary.await?;
+        let http = self.server.run(self.http);
+        let seek_http = async move {
+            match self.seek {
+                Some((listener, media)) => seek::run(listener, media).await,
+                None => std::future::pending().await,
             }
-
-            Ok(())
         };
 
         let subscriptions = self.subscriptions.run();
@@ -576,6 +573,7 @@ impl Bound {
         let (name, result) = tokio::select! {
             result = upstream => ("upstream", result),
             result = http => ("HTTP", result),
+            result = seek_http => ("seek HTTP", result),
             result = subscriptions => ("subscriptions", result),
             result = discovery => ("SSDP", result),
         };
