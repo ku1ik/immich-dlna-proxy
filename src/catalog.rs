@@ -36,7 +36,7 @@ use crate::{
     config::Config,
     eventing::Subscriptions,
     immich::{self, Asset, AssetFilter, Client},
-    protocol::{BrowseArguments, Fault, Object, Resource},
+    protocol::{BrowseArguments, Fault, Object, Resource, xml_char},
 };
 
 const FRESHNESS: Duration = Duration::from_secs(60);
@@ -530,13 +530,10 @@ fn log_dates(count: usize) {
 }
 
 fn xml_text(value: &str) -> String {
-    value.chars().map(|c| {
-        if matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}') {
-            c
-        } else {
-            '\u{fffd}'
-        }
-    }).collect()
+    value
+        .chars()
+        .map(|c| if xml_char(c) { c } else { '\u{fffd}' })
+        .collect()
 }
 
 fn title(value: &str, id: Uuid) -> String {

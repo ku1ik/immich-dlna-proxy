@@ -108,7 +108,10 @@ fn parse_settings(text: &str) -> anyhow::Result<Settings> {
     ensure!(
         !settings.friendly_name.is_empty()
             && settings.friendly_name.len() <= 128
-            && settings.friendly_name.chars().all(xml_char),
+            && settings
+                .friendly_name
+                .chars()
+                .all(crate::protocol::xml_char),
         "friendly_name must contain 1-128 UTF-8 bytes of XML-safe text"
     );
 
@@ -155,10 +158,6 @@ pub fn collator(locale: &str) -> anyhow::Result<CollatorBorrowed<'static>> {
     options.case_level = Some(CaseLevel::Off);
 
     Collator::try_new(locale.into(), options).context("cannot initialize sort_locale collation")
-}
-
-fn xml_char(c: char) -> bool {
-    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
 }
 
 pub fn is_unicast(address: Ipv4Addr) -> bool {
