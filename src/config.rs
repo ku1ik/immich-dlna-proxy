@@ -96,7 +96,8 @@ fn parse_settings(text: &str) -> anyhow::Result<Settings> {
     );
 
     ensure!(
-        is_unicast(*settings.listen_address.ip()) && settings.listen_address.port() >= 1024,
+        is_non_loopback_unicast(*settings.listen_address.ip())
+            && settings.listen_address.port() >= 1024,
         "listen_address must be a concrete non-loopback unicast IPv4 address with port 1024-65535"
     );
 
@@ -168,7 +169,7 @@ pub(crate) fn collator(locale: &str) -> anyhow::Result<CollatorBorrowed<'static>
     Collator::try_new(locale.into(), options).context("cannot initialize sort_locale collation")
 }
 
-pub fn is_unicast(address: Ipv4Addr) -> bool {
+pub fn is_non_loopback_unicast(address: Ipv4Addr) -> bool {
     !matches!(address.octets()[0], 0 | 127 | 224..=255)
 }
 
@@ -219,7 +220,7 @@ fn read_key(path: &Path) -> anyhow::Result<HeaderValue> {
 
 pub fn resolve_interface(address: Ipv4Addr) -> anyhow::Result<u32> {
     ensure!(
-        is_unicast(address),
+        is_non_loopback_unicast(address),
         "LAN address must be non-loopback unicast"
     );
     let mut list = std::ptr::null_mut();

@@ -18,7 +18,7 @@ use clap::Parser;
 use http::{HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
     catalog::{BrowseResult, Catalog, ObjectId, parse_id},
-    config::{is_unicast, resolve_interface},
+    config::{is_non_loopback_unicast, resolve_interface},
     eventing::Subscriptions,
     media::MediaProxy,
     protocol::{BrowseArguments, Fault, Object},
@@ -76,7 +76,7 @@ fn listen_address(value: &str) -> anyhow::Result<SocketAddrV4> {
     let address: SocketAddrV4 = value.parse().context("expected an IPv4 socket address")?;
 
     ensure!(
-        is_unicast(*address.ip()) && address.port() >= 1024,
+        is_non_loopback_unicast(*address.ip()) && address.port() >= 1024,
         "listen must be concrete non-loopback unicast IPv4 with port 1024-65535"
     );
 
