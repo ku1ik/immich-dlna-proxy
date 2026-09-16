@@ -105,7 +105,7 @@ impl MediaProxy {
             return response(StatusCode::NOT_FOUND);
         };
 
-        let (endpoint, expected_mime, edited) = match representation {
+        let route = match representation {
             "original" => ("original", None, false),
             "display" => (
                 "thumbnail?size=fullsize&edited=true",
@@ -158,17 +158,7 @@ impl MediaProxy {
 
         let started = std::time::Instant::now();
 
-        let result = self
-            .request(
-                asset,
-                endpoint,
-                expected_mime,
-                edited,
-                method,
-                headers,
-                permit,
-            )
-            .await;
+        let result = self.request(asset, route, method, headers, permit).await;
 
         match result {
             Ok(response) => response,
@@ -187,13 +177,13 @@ impl MediaProxy {
     async fn request(
         &self,
         asset: Uuid,
-        endpoint: &str,
-        expected_mime: Option<&str>,
-        edited: bool,
+        route: (&str, Option<&str>, bool),
         method: Method,
         headers: HeaderMap,
         permit: OwnedSemaphorePermit,
     ) -> Result<Response, Failure> {
+        let (endpoint, expected_mime, edited) = route;
+
         let mut url = self
             .api_base
             .join(&format!("assets/{asset}/{endpoint}"))
