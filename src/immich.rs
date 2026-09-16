@@ -8,14 +8,9 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Result, anyhow, ensure};
 use http::{HeaderValue, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::{
-    sync::OnceCell,
-    time::{Instant, timeout_at},
-};
+use tokio::{sync::OnceCell, time::timeout};
 use url::Url;
 use uuid::Uuid;
-
-use crate::deadline::Budget;
 
 pub(crate) const SEARCH_PAGE_SIZE: usize = 1_000;
 const JSON_BYTES: usize = 16 * 1024 * 1024;
@@ -28,8 +23,6 @@ pub struct Client {
     api_base: Url,
     api_key: HeaderValue,
     version_checked: Arc<OnceCell<()>>,
-    #[cfg(test)]
-    pub(crate) after_json: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,41 +167,17 @@ impl Client {
             api_base,
             api_key,
             version_checked: Arc::new(OnceCell::new()),
-            #[cfg(test)]
-            after_json: None,
         })
     }
 
-    async fn json<T: DeserializeOwned>(
-        &self,
-        request: reqwest::RequestBuilder,
-        budget: &Budget,
-    ) -> Result<T> {
-        budget.run(self.read_json(request, budget)).await?
-    }
-
-    async fn read_json<T: DeserializeOwned>(
-        &self,
-        request: reqwest::RequestBuilder,
-        budget: &Budget,
-    ) -> Result<T> {
+    async fn json<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T> {
         let request = request
             .header("x-api-key", self.api_key.clone())
             .header(header::ACCEPT, "application/json")
             .header(header::ACCEPT_ENCODING, "identity");
 
-        // A cooperative timeout cannot interrupt synchronous JSON processing.
-        budget.check()?;
-
-        let header_deadline = budget
-            .deadline
-            .min(Instant::now() + RESPONSE_HEADER_TIMEOUT);
-
-        let response = timeout_at(header_deadline, async { request.send().await }).await;
-
-        budget.check()?;
-
-        let mut response = response
+        let mut response = timeout(RESPONSE_HEADER_TIMEOUT, request.send())
+            .await
             .map_err(|_| anyhow!("Immich response-header deadline exceeded"))?
             .map_err(|_| anyhow!("Immich connection failed"))?;
 
@@ -227,19 +196,11 @@ impl Client {
 
         let mut body = Vec::new();
 
-        loop {
-            budget.check()?;
-
-            let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| anyhow!("Immich body read failed"))?
-            else {
-                break;
-            };
-
-            budget.check()?;
-
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| anyhow!("Immich body read failed"))?
+        {
             ensure!(
                 chunk.len() <= JSON_BYTES - body.len(),
                 "Immich JSON response exceeds byte limit"
@@ -248,31 +209,16 @@ impl Client {
             body.extend_from_slice(&chunk);
         }
 
-        budget.check()?;
-
-        let parsed = serde_json::from_slice(&body).map_err(|_| {
-            anyhow!("invalid Immich JSON structure; requires Immich 3.1.0 or newer")
-        })?;
-
-        #[cfg(test)]
-        if let Some(after_json) = &self.after_json {
-            after_json();
-        }
-
-        budget.check()?;
-
-        Ok(parsed)
+        serde_json::from_slice(&body)
+            .map_err(|_| anyhow!("invalid Immich JSON structure; requires Immich 3.1.0 or newer"))
     }
 
     /// Cache a successful minimum-version check across client clones.
-    pub async fn ensure_supported_version(&self, budget: &Budget) -> Result<()> {
-        budget
-            .run(self.version_checked.get_or_try_init(|| async {
+    pub async fn ensure_supported_version(&self) -> Result<()> {
+        self.version_checked
+            .get_or_try_init(|| async {
                 let version: Version = self
-                    .json(
-                        self.client.get(self.api_base.join("server/version")?),
-                        budget,
-                    )
+                    .json(self.client.get(self.api_base.join("server/version")?))
                     .await?;
 
                 ensure!(
@@ -282,17 +228,15 @@ impl Client {
                     "Immich 3.1.0 or newer is required; upgrade the upstream server"
                 );
 
-                budget.check()?;
-
                 Ok::<_, anyhow::Error>(())
-            }))
-            .await??;
+            })
+            .await?;
 
         Ok(())
     }
 
-    pub async fn albums(&self, budget: &Budget) -> Result<Vec<Album>> {
-        self.json(self.client.get(self.api_base.join("albums")?), budget)
+    pub async fn albums(&self) -> Result<Vec<Album>> {
+        self.json(self.client.get(self.api_base.join("albums")?))
             .await
     }
 
@@ -302,9 +246,7 @@ impl Client {
         album: Uuid,
         page: usize,
         filter: AssetFilter,
-        budget: &Budget,
     ) -> Result<AssetPage> {
-        budget.check()?;
         ensure!(page > 0, "Immich search pages start at one");
         let encoded = matches!(filter, AssetFilter::EncodedVideos);
 
@@ -324,7 +266,6 @@ impl Client {
                 self.client
                     .post(self.api_base.join("search/metadata")?)
                     .json(&query),
-                budget,
             )
             .await?;
 
@@ -342,8 +283,6 @@ impl Client {
         } else {
             None
         };
-
-        budget.check()?;
 
         Ok(AssetPage {
             items: result.assets.items,

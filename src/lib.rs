@@ -1,6 +1,5 @@
 pub mod catalog;
 pub mod config;
-pub mod deadline;
 pub mod eventing;
 pub mod immich;
 pub mod lifecycle;

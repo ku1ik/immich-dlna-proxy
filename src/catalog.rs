@@ -34,7 +34,6 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    deadline::Budget,
     eventing::Subscriptions,
     immich::{self, Asset, AssetFilter, Client},
     protocol::{BrowseArguments, Fault, Object, Resource},
@@ -184,10 +183,9 @@ impl Source {
     }
 
     /// The caller admits and bounds the whole refresh, including version checking.
-    async fn root(&self, budget: &Budget) -> Result<Root> {
-        budget.check()?;
-        self.client.ensure_supported_version(budget).await?;
-        let records = self.client.albums(budget).await?;
+    async fn root(&self) -> Result<Root> {
+        self.client.ensure_supported_version().await?;
+        let records = self.client.albums().await?;
 
         let root_object = Object {
             id: "0".into(),
@@ -205,7 +203,6 @@ impl Source {
         let mut bad_dates = 0;
 
         for dto in records {
-            budget.check()?;
             let created_at = parse_date(dto.created_at.as_deref(), &mut bad_dates);
 
             let mut album = Album {
@@ -249,21 +246,18 @@ impl Source {
             albums.insert(album.id, album);
         }
 
-        budget.check()?;
         log_dates(bad_dates);
         let mut projection = Projection::new(SNAPSHOT_BYTES);
         projection.write_all(b"[")?;
         projection.json(&root_object)?;
 
         for album in albums.values() {
-            budget.check()?;
             projection.write_all(b",")?;
             projection.json(album)?;
         }
 
         projection.write_all(b"]")?;
         let (digest, bytes) = projection.finish();
-        budget.check()?;
 
         Ok(Root {
             albums,
@@ -274,8 +268,7 @@ impl Source {
 
     /// Requires the caller to establish readable root membership first. No version
     /// request, admission queue, timeout extension, or publication happens here.
-    async fn contents(&self, album: Uuid, budget: &Budget) -> Result<Contents> {
-        budget.check()?;
+    async fn contents(&self, album: Uuid) -> Result<Contents> {
         let mut items = BTreeMap::<Uuid, Item>::new();
         let mut excluded = BTreeSet::new();
         let mut encoded_ids = BTreeSet::new();
@@ -285,8 +278,6 @@ impl Source {
         let mut bad_dates = 0;
 
         for encoded in [false, true] {
-            budget.check()?;
-
             if encoded
                 && !items
                     .values()
@@ -298,8 +289,6 @@ impl Source {
             let mut page = 1;
 
             loop {
-                budget.check()?;
-
                 ensure!(
                     pages < SEARCH_PAGES && records < SEARCH_RECORDS,
                     "Immich album traversal limit exceeded"
@@ -313,10 +302,7 @@ impl Source {
                     AssetFilter::All
                 };
 
-                let result = self
-                    .client
-                    .search_album(album, page, filter, budget)
-                    .await?;
+                let result = self.client.search_album(album, page, filter).await?;
 
                 ensure!(
                     result.items.len() <= SEARCH_RECORDS - records,
@@ -327,8 +313,6 @@ impl Source {
                 let mut advanced = false;
 
                 for dto in result.items {
-                    budget.check()?;
-
                     if encoded {
                         advanced |= encoded_ids.insert(dto.id);
                         continue;
@@ -336,7 +320,6 @@ impl Source {
 
                     let id = dto.id;
                     let item = self.project(album, dto, &mut bad_dates)?;
-                    budget.check()?;
 
                     match item {
                         Some(item) => {
@@ -375,8 +358,6 @@ impl Source {
                     }
                 }
 
-                budget.check()?;
-
                 let Some(next) = result.next_page else {
                     break;
                 };
@@ -387,8 +368,6 @@ impl Source {
         }
 
         for id in encoded_ids {
-            budget.check()?;
-
             if let Some(item) = items.get_mut(&id)
                 && item.object.class == "object.item.videoItem"
             {
@@ -406,14 +385,11 @@ impl Source {
             }
         }
 
-        budget.check()?;
         log_dates(bad_dates);
         let mut projection = Projection::new(SNAPSHOT_BYTES);
         projection.write_all(b"[")?;
 
         for (index, item) in items.values().enumerate() {
-            budget.check()?;
-
             if index != 0 {
                 projection.write_all(b",")?;
             }
@@ -423,7 +399,6 @@ impl Source {
 
         projection.write_all(b"]")?;
         let (digest, bytes) = projection.finish();
-        budget.check()?;
 
         Ok(Contents {
             items,
@@ -1636,15 +1611,10 @@ impl Library {
         );
 
         let prepare = async {
-            let budget = Budget {
-                deadline: preparation,
-                stop: self.inner.stop.clone(),
-            };
-
             let candidate = match scope {
-                Scope::Root => Candidate::Root(Arc::new(self.inner.source.root(&budget).await?)),
+                Scope::Root => Candidate::Root(Arc::new(self.inner.source.root().await?)),
                 Scope::Album(id) => {
-                    Candidate::Album(id, Arc::new(self.inner.source.contents(id, &budget).await?))
+                    Candidate::Album(id, Arc::new(self.inner.source.contents(id).await?))
                 }
             };
 
@@ -1946,13 +1916,6 @@ mod snapshot_tests {
 
     const ALBUM: Uuid = Uuid::from_u128(100_000);
 
-    fn budget() -> Budget {
-        Budget {
-            deadline: Instant::now() + PREPARATION_TIMEOUT,
-            stop: CancellationToken::new(),
-        }
-    }
-
     struct SnapshotFixture {
         source: Source,
         requests: Arc<Mutex<Vec<Received>>>,
@@ -1982,128 +1945,6 @@ mod snapshot_tests {
             .project(ALBUM, serde_json::from_value(value).unwrap(), &mut 0)
             .unwrap()
             .unwrap()
-    }
-
-    async fn processing_boundary(cancel: bool) {
-        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-        for stage in 0..6 {
-            let replies = match stage {
-                0 => vec![version(), reply(json!([]))],
-                1 => vec![page(vec![asset(1, "IMAGE")], Some("2")), page(vec![], None)],
-                2 => vec![page(vec![asset(1, "VIDEO")], None), page(vec![], None)],
-
-                3 => vec![
-                    page(vec![asset(1, "VIDEO")], None),
-                    page(vec![asset(1, "VIDEO")], Some("2")),
-                    page(vec![], None),
-                ],
-
-                4 => vec![version(), reply(json!([album(ALBUM)]))],
-                _ => vec![page(vec![asset(1, "IMAGE")], None)],
-            };
-
-            let mut fake = SnapshotFixture::new(replies).await;
-
-            let budget = Budget {
-                deadline: Instant::now() + Duration::from_secs(1),
-                ..budget()
-            };
-
-            let deadline = budget.deadline;
-            let cancelled = budget.stop.clone();
-            let calls = Arc::new(AtomicUsize::new(0));
-            let observed = calls.clone();
-            let allowed = if matches!(stage, 3 | 4) { 2 } else { 1 };
-
-            fake.source.client.after_json = Some(Arc::new(move || {
-                if observed.fetch_add(1, AtomicOrdering::SeqCst) + 1 == allowed {
-                    if cancel {
-                        let cancelled = cancelled.clone();
-
-                        std::thread::spawn(move || cancelled.cancel())
-                            .join()
-                            .unwrap();
-                    } else {
-                        // Block synchronously, as parsing can, without yielding to a timer.
-                        std::thread::sleep(
-                            deadline.saturating_duration_since(tokio::time::Instant::now()),
-                        );
-                    }
-                }
-            }));
-
-            let failed = if matches!(stage, 0 | 4) {
-                fake.source.root(&budget).await.is_err()
-            } else {
-                fake.source.contents(ALBUM, &budget).await.is_err()
-            };
-
-            assert_eq!(
-                fake.requests.lock().unwrap().len(),
-                allowed,
-                "stage {stage} started a request after processing exhausted the budget"
-            );
-
-            assert!(failed);
-            assert_eq!(calls.load(AtomicOrdering::SeqCst), allowed);
-        }
-    }
-
-    #[tokio::test]
-    async fn expired_during_processing_does_not_start_next_request() {
-        processing_boundary(false).await;
-    }
-
-    #[tokio::test]
-    async fn cancelled_during_processing_does_not_start_next_request() {
-        processing_boundary(true).await;
-    }
-
-    #[tokio::test]
-    async fn invalid_budget_rejects_snapshot_preparation() {
-        for checked in [false, true] {
-            for cancel in [false, true] {
-                let fake = SnapshotFixture::new(vec![version(), reply(json!([]))]).await;
-
-                if checked {
-                    fake.source.root(&budget()).await.unwrap();
-                }
-
-                let mut budget = budget();
-
-                if cancel {
-                    budget.stop.cancel();
-                } else {
-                    budget.deadline = Instant::now();
-                }
-
-                let expected = if cancel {
-                    "operation cancelled"
-                } else {
-                    "operation deadline exceeded"
-                };
-
-                assert_eq!(
-                    fake.source.root(&budget).await.unwrap_err().to_string(),
-                    expected
-                );
-
-                assert_eq!(
-                    fake.source
-                        .contents(ALBUM, &budget)
-                        .await
-                        .unwrap_err()
-                        .to_string(),
-                    expected
-                );
-
-                assert_eq!(
-                    fake.requests.lock().unwrap().len(),
-                    if checked { 2 } else { 0 }
-                );
-            }
-        }
     }
 
     #[tokio::test]
@@ -2246,7 +2087,7 @@ mod snapshot_tests {
         ])
         .await;
 
-        let root = fake.source.root(&budget()).await.unwrap();
+        let root = fake.source.root().await.unwrap();
 
         assert_eq!(
             root.albums[&ALBUM].object.date.as_deref(),
@@ -2263,7 +2104,7 @@ mod snapshot_tests {
         );
 
         assert!(root.albums[&ALBUM].object.child_count.is_none());
-        let contents = fake.source.contents(ALBUM, &budget()).await.unwrap();
+        let contents = fake.source.contents(ALBUM).await.unwrap();
         assert_eq!(contents.items.len(), 1001);
         let video = &contents.items[&Uuid::from_u128(1001)].object;
         assert_eq!(video.resources.len(), 2);
@@ -2272,15 +2113,7 @@ mod snapshot_tests {
         assert!(video.resources.iter().all(|r| r.byte_seek));
         assert!(video.resources[1].duration.is_none());
 
-        assert!(
-            fake.source
-                .clone()
-                .root(&budget())
-                .await
-                .unwrap()
-                .albums
-                .is_empty()
-        );
+        assert!(fake.source.clone().root().await.unwrap().albums.is_empty());
 
         let requests = fake.requests.lock().unwrap();
         assert_eq!(requests.len(), 6);
@@ -2332,11 +2165,7 @@ mod snapshot_tests {
             let fake = SnapshotFixture::new(vec![page(vec![dto], None)]).await;
 
             assert_eq!(
-                fake.source
-                    .contents(ALBUM, &budget())
-                    .await
-                    .unwrap_err()
-                    .to_string(),
+                fake.source.contents(ALBUM).await.unwrap_err().to_string(),
                 "eligible Immich asset is missing originalFileName"
             );
         }
@@ -2377,10 +2206,7 @@ mod snapshot_tests {
 
                 let fake = SnapshotFixture::new(vec![page(records, None)]).await;
 
-                assert!(
-                    fake.source.contents(ALBUM, &budget()).await.is_err(),
-                    "{field}"
-                );
+                assert!(fake.source.contents(ALBUM).await.is_err(), "{field}");
             }
         }
 
@@ -2401,7 +2227,7 @@ mod snapshot_tests {
         )])
         .await;
 
-        let result = fake.source.contents(ALBUM, &budget()).await.unwrap();
+        let result = fake.source.contents(ALBUM).await.unwrap();
         assert_eq!(result.items.len(), 1);
         assert_eq!(fake.requests.lock().unwrap().len(), 1);
     }
@@ -2423,22 +2249,22 @@ mod snapshot_tests {
         ])
         .await;
 
-        let first = fake.source.root(&budget()).await.unwrap();
-        let second = fake.source.root(&budget()).await.unwrap();
+        let first = fake.source.root().await.unwrap();
+        let second = fake.source.root().await.unwrap();
         assert_eq!(first.digest, second.digest);
         assert_eq!(first.bytes, second.bytes);
         assert_eq!(first.albums[&ALBUM].object.title, ALBUM.to_string());
         assert!(first.albums[&ALBUM].object.art.is_none());
 
         for _ in 0..3 {
-            assert!(fake.source.root(&budget()).await.is_err());
+            assert!(fake.source.root().await.is_err());
         }
 
         let renamed = SnapshotFixture::new(vec![version(), reply(json!([empty.clone()]))]).await;
-        let baseline = renamed.source.root(&budget()).await.unwrap();
+        let baseline = renamed.source.root().await.unwrap();
         let mut changed = SnapshotFixture::new(vec![version(), reply(json!([empty]))]).await;
         changed.source.friendly_name = "Another title".into();
-        let changed = changed.source.root(&budget()).await.unwrap();
+        let changed = changed.source.root().await.unwrap();
         assert_ne!(baseline.digest, changed.digest);
         assert_eq!(
             baseline.albums[&ALBUM].digest,
@@ -2458,8 +2284,8 @@ mod snapshot_tests {
         ])
         .await;
 
-        let baseline = fake.source.contents(ALBUM, &budget()).await.unwrap();
-        let reordered = fake.source.contents(ALBUM, &budget()).await.unwrap();
+        let baseline = fake.source.contents(ALBUM).await.unwrap();
+        let reordered = fake.source.contents(ALBUM).await.unwrap();
         assert_eq!(baseline.digest, reordered.digest);
         assert_eq!(baseline.bytes, reordered.bytes);
         let serialized = serde_json::to_vec(&baseline.items.values().collect::<Vec<_>>()).unwrap();
@@ -2524,7 +2350,7 @@ mod snapshot_tests {
             ));
 
             let fake = SnapshotFixture::new(replies).await;
-            assert!(fake.source.contents(ALBUM, &budget()).await.is_err());
+            assert!(fake.source.contents(ALBUM).await.is_err());
             assert_eq!(fake.requests.lock().unwrap().len(), 2);
         }
 
@@ -2545,7 +2371,7 @@ mod snapshot_tests {
             }
 
             let fake = SnapshotFixture::new(replies).await;
-            assert_eq!(fake.source.contents(ALBUM, &budget()).await.is_ok(), finish);
+            assert_eq!(fake.source.contents(ALBUM).await.is_ok(), finish);
             assert_eq!(fake.requests.lock().unwrap().len(), SEARCH_PAGES);
         }
     }
@@ -2559,7 +2385,7 @@ mod snapshot_tests {
 
         assert!(
             fake.source
-                .contents(ALBUM, &budget())
+                .contents(ALBUM)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -2575,10 +2401,7 @@ mod snapshot_tests {
             ])
             .await;
 
-            assert_eq!(
-                fake.source.contents(ALBUM, &budget()).await.is_ok(),
-                extra == 0
-            );
+            assert_eq!(fake.source.contents(ALBUM).await.is_ok(), extra == 0);
 
             assert_eq!(fake.requests.lock().unwrap().len(), 2);
         }
@@ -2606,12 +2429,7 @@ mod snapshot_tests {
 
         let fake = SnapshotFixture::new(replies).await;
 
-        let error = fake
-            .source
-            .contents(ALBUM, &budget())
-            .await
-            .unwrap_err()
-            .to_string();
+        let error = fake.source.contents(ALBUM).await.unwrap_err().to_string();
 
         assert!(error.contains("item limit"), "{error}");
 
@@ -2627,7 +2445,7 @@ mod snapshot_tests {
 
         assert!(
             fake.source
-                .root(&budget())
+                .root()
                 .await
                 .unwrap_err()
                 .to_string()
@@ -2644,7 +2462,7 @@ mod snapshot_tests {
 
         assert!(
             fake.source
-                .contents(ALBUM, &budget())
+                .contents(ALBUM)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -5467,18 +5285,13 @@ mod tests {
                 .insert(Uuid::from_u128(id), vec![asset]);
         }
 
-        let budget = Budget {
-            deadline: Instant::now() + PREPARATION_TIMEOUT,
-            stop: fixture.library.inner.stop.clone(),
-        };
-
-        let root = fixture.library.inner.source.root(&budget).await.unwrap();
+        let root = fixture.library.inner.source.root().await.unwrap();
 
         let contents = fixture
             .library
             .inner
             .source
-            .contents(Uuid::from_u128(1), &budget)
+            .contents(Uuid::from_u128(1))
             .await
             .unwrap();
 
@@ -5699,6 +5512,165 @@ mod tests {
         );
 
         fixture.stop(task).await;
+    }
+
+    #[tokio::test]
+    async fn preparation_timeout_and_shutdown_drop_stalled_requests_across_pages() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpStream;
+
+        async fn request(listener: &TcpListener, path: &str) -> (TcpStream, Value) {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            assert!(line.contains(&format!(" {path} HTTP/1.1\r\n")));
+            let mut length = 0;
+
+            loop {
+                line.clear();
+                assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+
+                if line == "\r\n" {
+                    break;
+                }
+
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).await.unwrap();
+
+            let body = if body.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&body).unwrap()
+            };
+
+            (socket.into_inner(), body)
+        }
+
+        async fn respond(mut socket: TcpStream, body: Value) {
+            let body = body.to_string();
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.shutdown().await.unwrap();
+        }
+
+        // Stall version checking, album listing, or a later search page.
+        for stage in 0..3 {
+            for body_pending in [false, true] {
+                for cancel in [false, true] {
+                    let mut fixture = Fixture::new(1).await;
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let inner = Arc::get_mut(&mut fixture.library.inner).unwrap();
+                    inner.preparation_timeout = Duration::from_secs(10);
+
+                    inner.source.client = Client::new(
+                        format!("http://{}/api/", listener.local_addr().unwrap())
+                            .parse()
+                            .unwrap(),
+                        HeaderValue::from_static("fake-key"),
+                    )
+                    .unwrap();
+
+                    tokio::time::pause();
+
+                    // Advance only explicitly while exchanging loopback responses.
+                    let clock_guard = tokio::spawn(async {
+                        loop {
+                            tokio::task::yield_now().await;
+                        }
+                    });
+
+                    let task = fixture.run();
+                    let caller = browse(&fixture.library, children(1));
+                    let (mut socket, _) = request(&listener, "/api/server/version").await;
+
+                    if stage > 0 {
+                        if stage == 1 {
+                            tokio::time::advance(Duration::from_secs(6)).await;
+                        }
+
+                        respond(
+                            socket,
+                            json!({"major": 3, "minor": 1, "patch": 0, "prerelease": null}),
+                        )
+                        .await;
+
+                        (socket, _) = request(&listener, "/api/albums").await;
+                    }
+
+                    if stage == 2 {
+                        respond(socket, json!([album(1, "Album")])).await;
+                        let (first, query) = request(&listener, "/api/search/metadata").await;
+                        assert_eq!(query["page"], 1);
+                        tokio::time::advance(Duration::from_secs(6)).await;
+
+                        respond(first, json!({"assets": {"items": [crate::immich::tests::asset(1, "IMAGE")], "nextPage": "2"}})).await;
+
+                        let query;
+                        (socket, query) = request(&listener, "/api/search/metadata").await;
+                        assert_eq!(query["page"], 2);
+                    }
+
+                    if body_pending {
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n[")
+                            .await
+                            .unwrap();
+                    }
+
+                    assert!(!caller.is_finished());
+                    let before = fixture.disk();
+
+                    if cancel {
+                        fixture.library.inner.stop.cancel();
+                    } else {
+                        // Earlier requests consumed six seconds; a new page gets no new window.
+                        tokio::time::advance(Duration::from_secs(if stage == 0 { 11 } else { 5 }))
+                            .await;
+                    }
+
+                    clock_guard.abort();
+                    assert!(clock_guard.await.unwrap_err().is_cancelled());
+                    fault(caller, 501).await;
+                    assert_eq!(fixture.disk(), before);
+                    assert_eq!(fixture.library.inner.permits.available_permits(), REFRESHES);
+
+                    assert!(
+                        fixture
+                            .library
+                            .inner
+                            .state
+                            .lock()
+                            .unwrap()
+                            .flights
+                            .is_empty()
+                    );
+
+                    assert_eq!(
+                        tokio::time::timeout(Duration::from_secs(1), socket.read(&mut [0; 1]))
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        0
+                    );
+
+                    fixture.stop(task).await;
+                    tokio::time::resume();
+                }
+            }
+        }
     }
 
     #[tokio::test]

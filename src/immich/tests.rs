@@ -7,17 +7,9 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::{collections::VecDeque, sync::Mutex, time::Duration};
-use tokio::{net::TcpListener, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
+use tokio::{net::TcpListener, task::JoinHandle, time::Instant};
 
 const ALBUM: Uuid = Uuid::from_u128(100_000);
-
-fn budget() -> Budget {
-    Budget {
-        deadline: Instant::now() + Duration::from_secs(20),
-        stop: CancellationToken::new(),
-    }
-}
 
 pub(crate) struct Received {
     pub method: Method,
@@ -136,7 +128,7 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
     ])
     .await;
 
-    let albums = fake.client.albums(&budget()).await.unwrap();
+    let albums = fake.client.albums().await.unwrap();
     assert_eq!(albums[0].album_name, "A\u{0001}&B");
 
     assert_eq!(
@@ -146,7 +138,7 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
 
     let result = fake
         .client
-        .search_album(ALBUM, 1, AssetFilter::All, &budget())
+        .search_album(ALBUM, 1, AssetFilter::All)
         .await
         .unwrap();
 
@@ -166,7 +158,7 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
 
     let result = fake
         .client
-        .search_album(ALBUM, 2, AssetFilter::EncodedVideos, &budget())
+        .search_album(ALBUM, 2, AssetFilter::EncodedVideos)
         .await
         .unwrap();
 
@@ -219,7 +211,7 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
 
             assert!(
                 fake.client
-                    .search_album(ALBUM, 1, AssetFilter::All, &budget())
+                    .search_album(ALBUM, 1, AssetFilter::All)
                     .await
                     .is_err(),
                 "{field}"
@@ -241,7 +233,7 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
 
         assert!(
             fake.client
-                .search_album(ALBUM, 1, AssetFilter::All, &budget())
+                .search_album(ALBUM, 1, AssetFilter::All)
                 .await
                 .is_err(),
             "{field}"
@@ -259,7 +251,7 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
 
         assert!(
             fake.client
-                .search_album(ALBUM, 1, AssetFilter::All, &budget())
+                .search_album(ALBUM, 1, AssetFilter::All)
                 .await
                 .is_err()
         );
@@ -285,7 +277,7 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
 
     let result = fake
         .client
-        .search_album(ALBUM, 1, AssetFilter::All, &budget())
+        .search_album(ALBUM, 1, AssetFilter::All)
         .await
         .unwrap();
 
@@ -302,7 +294,7 @@ async fn search_validates_page_numbers_and_continuation_tokens() {
 
         assert!(
             fake.client
-                .search_album(ALBUM, 1, AssetFilter::All, &budget())
+                .search_album(ALBUM, 1, AssetFilter::All)
                 .await
                 .is_err(),
             "{next}"
@@ -315,7 +307,7 @@ async fn search_validates_page_numbers_and_continuation_tokens() {
 
     assert!(
         fake.client
-            .search_album(ALBUM, 0, AssetFilter::All, &budget())
+            .search_album(ALBUM, 0, AssetFilter::All)
             .await
             .is_err()
     );
@@ -324,7 +316,7 @@ async fn search_validates_page_numbers_and_continuation_tokens() {
 
     assert!(
         fake.client
-            .search_album(ALBUM, usize::MAX, AssetFilter::All, &budget())
+            .search_album(ALBUM, usize::MAX, AssetFilter::All)
             .await
             .is_err()
     );
@@ -344,23 +336,15 @@ async fn versions_retry_only_failed_checks_and_share_success_across_clones() {
     ] {
         let fake = Fake::new(vec![reply(value), version()]).await;
 
-        assert!(
-            fake.client
-                .ensure_supported_version(&budget())
-                .await
-                .is_err()
-        );
+        assert!(fake.client.ensure_supported_version().await.is_err());
 
         assert_eq!(fake.requests.lock().unwrap().len(), 1);
 
-        fake.client
-            .ensure_supported_version(&budget())
-            .await
-            .unwrap();
+        fake.client.ensure_supported_version().await.unwrap();
 
         fake.client
             .clone()
-            .ensure_supported_version(&budget())
+            .ensure_supported_version()
             .await
             .unwrap();
 
@@ -382,78 +366,16 @@ async fn versions_retry_only_failed_checks_and_share_success_across_clones() {
     ])
     .await;
 
-    fake.client
-        .ensure_supported_version(&budget())
-        .await
-        .unwrap();
+    fake.client.ensure_supported_version().await.unwrap();
 
-    let error = format!("{:#}", fake.client.albums(&budget()).await.unwrap_err());
+    let error = format!("{:#}", fake.client.albums().await.unwrap_err());
     assert!(error.contains("403"));
     assert!(!error.contains("private") && !error.contains("http://"));
 
-    fake.client
-        .ensure_supported_version(&budget())
-        .await
-        .unwrap();
+    fake.client.ensure_supported_version().await.unwrap();
 
-    fake.client.albums(&budget()).await.unwrap();
+    fake.client.albums().await.unwrap();
     assert_eq!(fake.requests.lock().unwrap().len(), 3);
-}
-
-#[tokio::test]
-async fn invalid_budget_rejects_cached_version_and_all_endpoints() {
-    for checked in [false, true] {
-        for cancel in [false, true] {
-            let fake = Fake::new(vec![version()]).await;
-
-            if checked {
-                fake.client
-                    .ensure_supported_version(&budget())
-                    .await
-                    .unwrap();
-            }
-
-            let mut budget = budget();
-
-            if cancel {
-                budget.stop.cancel();
-            } else {
-                budget.deadline = Instant::now();
-            }
-
-            let expected = if cancel {
-                "operation cancelled"
-            } else {
-                "operation deadline exceeded"
-            };
-
-            assert_eq!(
-                fake.client
-                    .ensure_supported_version(&budget)
-                    .await
-                    .unwrap_err()
-                    .to_string(),
-                expected
-            );
-
-            assert_eq!(
-                fake.client.albums(&budget).await.unwrap_err().to_string(),
-                expected
-            );
-
-            assert_eq!(
-                fake.client
-                    .search_album(ALBUM, 1, AssetFilter::All, &budget)
-                    .await
-                    .unwrap_err()
-                    .to_string(),
-                expected
-            );
-
-            assert_eq!(fake.requests.lock().unwrap().len(), usize::from(checked));
-            assert_eq!(fake.client.version_checked.get().is_some(), checked);
-        }
-    }
 }
 
 #[tokio::test]
@@ -473,13 +395,13 @@ async fn redirects_are_rejected_at_every_endpoint() {
                 .await;
 
                 let result = match endpoint {
-                    0 => fake.client.ensure_supported_version(&budget()).await,
+                    0 => fake.client.ensure_supported_version().await,
 
-                    1 => fake.client.albums(&budget()).await.map(|_| ()),
+                    1 => fake.client.albums().await.map(|_| ()),
 
                     _ => fake
                         .client
-                        .search_album(ALBUM, 1, AssetFilter::All, &budget())
+                        .search_album(ALBUM, 1, AssetFilter::All)
                         .await
                         .map(|_| ()),
                 };
@@ -505,7 +427,7 @@ async fn json_bound_is_enforced_before_parsing_with_and_without_content_length()
         };
 
         let fake = Fake::new(vec![Response::new(body)]).await;
-        let error = fake.client.albums(&budget()).await.unwrap_err().to_string();
+        let error = fake.client.albums().await.unwrap_err().to_string();
 
         assert!(
             error.contains("JSON response exceeds byte limit"),
@@ -529,7 +451,7 @@ async fn transport_failures_are_sanitized_and_do_not_retry() {
         ])
         .await;
 
-        let error = format!("{:#}", fake.client.albums(&budget()).await.unwrap_err());
+        let error = format!("{:#}", fake.client.albums().await.unwrap_err());
         assert!(error.contains(&status.to_string()));
         assert!(!error.contains("private") && !error.contains("http://"));
         assert_eq!(fake.requests.lock().unwrap().len(), 1);
@@ -543,15 +465,15 @@ async fn transport_failures_are_sanitized_and_do_not_retry() {
     ])
     .await;
 
-    let error = format!("{:#}", fake.client.albums(&budget()).await.unwrap_err());
+    let error = format!("{:#}", fake.client.albums().await.unwrap_err());
     assert!(!error.contains("private") && !error.contains("http://"));
-    fake.client.albums(&budget()).await.unwrap();
+    fake.client.albums().await.unwrap();
     assert_eq!(fake.requests.lock().unwrap().len(), 2);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = client_for(&listener);
     drop(listener);
-    let error = format!("{:#}", client.albums(&budget()).await.unwrap_err());
+    let error = format!("{:#}", client.albums().await.unwrap_err());
     assert_eq!(error, "Immich connection failed");
 }
 
@@ -565,121 +487,14 @@ fn client_for(listener: &TcpListener) -> Client {
     .unwrap()
 }
 
-#[tokio::test(start_paused = true)]
-async fn headers_complete_before_deadline_or_stalled_requests_time_out() {
-    use futures_util::FutureExt;
-    use std::{future::Future, task::Wake};
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        sync::Notify,
-    };
-
-    struct HeaderWake(Notify);
-
-    impl Wake for HeaderWake {
-        fn wake(self: Arc<Self>) {
-            self.0.notify_one();
-        }
-    }
-
-    // Let loopback I/O progress without auto-advancing the paused clock.
-    let clock_guard = tokio::spawn(async {
-        loop {
-            tokio::task::yield_now().await;
-        }
-    });
-
-    for duration in [Duration::from_secs(10), Duration::from_secs(20)] {
-        let limit = duration.min(RESPONSE_HEADER_TIMEOUT);
-
-        for elapsed in [
-            limit - Duration::from_secs(1),
-            limit,
-            limit + Duration::from_secs(1),
-        ] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let client = client_for(&listener);
-            let started = Instant::now();
-
-            let budget = Budget {
-                deadline: started + duration,
-                ..budget()
-            };
-
-            let request = client.albums(&budget);
-            tokio::pin!(request);
-
-            let mut socket = tokio::select! {
-                _ = &mut request => panic!("request ended before headers"),
-
-                accepted = listener.accept() => accepted.unwrap().0,
-            };
-
-            let read_request = async {
-                let mut bytes = Vec::new();
-
-                while !bytes.ends_with(b"\r\n\r\n") {
-                    bytes.push(socket.read_u8().await.unwrap());
-                }
-            };
-
-            tokio::select! {
-                _ = &mut request => panic!("request ended before headers"),
-
-                _ = read_request => {}
-            }
-
-            let wake = Arc::new(HeaderWake(Notify::new()));
-            let waker = std::task::Waker::from(wake.clone());
-            let mut context = std::task::Context::from_waker(&waker);
-            assert!(request.as_mut().poll(&mut context).is_pending());
-            let _ = wake.0.notified().now_or_never();
-
-            if elapsed < limit {
-                socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]")
-                    .await
-                    .unwrap();
-
-                wake.0.notified().await;
-            }
-
-            assert_eq!(Instant::now(), started);
-            // Allow for Tokio's millisecond timer granularity.
-            tokio::time::advance(elapsed + Duration::from_millis(1)).await;
-            let result = request.await;
-
-            if elapsed < limit {
-                assert!(result.unwrap().is_empty());
-            } else {
-                let expected = if duration <= RESPONSE_HEADER_TIMEOUT {
-                    "operation deadline exceeded"
-                } else {
-                    "Immich response-header deadline exceeded"
-                };
-
-                assert_eq!(result.unwrap_err().to_string(), expected);
-            }
-        }
-    }
-
-    clock_guard.abort();
-    let _ = clock_guard.await;
-}
-
 #[tokio::test]
-async fn stalled_headers_are_capped_by_remaining_request_budget() {
+async fn stalled_headers_time_out_and_close_the_connection() {
     use tokio::io::AsyncReadExt;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client = client_for(&listener);
 
-    let budget = Budget {
-        deadline: Instant::now() + Duration::from_secs(10),
-        ..budget()
-    };
-
-    let fetch = client.albums(&budget);
+    let fetch = client.albums();
     tokio::pin!(fetch);
 
     let (mut socket, _) = tokio::select! {
@@ -701,68 +516,15 @@ async fn stalled_headers_are_capped_by_remaining_request_budget() {
     }
 
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(9)).await;
+    tokio::time::advance(RESPONSE_HEADER_TIMEOUT - Duration::from_secs(1)).await;
     assert!(futures_util::poll!(&mut fetch).is_pending());
     tokio::time::advance(Duration::from_secs(2)).await;
     let now = Instant::now();
     let error = fetch.await.unwrap_err();
     assert_eq!(Instant::now(), now);
-    assert_eq!(error.to_string(), "operation deadline exceeded");
+    assert_eq!(
+        error.to_string(),
+        "Immich response-header deadline exceeded"
+    );
     assert_eq!(socket.read(&mut [0; 1]).await.unwrap(), 0);
-}
-
-#[tokio::test]
-async fn deadlines_and_cancellation_drop_stalled_header_and_body_reads() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    for send_headers in [false, true] {
-        for cancel in [false, true] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let client = client_for(&listener);
-            let budget = budget();
-            let stop = budget.stop.clone();
-
-            let fetch = tokio::spawn(async move { client.albums(&budget).await });
-
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-
-            while !request.ends_with(b"\r\n\r\n") {
-                request.push(socket.read_u8().await.unwrap());
-            }
-
-            if send_headers {
-                socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n[")
-                    .await
-                    .unwrap();
-
-                // Deliver headers before advancing the virtual clock.
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-
-            tokio::time::pause();
-
-            let expected = if cancel {
-                stop.cancel();
-
-                "operation cancelled"
-            } else {
-                tokio::time::advance(RESPONSE_HEADER_TIMEOUT).await;
-
-                if send_headers {
-                    assert!(!fetch.is_finished());
-                    tokio::time::advance(Duration::from_secs(5)).await;
-
-                    "operation deadline exceeded"
-                } else {
-                    "Immich response-header deadline exceeded"
-                }
-            };
-
-            assert_eq!(fetch.await.unwrap().unwrap_err().to_string(), expected);
-            assert_eq!(socket.read(&mut [0; 1]).await.unwrap(), 0);
-            tokio::time::resume();
-        }
-    }
 }
