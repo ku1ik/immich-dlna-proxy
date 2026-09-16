@@ -12,6 +12,8 @@ use tokio::{sync::OnceCell, time::timeout};
 use url::Url;
 use uuid::Uuid;
 
+use crate::config::is_normalized_api_base;
+
 pub(crate) const SEARCH_PAGE_SIZE: usize = 1_000;
 const JSON_BYTES: usize = 16 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -138,13 +140,7 @@ struct Search {
 impl Client {
     pub fn new(api_base: Url, mut api_key: HeaderValue) -> Result<Self> {
         ensure!(
-            matches!(api_base.scheme(), "http" | "https")
-                && api_base.host_str().is_some()
-                && api_base.username().is_empty()
-                && api_base.password().is_none()
-                && api_base.query().is_none()
-                && api_base.fragment().is_none()
-                && api_base.path().ends_with("/api/"),
+            is_normalized_api_base(&api_base),
             "Immich requires a normalized HTTP(S) API directory"
         );
 

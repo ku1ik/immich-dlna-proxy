@@ -9,6 +9,8 @@ use tokio::{
 use url::Url;
 use uuid::Uuid;
 
+use crate::config::is_normalized_api_base;
+
 pub const OPERATIONS: usize = 16;
 const REDIRECTS: usize = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -75,13 +77,7 @@ impl ByteRange {
 impl MediaProxy {
     pub fn new(api_base: Url, mut api_key: HeaderValue) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            matches!(api_base.scheme(), "http" | "https")
-                && api_base.host_str().is_some()
-                && api_base.username().is_empty()
-                && api_base.password().is_none()
-                && api_base.query().is_none()
-                && api_base.fragment().is_none()
-                && api_base.path().ends_with("/api/"),
+            is_normalized_api_base(&api_base),
             "media requires a normalized HTTP(S) API directory"
         );
 

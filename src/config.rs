@@ -151,6 +151,16 @@ pub fn normalize_api_base(value: &str) -> anyhow::Result<Url> {
     Ok(url)
 }
 
+pub(crate) fn is_normalized_api_base(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path().ends_with("/api/")
+}
+
 pub fn collator(locale: &str) -> anyhow::Result<CollatorBorrowed<'static>> {
     let locale: Locale = locale.parse().context("invalid sort_locale identifier")?;
     let mut options = CollatorOptions::default();
@@ -408,6 +418,7 @@ state_directory = "/var/lib/immich-dlna-proxy"
             ),
         ] {
             let base = normalize_api_base(input).unwrap();
+            assert!(is_normalized_api_base(&base));
             assert_eq!(base.as_str(), expected);
             assert_eq!(
                 base.join("albums").unwrap().as_str(),
@@ -423,6 +434,17 @@ state_directory = "/var/lib/immich-dlna-proxy"
             "https://example.com#x",
         ] {
             assert!(normalize_api_base(value).is_err());
+        }
+
+        for value in [
+            "ftp://example.com/api/",
+            "https://user@example.com/api/",
+            "https://example.com/api/?query",
+            "https://example.com/api/#fragment",
+            "https://example.com/api",
+            "https://example.com/not-api/",
+        ] {
+            assert!(!is_normalized_api_base(&value.parse().unwrap()));
         }
     }
 
