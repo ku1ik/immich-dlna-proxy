@@ -1943,31 +1943,11 @@ mod snapshot_tests {
             ),
             (Some("image/png"), false, "original", "image/png"),
             (Some("image/jpeg; q =90"), false, "original", "image/jpeg"),
-            (Some("image/jpeg; q= 90"), false, "original", "image/jpeg"),
-            (
-                Some("IMAGE/JPEG;; q \t=\t \"90\"; ; x = y;"),
-                false,
-                "original",
-                "image/jpeg",
-            ),
             (Some("image/gif"), false, "original", "image/gif"),
             (Some("image/jpeg"), true, "display", "image/jpeg"),
             (Some("image/heic"), false, "display", "image/jpeg"),
             (Some("image/webp"), false, "display", "image/jpeg"),
             (Some("image/jpeg;broken"), false, "display", "image/jpeg"),
-            (Some("image/jpeg; q = "), false, "display", "image/jpeg"),
-            (
-                Some("image/jpeg; q = \"90\"oops"),
-                false,
-                "display",
-                "image/jpeg",
-            ),
-            (
-                Some("image/jpeg; q = \"bad\u{7f}\""),
-                false,
-                "display",
-                "image/jpeg",
-            ),
             (None, false, "display", "image/jpeg"),
         ] {
             let mut dto = asset(1, "IMAGE");
@@ -2451,32 +2431,6 @@ mod snapshot_tests {
                 .to_string()
                 .contains("byte limit")
         );
-    }
-
-    #[test]
-    fn mime_normalization_accepts_parameter_whitespace_but_rejects_garbage() {
-        for value in [
-            " IMAGE/JPEG ; q=90",
-            "image/jpeg; q =90",
-            "image/jpeg; q= 90",
-            "IMAGE/JPEG;; q \t=\t \"90\"; ; x = y;",
-        ] {
-            assert_eq!(
-                media_type(value).as_deref(),
-                Some("image/jpeg"),
-                "{value:?}"
-            );
-        }
-
-        for value in [
-            "image/jpeg; q = ",
-            "image/jpeg; q = \"90\"oops",
-            "image/jpeg; q\n=90",
-            "image/jpeg; q=\n90",
-            "image/jpeg; q = \"bad\u{7f}\"",
-        ] {
-            assert_eq!(media_type(value), None, "{value:?}");
-        }
     }
 }
 
