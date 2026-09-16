@@ -32,7 +32,6 @@ let
   disabled = evaluate { };
   enabled = evaluate required;
   service = enabled.config.systemd.services.${name};
-  unit = enabled.config.systemd.units."${name}.service".text;
   firewall = evaluate (
     required
     // {
@@ -151,9 +150,7 @@ let
       && service.wants == [ "network-online.target" ]
       && service.after == [ "network-online.target" ]
       && service.serviceConfig.Restart == "on-failure"
-      && service.serviceConfig.RestartSec == 3
-      && service.serviceConfig.TimeoutStopSec == 15
-      && lib.hasInfix "TimeoutStopSec=15\n" unit;
+      && service.serviceConfig.RestartSec == 3;
     firewallClosedByDefault =
       enabled.config.networking.firewall.interfaces == { }
       &&

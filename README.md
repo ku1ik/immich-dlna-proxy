@@ -96,7 +96,6 @@ StateDirectoryMode=0700
 UMask=0077
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=15
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -186,8 +185,9 @@ remain generic. No HTTP `contentFeatures.dlna.org` header, time seeking, codec/p
 claims, HLS, or renderer probing. GET supports one closed, open-ended, or suffix
 byte range. Unsupported, malformed, or multiple ranges are ignored together with
 `If-Range`, giving an ordinary full/conditional request, not multipart delivery.
-HEAD ignores Range/If-Range. Streams have a 60-second no-progress timeout, not a
-total duration limit; failures after headers terminate the stream without retry.
+HEAD ignores Range/If-Range. Upstream media reads have a 60-second no-progress
+timeout, not a total duration limit; failures after headers terminate the stream
+without retry.
 
 Client resource selection/fallback, legacy containers/codecs, HDR/audio/frame rates,
 EXIF/portrait rotation, and large images/panoramas need sample-specific testing.

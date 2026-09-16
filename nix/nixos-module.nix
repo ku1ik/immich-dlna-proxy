@@ -149,7 +149,6 @@ in
         UMask = "0077";
         Restart = "on-failure";
         RestartSec = 3;
-        TimeoutStopSec = 15;
 
         NoNewPrivileges = true;
         CapabilityBoundingSet = "";
