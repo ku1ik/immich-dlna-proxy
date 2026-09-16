@@ -83,7 +83,7 @@ impl Discovery {
     }
 
     async fn run_to(self, announcement_destination: SocketAddrV4) -> anyhow::Result<()> {
-        self.announce(Message::Alive, announcement_destination)?;
+        self.announce(announcement_destination)?;
 
         let start = Instant::now();
         let mut announcement = start + STARTUP_REPEAT;
@@ -99,7 +99,7 @@ impl Discovery {
                 biased;
 
                 _ = tokio::time::sleep_until(announcement) => {
-                    self.announce(Message::Alive, announcement_destination)?;
+                    self.announce(announcement_destination)?;
 
                     announcement = if startup_repeat {
                         startup_repeat = false;
@@ -159,11 +159,13 @@ impl Discovery {
         )
     }
 
-    fn announce(&self, kind: Message, destination: SocketAddrV4) -> anyhow::Result<()> {
+    fn announce(&self, destination: SocketAddrV4) -> anyhow::Result<()> {
         let mut result = Ok(());
 
         for target in 0..self.targets.len() {
-            if let Err(error) = self.send(self.message(target, kind).as_bytes(), destination) {
+            let message = self.message(target, Message::Alive);
+
+            if let Err(error) = self.send(message.as_bytes(), destination) {
                 if error.kind() == io::ErrorKind::WouldBlock {
                     tracing::warn!("SSDP announcement dropped: UDP send buffer full");
                 } else if result.is_ok() {
