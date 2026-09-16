@@ -607,7 +607,7 @@ fn action_response_bounded(
     Ok(xml.value)
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Filter {
     date: bool,
     art: bool,

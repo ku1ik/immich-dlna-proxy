@@ -276,7 +276,7 @@ impl<C: Catalog> Server<C> {
         let result = timeout_at(deadline, async {
             let args = match action {
                 Action::Browse(args) => {
-                    let filter = args.filter.clone();
+                    let filter = args.filter;
                     let object = crate::catalog::parse_id(&args.object_id).ok();
 
                     tracing::debug!(
