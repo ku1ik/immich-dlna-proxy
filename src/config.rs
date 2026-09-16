@@ -130,12 +130,7 @@ fn normalize_api_base(value: &str) -> anyhow::Result<Url> {
     let mut url = Url::parse(value).map_err(|_| anyhow::anyhow!("invalid immich_url"))?;
 
     ensure!(
-        matches!(url.scheme(), "http" | "https")
-            && url.host_str().is_some()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none(),
+        is_safe_api_base(&url),
         "immich_url must be an absolute HTTP(S) URL without userinfo, query or fragment"
     );
 
@@ -152,13 +147,16 @@ fn normalize_api_base(value: &str) -> anyhow::Result<Url> {
 }
 
 pub(crate) fn is_normalized_api_base(url: &Url) -> bool {
+    is_safe_api_base(url) && url.path().ends_with("/api/")
+}
+
+fn is_safe_api_base(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
         && url.host_str().is_some()
         && url.username().is_empty()
         && url.password().is_none()
         && url.query().is_none()
         && url.fragment().is_none()
-        && url.path().ends_with("/api/")
 }
 
 pub(crate) fn collator(locale: &str) -> anyhow::Result<CollatorBorrowed<'static>> {
