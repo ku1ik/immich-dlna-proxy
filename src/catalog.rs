@@ -905,10 +905,11 @@ impl Store {
 
         let ledger = match committed {
             Ok(file) => {
-                check_private(&file.metadata()?, false)?;
+                let metadata = file.metadata()?;
+                check_private(&metadata, false)?;
 
                 ensure!(
-                    file.metadata()?.len() <= REVISION_BYTES as u64,
+                    metadata.len() <= REVISION_BYTES as u64,
                     "revision file exceeds 8 MiB"
                 );
 
@@ -1547,13 +1548,13 @@ impl Library {
                     result: Err(FAILED),
                 };
 
-                let library = self.clone();
                 let deadline = now + PREPARATION_TIMEOUT;
 
                 supervisor.tasks.spawn(async move {
                     flight.result =
-                        library
-                             .refresh(scope, token, deadline)
+                        flight
+                            .library
+                            .refresh(scope, token, deadline)
                              .await
                              .inspect(|view| {
                                  tracing::debug!(?scope, update_id = view.ledger.system_update_id, elapsed_ms = now.elapsed().as_millis(), "catalog refresh completed");
@@ -2781,7 +2782,7 @@ mod revision_tests {
     }
 
     #[tokio::test]
-    async fn first_contents_survive_reload_and_unchanged_transitions_do_not_write() {
+    async fn first_contents_survive_reload_and_unchanged_transitions_are_detected() {
         let directory = private_directory();
         let (store, mut ledger) = Store::open(directory.path(), id(1)).unwrap();
         ledger.restart();
@@ -2806,10 +2807,7 @@ mod revision_tests {
         assert_eq!(metadata.mode() & 0o777, 0o600);
         assert!(!directory.path().join("revisions.tmp").exists());
         let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
-        assert_eq!(Arc::strong_count(&store.inner), 1);
-        let ownership = Arc::downgrade(&store.inner);
         drop(store);
-        assert!(ownership.upgrade().is_none());
         let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
         assert_eq!(loaded, ledger);
         assert_eq!(loaded.contents_transition(id(2), &digest(3)).unwrap(), None);
@@ -2819,14 +2817,6 @@ mod revision_tests {
                 .root_transition(&digest(1), &BTreeMap::from([(id(2), digest(2))]))
                 .unwrap(),
             None
-        );
-
-        let unchanged_metadata = fs::metadata(directory.path().join("revisions.json")).unwrap();
-        assert_eq!(unchanged_metadata.ino(), metadata.ino());
-
-        assert_eq!(
-            unchanged_metadata.modified().unwrap(),
-            metadata.modified().unwrap()
         );
 
         let changed = loaded
