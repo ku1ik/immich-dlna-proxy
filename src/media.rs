@@ -105,11 +105,19 @@ impl MediaProxy {
             return response(StatusCode::NOT_FOUND);
         };
 
-        let (endpoint, expected_mime) = match representation {
-            "original" => ("original", None),
-            "display" => ("thumbnail?size=fullsize&edited=true", Some("image/jpeg")),
-            "preview" => ("thumbnail?size=preview&edited=true", Some("image/jpeg")),
-            "playback" => ("video/playback", Some("video/mp4")),
+        let (endpoint, expected_mime, edited) = match representation {
+            "original" => ("original", None, false),
+            "display" => (
+                "thumbnail?size=fullsize&edited=true",
+                Some("image/jpeg"),
+                true,
+            ),
+            "preview" => (
+                "thumbnail?size=preview&edited=true",
+                Some("image/jpeg"),
+                true,
+            ),
+            "playback" => ("video/playback", Some("video/mp4"), false),
             _ => return response(StatusCode::NOT_FOUND),
         };
 
@@ -151,7 +159,15 @@ impl MediaProxy {
         let started = std::time::Instant::now();
 
         let result = self
-            .request(asset, endpoint, expected_mime, method, headers, permit)
+            .request(
+                asset,
+                endpoint,
+                expected_mime,
+                edited,
+                method,
+                headers,
+                permit,
+            )
             .await;
 
         match result {
@@ -173,6 +189,7 @@ impl MediaProxy {
         asset: Uuid,
         endpoint: &str,
         expected_mime: Option<&str>,
+        edited: bool,
         method: Method,
         headers: HeaderMap,
         permit: OwnedSemaphorePermit,
@@ -182,9 +199,6 @@ impl MediaProxy {
             .join(&format!("assets/{asset}/{endpoint}"))
             .map_err(|_| Failure::Upstream("invalid media endpoint"))?;
 
-        let initial_edited = url
-            .query_pairs()
-            .any(|(key, value)| key == "edited" && value == "true");
         let mut forwarded = HeaderMap::new();
 
         for name in [
@@ -265,7 +279,7 @@ impl MediaProxy {
 
             if visited.len() > REDIRECTS
                 || visited.contains(&target)
-                || !self.allowed_redirect(initial_edited, &target, asset)
+                || !self.allowed_redirect(edited, &target, asset)
             {
                 return Err(Failure::Upstream("unsafe or excessive media redirect"));
             }

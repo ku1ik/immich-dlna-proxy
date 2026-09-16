@@ -165,14 +165,7 @@ impl<C: Catalog> Server<C> {
         }
 
         if let Some((asset, representation)) = media_route {
-            if let Ok(asset) = Uuid::parse_str(asset)
-                && matches!(
-                    representation,
-                    "original" | "display" | "preview" | "playback"
-                )
-            {
-                tracing::debug!(%peer, %asset, representation, "media request peer");
-            }
+            tracing::debug!(%peer, "media request peer");
 
             return self
                 .media
