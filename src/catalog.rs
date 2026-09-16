@@ -1239,14 +1239,9 @@ impl Cache {
         }
     }
 
-    fn invalidate(&mut self, before: &Ledger, after: &Ledger) {
-        self.albums.retain(|id, _| {
-            let before = before.albums.get(id);
-            let after = after.albums.get(id);
-
-            after.is_some_and(|album| album.present)
-                && before.map(|album| album.present) == after.map(|album| album.present)
-        });
+    fn invalidate(&mut self, ledger: &Ledger) {
+        self.albums
+            .retain(|id, _| ledger.albums.get(id).is_some_and(|album| album.present));
     }
 
     fn insert(&mut self, candidate: Candidate, now: Instant) {
@@ -1693,7 +1688,7 @@ impl Library {
 
             if let Some(next) = next {
                 let State { ledger, cache, .. } = &mut *state;
-                cache.invalidate(ledger, &next);
+                cache.invalidate(&next);
                 *ledger = Arc::new(next);
             }
 
