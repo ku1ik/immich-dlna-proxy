@@ -25,7 +25,6 @@ const DELIVERIES: usize = 4;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const CALLBACK_BODY_BYTES: usize = 8 * 1024;
 pub(crate) const MODERATION: Duration = Duration::from_secs(2);
-const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct Subscriptions {
@@ -477,9 +476,7 @@ async fn deliver(
     body: String,
 ) -> (Uuid, bool) {
     for url in callbacks {
-        let started = Instant::now();
-        let header_deadline = started + RESPONSE_HEADER_TIMEOUT;
-        let deadline = started + CALLBACK_TIMEOUT;
+        let deadline = Instant::now() + CALLBACK_TIMEOUT;
 
         let attempt = async {
             let request = client
@@ -493,10 +490,7 @@ async fn deliver(
                 .header(header::ACCEPT_ENCODING, "identity")
                 .body(body.clone());
 
-            let mut response = timeout_at(header_deadline, async { request.send().await })
-                .await
-                .ok()?
-                .ok()?;
+            let mut response = request.send().await.ok()?;
 
             let status = response.status();
 
@@ -1819,18 +1813,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_header_and_total_deadlines_are_per_url_and_keep_active_leases() {
-        for (path, deadline) in [
-            ("/slow-headers", RESPONSE_HEADER_TIMEOUT),
-            ("/slow-body", CALLBACK_TIMEOUT),
-        ] {
+    async fn callback_deadline_is_per_url_and_keeps_active_leases() {
+        for path in ["/slow-headers", "/slow-body"] {
             let subscriptions = Subscriptions::new().unwrap();
             let mut callback = Callback::new().await;
             let sid = callback.register(&subscriptions, SERVICE, &[path, "/fail"]);
             let task = tokio::spawn(subscriptions.clone().run());
             assert_eq!(callback.next().await.0.uri.path(), path);
             tokio::time::pause();
-            tokio::time::advance(deadline).await;
+            tokio::time::advance(CALLBACK_TIMEOUT).await;
             tokio::time::resume();
             assert_eq!(callback.next().await.0.uri.path(), "/fail");
             finished(&subscriptions, sid).await;
@@ -1860,11 +1851,9 @@ mod tests {
             }
         });
 
-        for (body_pending, status, limit) in [
-            (false, 412, RESPONSE_HEADER_TIMEOUT),
-            (false, 200, RESPONSE_HEADER_TIMEOUT),
-            (true, 200, CALLBACK_TIMEOUT),
-        ] {
+        for (body_pending, status) in [(false, 412), (false, 200), (true, 200)] {
+            let limit = CALLBACK_TIMEOUT;
+
             for elapsed in [
                 limit - Duration::from_secs(1),
                 limit,
