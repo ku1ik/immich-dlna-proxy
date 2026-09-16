@@ -46,8 +46,7 @@ struct Subscription {
     peer: Ipv4Addr,
     callbacks: Vec<Url>,
     lease: Duration,
-    expires: Instant,
-    active: bool,
+    expires: Option<Instant>,
     initial_update_id: Option<u32>,
     pending: Option<u32>,
     delivering: bool,
@@ -58,15 +57,15 @@ struct Subscription {
 impl State {
     fn expire(&mut self, now: Instant) {
         self.entries.retain_mut(|entry| {
-            if entry.expires <= now {
-                entry.active = false;
+            if entry.expires.is_some_and(|expires| expires <= now) {
+                entry.expires = None;
             }
 
-            if !entry.active {
+            if entry.expires.is_none() {
                 entry.pending = None;
             }
 
-            entry.active || entry.initial_update_id.is_some() || entry.delivering
+            entry.expires.is_some() || entry.initial_update_id.is_some() || entry.delivering
         });
     }
 }
@@ -100,7 +99,7 @@ impl Subscriptions {
         state.expire(Instant::now());
 
         for entry in &mut state.entries {
-            if entry.active && entry.service == Service::ContentDirectory {
+            if entry.expires.is_some() && entry.service == Service::ContentDirectory {
                 entry.pending = Some(id);
             }
         }
@@ -153,15 +152,15 @@ impl Subscriptions {
                         entry.sid == sid
                             && entry.service == service
                             && entry.peer == peer
-                            && entry.active
+                            && entry.expires.is_some()
                     })
                     .ok_or(StatusCode::PRECONDITION_FAILED)?;
 
                 if method.as_str() == "UNSUBSCRIBE" {
-                    entry.active = false;
+                    entry.expires = None;
                 } else {
                     entry.lease = lease;
-                    entry.expires = now + lease;
+                    entry.expires = Some(now + lease);
                 }
 
                 let granted = entry.lease;
@@ -195,8 +194,7 @@ impl Subscriptions {
                 peer,
                 callbacks,
                 lease,
-                expires: now + lease,
-                active: true,
+                expires: Some(now + lease),
                 initial_update_id,
                 pending: None,
                 delivering: false,
@@ -273,8 +271,7 @@ impl Subscriptions {
                     let Some(index) = state.entries.iter().position(|entry| {
                         !entry.delivering
                             && (entry.initial_update_id.is_some()
-                                || (entry.initial_update_id.is_none()
-                                    && entry.active
+                                || (entry.expires.is_some()
                                     && entry.next_attempt <= now
                                     && entry.pending.is_some()))
                     }) else {
@@ -310,16 +307,16 @@ impl Subscriptions {
                 state
                     .entries
                     .iter()
-                    .filter(|entry| entry.active)
                     .flat_map(|entry| {
                         // A ready event waits on completion when all delivery slots are full.
-                        let moderation = (deliveries.len() < DELIVERIES
+                        let moderation = (entry.expires.is_some()
+                            && deliveries.len() < DELIVERIES
                             && entry.initial_update_id.is_none()
                             && !entry.delivering
                             && entry.pending.is_some())
                         .then_some(entry.next_attempt);
 
-                        Some(entry.expires).into_iter().chain(moderation)
+                        entry.expires.into_iter().chain(moderation)
                     })
                     .min()
             };
@@ -336,10 +333,16 @@ impl Subscriptions {
                 finished = deliveries.next(), if !deliveries.is_empty() => {
                     let (sid, deactivate) = finished.expect("nonempty delivery set");
                     let mut state = self.state.lock().unwrap();
+                    let entry = state
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.sid == sid)
+                        .expect("in-flight subscription is retained");
 
-                    if let Some(entry) = state.entries.iter_mut().find(|entry| entry.sid == sid) {
-                        entry.delivering = false;
-                        entry.active &= !deactivate;
+                    entry.delivering = false;
+
+                    if deactivate {
+                        entry.expires = None;
                     }
 
                     state.expire(Instant::now());
@@ -648,7 +651,7 @@ mod tests {
 
             assert_eq!(
                 state.entries[0].expires,
-                Instant::now() + Duration::from_secs(expected)
+                Some(Instant::now() + Duration::from_secs(expected))
             );
 
             assert_eq!(state.entries[0].initial_update_id, Some(42));
@@ -959,7 +962,7 @@ mod tests {
 
             assert_eq!(
                 state.entries[0].expires,
-                Instant::now() + Duration::from_secs(20)
+                Some(Instant::now() + Duration::from_secs(20))
             );
         }
 
@@ -1336,7 +1339,7 @@ mod tests {
             {
                 let mut state = subscriptions.state.lock().unwrap();
                 let entry = &mut state.entries[0];
-                assert!(entry.active);
+                assert!(entry.expires.is_some());
                 assert_eq!(entry.pending, future);
                 assert_eq!(entry.next_seq, seq.wrapping_add(1).max(1));
 
@@ -1522,7 +1525,7 @@ mod tests {
                     .find(|entry| entry.sid == target)
                     .unwrap();
 
-                entry.expires = Instant::now();
+                entry.expires = Some(Instant::now());
                 state.expire(Instant::now());
             }
 
@@ -1575,7 +1578,7 @@ mod tests {
                         StatusCode::OK
                     );
                 } else {
-                    subscriptions.state.lock().unwrap().entries[0].expires = Instant::now();
+                    subscriptions.state.lock().unwrap().entries[0].expires = Some(Instant::now());
                 }
 
                 subscriptions.publish(3);
@@ -1583,7 +1586,7 @@ mod tests {
                 {
                     let state = subscriptions.state.lock().unwrap();
                     let entry = &state.entries[0];
-                    assert!(!entry.active);
+                    assert!(entry.expires.is_none());
                     assert!(entry.delivering);
                     assert_eq!(entry.pending, None);
                 }
@@ -1677,7 +1680,11 @@ mod tests {
 
         finished(&subscriptions, sid).await;
         assert!(callback.received.try_recv().is_err());
-        assert!(subscriptions.state.lock().unwrap().entries[0].active);
+        assert!(
+            subscriptions.state.lock().unwrap().entries[0]
+                .expires
+                .is_some()
+        );
         abort_scheduler(task).await;
     }
 
@@ -1735,7 +1742,7 @@ mod tests {
             let state = subscriptions.state.lock().unwrap();
             assert_eq!(state.entries.len(), 1);
             assert_eq!(state.entries[0].sid, active);
-            assert!(state.entries[0].active);
+            assert!(state.entries[0].expires.is_some());
         }
 
         assert_eq!(
@@ -1825,7 +1832,11 @@ mod tests {
             tokio::time::resume();
             assert_eq!(callback.next().await.0.uri.path(), "/fail");
             finished(&subscriptions, sid).await;
-            assert!(subscriptions.state.lock().unwrap().entries[0].active);
+            assert!(
+                subscriptions.state.lock().unwrap().entries[0]
+                    .expires
+                    .is_some()
+            );
             abort_scheduler(task).await;
         }
     }
@@ -1967,7 +1978,7 @@ mod tests {
                         .unwrap()
                         .entries
                         .first()
-                        .map(|entry| (entry.active, entry.delivering, entry.next_seq));
+                        .map(|entry| (entry.expires.is_some(), entry.delivering, entry.next_seq));
 
                     assert_eq!(
                         entry,
@@ -2014,7 +2025,7 @@ mod tests {
 
                     let state = subscriptions.state.lock().unwrap();
                     let entry = &state.entries[0];
-                    assert!(entry.active);
+                    assert!(entry.expires.is_some());
                     assert!(entry.initial_update_id.is_none());
                     assert_eq!(entry.next_seq, seq + 1);
                     assert_eq!(entry.pending, None);
