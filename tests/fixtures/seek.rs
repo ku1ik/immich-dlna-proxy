@@ -252,7 +252,7 @@ async fn connection<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(io: T, m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use immich_dlna_proxy::media::MEDIA_OPERATIONS;
+    use immich_dlna_proxy::media;
     use std::{
         io,
         net::{Ipv4Addr, SocketAddr},
@@ -652,7 +652,7 @@ mod tests {
         let upstream = Upstream::start().await;
         let mut held = Vec::new();
 
-        for _ in 0..MEDIA_OPERATIONS {
+        for _ in 0..media::OPERATIONS {
             let result = upstream
                 .media
                 .serve(ASSET, "original", Method::GET, HeaderMap::new())
@@ -669,7 +669,7 @@ mod tests {
             assert!(!result.headers().contains_key(CAPABILITY));
         }
 
-        assert_eq!(upstream.requests.lock().unwrap().len(), MEDIA_OPERATIONS);
+        assert_eq!(upstream.requests.lock().unwrap().len(), media::OPERATIONS);
 
         held.pop();
 
@@ -688,7 +688,7 @@ mod tests {
         let upstream = Upstream::start().await;
         let mut held = Vec::new();
 
-        for _ in 0..MEDIA_OPERATIONS {
+        for _ in 0..media::OPERATIONS {
             let request = Request::builder()
                 .method(Method::HEAD)
                 .uri("/byte-seek")
@@ -731,7 +731,7 @@ mod tests {
                 let upstream = Upstream::start().await;
                 let mut connections = Vec::new();
 
-                for _ in 0..MEDIA_OPERATIONS {
+                for _ in 0..media::OPERATIONS {
                     let (mut client, io) = tokio::io::duplex(1);
                     let task = tokio::spawn(connection(io, upstream.media.clone()));
 
@@ -810,7 +810,7 @@ mod tests {
                 // All slots, not only the most recent connection's slot, must return.
                 let mut held = Vec::new();
 
-                for _ in 0..MEDIA_OPERATIONS {
+                for _ in 0..media::OPERATIONS {
                     let result = upstream
                         .media
                         .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
@@ -846,7 +846,7 @@ mod tests {
             let task = tokio::spawn(run(listener, upstream.media.clone(), stop.clone()));
             let mut clients = Vec::new();
 
-            for count in 1..=MEDIA_OPERATIONS {
+            for count in 1..=media::OPERATIONS {
                 let mut client = TcpStream::connect(address).await.unwrap();
 
                 client
@@ -894,7 +894,7 @@ mod tests {
             let mut held = Vec::new();
 
             timeout(Duration::from_secs(2), async {
-                while held.len() < MEDIA_OPERATIONS {
+                while held.len() < media::OPERATIONS {
                     let result = upstream
                         .media
                         .serve(ASSET, "original", Method::HEAD, HeaderMap::new())

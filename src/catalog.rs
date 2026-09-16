@@ -40,7 +40,7 @@ use crate::{
     protocol::{BrowseArguments, Fault, Object, Resource},
 };
 
-const CATALOG_FRESHNESS: Duration = Duration::from_secs(60);
+const FRESHNESS: Duration = Duration::from_secs(60);
 const RESIDENT_ALBUMS: usize = 32;
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
@@ -51,7 +51,7 @@ const REVISION_BYTES: usize = 8 * 1024 * 1024;
 const SEARCH_PAGES: usize = 50;
 const SEARCH_RECORDS: usize = 50_000;
 const REFRESHES: usize = 4;
-const REFRESH_PREPARATION_TIMEOUT: Duration = Duration::from_secs(20);
+const PREPARATION_TIMEOUT: Duration = Duration::from_secs(20);
 // The outer commit includes publication; persistence also runs independently at startup.
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 const PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1252,7 +1252,7 @@ impl Cache {
         Self {
             root: None,
             albums: BTreeMap::new(),
-            freshness: CATALOG_FRESHNESS,
+            freshness: FRESHNESS,
             album_limit: RESIDENT_ALBUMS,
             byte_limit: CACHE_BYTES,
         }
@@ -1470,7 +1470,7 @@ impl Library {
                     failed: false,
                 }),
                 wake: Notify::new(),
-                preparation_timeout: REFRESH_PREPARATION_TIMEOUT,
+                preparation_timeout: PREPARATION_TIMEOUT,
                 #[cfg(test)]
                 publication: Mutex::new(None),
                 #[cfg(test)]
@@ -1948,7 +1948,7 @@ mod snapshot_tests {
 
     fn budget() -> Budget {
         Budget {
-            deadline: Instant::now() + REFRESH_PREPARATION_TIMEOUT,
+            deadline: Instant::now() + PREPARATION_TIMEOUT,
             stop: CancellationToken::new(),
         }
     }
@@ -4311,11 +4311,9 @@ mod tests {
             let mut state = self.library.inner.state.lock().unwrap();
 
             match scope {
-                Scope::Root => state.cache.root.as_mut().unwrap().completed -= CATALOG_FRESHNESS,
+                Scope::Root => state.cache.root.as_mut().unwrap().completed -= FRESHNESS,
 
-                Scope::Album(id) => {
-                    state.cache.albums.get_mut(&id).unwrap().completed -= CATALOG_FRESHNESS
-                }
+                Scope::Album(id) => state.cache.albums.get_mut(&id).unwrap().completed -= FRESHNESS,
             }
         }
 
@@ -4900,7 +4898,7 @@ mod tests {
 
         // Root, initial contents, and the changed refresh coalesce while SEQ=0 is in flight.
         tokio::time::pause();
-        tokio::time::advance(crate::eventing::EVENT_MODERATION).await;
+        tokio::time::advance(crate::eventing::MODERATION).await;
         tokio::time::resume();
         fixture.fake.upstream.lock().unwrap().notification_gate = None;
         callback_gate.release.add_permits(1);
@@ -5470,7 +5468,7 @@ mod tests {
         }
 
         let budget = Budget {
-            deadline: Instant::now() + REFRESH_PREPARATION_TIMEOUT,
+            deadline: Instant::now() + PREPARATION_TIMEOUT,
             stop: fixture.library.inner.stop.clone(),
         };
 
@@ -5994,7 +5992,7 @@ mod tests {
             .root
             .as_mut()
             .unwrap()
-            .completed -= CATALOG_FRESHNESS;
+            .completed -= FRESHNESS;
 
         let mut barrier = Barrier::new();
         Arc::get_mut(&mut barrier).unwrap().panic = mode == "panic";
@@ -6204,7 +6202,7 @@ mod tests {
         let before = fixture.disk();
         let calls = fixture.fake.upstream.lock().unwrap().requests.len();
         tokio::time::pause();
-        tokio::time::advance(CATALOG_FRESHNESS).await;
+        tokio::time::advance(FRESHNESS).await;
         tokio::time::resume();
         assert_eq!(fixture.library.system_update_id(), 2);
         assert_eq!(fixture.disk(), before);

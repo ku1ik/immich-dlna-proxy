@@ -677,7 +677,7 @@ mod tests {
         catalog::BrowseResult,
         eventing::SUBSCRIPTIONS,
         lifecycle::SHUTDOWN_GRACE,
-        media::MEDIA_OPERATIONS,
+        media,
         protocol::{BrowseArguments, SOAP_RESPONSE_BYTES},
     };
     use std::{
@@ -1522,7 +1522,7 @@ mod tests {
             );
 
             let remote = tokio::spawn(async move {
-                for _ in 0..MEDIA_OPERATIONS {
+                for _ in 0..media::OPERATIONS {
                     let (mut io, _) = upstream.accept().await.unwrap();
                     read_headers(&mut io).await;
                     io.write_all(wire.as_bytes()).await.unwrap();
@@ -1533,7 +1533,7 @@ mod tests {
             let mut connections = Vec::new();
             let path = format!("/media/assets/{ASSET}/original");
 
-            for _ in 0..MEDIA_OPERATIONS {
+            for _ in 0..media::OPERATIONS {
                 let (mut client, io) = tokio::io::duplex(4096);
                 let entered = Arc::new(Notify::new());
                 let (release, gate) = oneshot::channel();
@@ -1592,7 +1592,7 @@ mod tests {
             let server = Arc::new(server);
             let mut connections = Vec::new();
 
-            for _ in 0..MEDIA_OPERATIONS {
+            for _ in 0..media::OPERATIONS {
                 let mut client = TcpStream::connect(listener.local_addr().unwrap())
                     .await
                     .unwrap();
