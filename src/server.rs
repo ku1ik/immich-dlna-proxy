@@ -282,8 +282,8 @@ impl<C: Catalog> Server<C> {
                     tracing::debug!(
                         %peer, ?object,
                         metadata = args.metadata,
-                        starting_index = ?Some(args.starting_index),
-                        requested_count = ?Some(args.requested_count),
+                        starting_index = args.starting_index,
+                        requested_count = args.requested_count,
                         sort = ?args.sort,
                         resources_selected = filter.res(),
                         "Browse request"
