@@ -1187,13 +1187,14 @@ struct State {
 }
 
 // A response pins one publication independently of subsequent cache eviction.
+#[derive(Clone)]
 struct View {
     root: Arc<Root>,
     contents: Option<Arc<Contents>>,
     ledger: Arc<Ledger>,
 }
 
-type RefreshResult = Result<Arc<View>, Fault>;
+type RefreshResult = Result<View, Fault>;
 
 impl State {
     fn view(&self, scope: Scope) -> RefreshResult {
@@ -1202,11 +1203,11 @@ impl State {
             Scope::Album(id) => Some(self.cache.albums.get(&id).ok_or(FAILED)?.snapshot.clone()),
         };
 
-        Ok(Arc::new(View {
+        Ok(View {
             root: self.cache.root.as_ref().ok_or(FAILED)?.snapshot.clone(),
             contents,
             ledger: self.ledger.clone(),
-        }))
+        })
     }
 }
 
@@ -1592,7 +1593,7 @@ impl Library {
         }
     }
 
-    async fn refresh(&self, scope: Scope, token: Token, preparation: Instant) -> Result<Arc<View>> {
+    async fn refresh(&self, scope: Scope, token: Token, preparation: Instant) -> Result<View> {
         ensure!(
             !self.inner.failure.is_cancelled() && Instant::now() < preparation,
             "catalog preparation failed or expired"
