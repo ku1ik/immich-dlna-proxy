@@ -441,7 +441,7 @@ impl Source {
 
         let duration = dto
             .duration
-            .filter(|ms| (0..=i32::MAX as i64).contains(ms))
+            .filter(|ms| *ms >= 0)
             .filter(|_| video)
             .map(|ms| {
                 format!(
@@ -1972,8 +1972,8 @@ mod snapshot_tests {
             (0, Some("0:00:00.000")),
             (3_661_007, Some("1:01:01.007")),
             (i32::MAX as i64, Some("596:31:23.647")),
+            (i32::MAX as i64 + 1, Some("596:31:23.648")),
             (-1, None),
-            (i32::MAX as i64 + 1, None),
         ] {
             let mut dto = asset(1, "VIDEO");
             dto["originalMimeType"] = Value::Null;
