@@ -1,5 +1,4 @@
 use std::{
-    ffi::CStr,
     fs::{self, OpenOptions},
     io::Read,
     net::{Ipv4Addr, SocketAddrV4},
@@ -60,13 +59,7 @@ pub struct Config {
     pub server_uuid: Uuid,
     pub state_directory: PathBuf,
     pub log_level: tracing::Level,
-    pub interface: Interface,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub struct Interface {
-    pub name: String,
-    pub index: u32,
+    pub interface_index: u32,
 }
 
 impl Config {
@@ -76,7 +69,7 @@ impl Config {
         let api_base = normalize_api_base(&settings.immich_url)?;
         let collator = collator(&settings.sort_locale)?;
         let api_key = read_key(&settings.immich_api_key_file)?;
-        let interface = resolve_interface(*settings.listen_address.ip())?;
+        let interface_index = resolve_interface(*settings.listen_address.ip())?;
 
         Ok(Self {
             api_base,
@@ -87,7 +80,7 @@ impl Config {
             server_uuid: settings.server_uuid,
             state_directory: settings.state_directory,
             log_level: settings.log_level.parse().expect("validated log level"),
-            interface,
+            interface_index,
         })
     }
 }
@@ -217,7 +210,7 @@ fn read_key(path: &Path) -> anyhow::Result<HeaderValue> {
     Ok(value)
 }
 
-pub fn resolve_interface(address: Ipv4Addr) -> anyhow::Result<Interface> {
+pub fn resolve_interface(address: Ipv4Addr) -> anyhow::Result<u32> {
     ensure!(
         is_unicast(address),
         "LAN address must be non-loopback unicast"
@@ -247,10 +240,7 @@ pub fn resolve_interface(address: Ipv4Addr) -> anyhow::Result<Interface> {
 
                 if local == address {
                     let index = libc::if_nametoindex(entry.ifa_name);
-                    let name = CStr::from_ptr(entry.ifa_name)
-                        .to_string_lossy()
-                        .into_owned();
-                    found.insert(index, (name, entry.ifa_flags));
+                    found.insert(index, entry.ifa_flags);
                 }
             }
 
@@ -264,7 +254,7 @@ pub fn resolve_interface(address: Ipv4Addr) -> anyhow::Result<Interface> {
         bail!("listen_address must identify exactly one local network interface");
     }
 
-    let (index, (name, flags)) = found.pop_first().expect("one interface");
+    let (index, flags) = found.pop_first().expect("one interface");
 
     ensure!(
         index != 0
@@ -274,7 +264,7 @@ pub fn resolve_interface(address: Ipv4Addr) -> anyhow::Result<Interface> {
         "configured interface must be up, non-loopback and multicast-capable"
     );
 
-    Ok(Interface { name, index })
+    Ok(index)
 }
 
 #[cfg(test)]

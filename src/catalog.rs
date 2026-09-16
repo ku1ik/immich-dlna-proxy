@@ -4006,10 +4006,7 @@ mod tests {
                 server_uuid: Uuid::from_u128(999),
                 state_directory: directory.to_owned(),
                 log_level: tracing::Level::INFO,
-                interface: crate::config::Interface {
-                    name: "test".into(),
-                    index: 1,
-                },
+                interface_index: 1,
             }
         }
 

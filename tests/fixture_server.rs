@@ -86,7 +86,7 @@ fn listen_address(value: &str) -> anyhow::Result<SocketAddrV4> {
 /// Validate local inputs and bind every service before starting discovery.
 pub async fn run(arguments: Arguments) -> anyhow::Result<()> {
     listen_address(&arguments.listen.to_string())?;
-    let interface = resolve_interface(*arguments.listen.ip())?;
+    let interface_index = resolve_interface(*arguments.listen.ip())?;
 
     let mode = match (
         arguments.seek_test,
@@ -104,7 +104,7 @@ pub async fn run(arguments: Arguments) -> anyhow::Result<()> {
 
     let discovery = Discovery::bind(
         *arguments.listen.ip(),
-        interface.index,
+        interface_index,
         bound.uuid,
         arguments.listen,
     )?;
