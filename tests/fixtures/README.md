@@ -227,14 +227,13 @@ and its configuration unchanged. No experiment flag is needed for playback-only.
 
 The device is named **DLNA Fixture Baseline**, containing **Mixed JPEG and H264
 AAC**, with fixed device UUID `30000000-0000-4000-8000-000000000001`.
-A loopback-only fake Immich serves the six files through the production
-proxy transport. No live API key or Immich connection is used. Fixed revisions
+A loopback-only fake Immich serves the six files through the production media
+proxy. No live API key or Immich connection is used. Fixed revisions
 are valid only for this immutable test catalog. The example is not installed as
 the production service.
 
 Keep the terminal output to identify requested resources and ranges. Use Ctrl-C
-to withdraw discovery advertisements and stop; admitted requests get at most ten
-seconds to finish. Restart with the same fixed fixture device identity. Since the
+to stop. Restart with the same fixed fixture device identity. Since the
 catalog uses fixed revisions, re-enter or refresh the fixture listing if a client
 has cached the earlier three-item album.
 
@@ -302,10 +301,10 @@ baseline items remain, with four additional videos:
 
 All use the **identical original MP4**, one resource, the same duration and MIME.
 A/B retain generic DIDL; C/D explicitly advertise byte seeking in the fourth
-`protocolInfo` field. Their media responses use the same bounded
-listener and real proxy. The extra listener uses the configured LAN address and
+`protocolInfo` field. Their media responses use the same bounded media operations
+and real proxy. The extra listener uses the configured LAN address and
 the next TCP port, so that port must also be reachable. Both listeners bind before
-discovery starts and retain the upstream until admitted streams drain.
+discovery starts.
 
 Test C, D and A: play and click the timeline near 20 seconds and then 5 seconds.
 Record warnings, actual position changes, audio, and request evidence. The visible

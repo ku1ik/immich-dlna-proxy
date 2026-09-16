@@ -6,8 +6,7 @@ use quick_xml::{
     name::{Namespace, NamespaceResolver, PrefixDeclaration, ResolveResult},
 };
 
-use crate::transport::HEADER_BYTES;
-
+pub const HEADER_BYTES: usize = 16 * 1024;
 pub(crate) const SOAP_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const SOAP_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const XML_DEPTH: usize = 32;

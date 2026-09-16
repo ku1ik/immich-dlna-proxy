@@ -222,8 +222,7 @@ terminates the service. Invalid or wrong-UUID `revisions.json` blocks startup; i
 initializes state only if the directory is otherwise empty. An uncommitted `revisions.tmp`
 is discarded only after loading valid committed state; other files are left untouched.
 Immich outages do not block startup: version checking occurs on first catalog access;
-requests can recover. SIGTERM/SIGINT withdraw discovery and allow ten seconds to drain
-admitted work.
+requests can recover.
 
 Configured state-directory symlinks are resolved once at startup; file operations use that
 resolved path. Live replacement/renaming of the directory or its parents and external state

@@ -1,24 +1,9 @@
 //! Fixture-only comparison of otherwise identical original-video responses.
 
-use std::sync::{Arc, Mutex};
-
 use axum::{Router, body::Body, extract::Request, response::Response};
 use http::{HeaderValue, Method, StatusCode, header};
-use hyper_util::{rt::TokioIo, service::TowerToHyperService};
-use immich_dlna_proxy::{
-    lifecycle::SHUTDOWN_GRACE,
-    media::MediaProxy,
-    server::{CONNECTIONS, HEADER_TIMEOUT, WRITE_IDLE_TIMEOUT},
-    transport::{self, HEADER_BYTES, WriteDeadline},
-};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::TcpListener,
-    sync::OwnedSemaphorePermit,
-    task::JoinSet,
-    time::{Instant, timeout_at},
-};
-use tokio_util::sync::CancellationToken;
+use immich_dlna_proxy::{media::MediaProxy, protocol::HEADER_BYTES};
+use tokio::net::TcpListener;
 
 const ASSET: &str = "20000000-0000-4000-8000-000000000003";
 const CAPABILITY: &str = "contentfeatures.dlna.org";
@@ -35,7 +20,7 @@ pub async fn response(media: &MediaProxy, request: Request) -> Response {
         _ => "rejected",
     };
 
-    let mut result = async {
+    let result = async {
         let header_bytes = parts.method.as_str().len()
             + parts.uri.to_string().len()
             + 14
@@ -103,10 +88,6 @@ pub async fn response(media: &MediaProxy, request: Request) -> Response {
     }
     .await;
 
-    result
-        .headers_mut()
-        .insert(header::CONNECTION, HeaderValue::from_static("close"));
-
     tracing::info!(
         case,
         status = result.status().as_u16(),
@@ -124,128 +105,16 @@ fn empty(status: StatusCode) -> Response {
     result
 }
 
-/// Stop accepting on cancellation, then drain admitted connections for one grace period.
-/// The caller must keep the upstream alive until this and the primary listener finish.
-pub async fn run(
-    listener: TcpListener,
-    media: MediaProxy,
-    shutdown: CancellationToken,
-) -> anyhow::Result<()> {
-    let mut tasks = JoinSet::new();
-    let mut failure = None;
-
-    loop {
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => break,
-
-            joined = tasks.join_next(), if !tasks.is_empty() => {
-                if let Some(Err(error)) = joined {
-                    failure = Some(anyhow::anyhow!("fixture seek connection task failed: {error}"));
-                    break;
-                }
-            }
-
-            accepted = listener.accept() => {
-                let (socket, _) = match accepted {
-                    Ok(accepted) => accepted,
-
-                    Err(error) => {
-                        failure = Some(anyhow::anyhow!("fixture seek listener accept failed: {error}"));
-                        break;
-                    }
-                };
-
-                if shutdown.is_cancelled() {
-                    break;
-                }
-
-                // Completed but unreaped tasks count too, bounding the results backlog.
-                if tasks.len() >= CONNECTIONS {
-                    let _ = socket.try_write(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-                    continue;
-                }
-
-                tasks.spawn(connection(socket, media.clone()));
-            }
-        }
-    }
-
-    drop(listener);
-
-    if failure.is_some() {
-        tasks.abort_all();
-    }
-
-    let deadline = Instant::now() + SHUTDOWN_GRACE;
-
-    while !tasks.is_empty() {
-        match timeout_at(deadline, tasks.join_next()).await {
-            Ok(Some(Err(error))) if error.is_panic() => {
-                failure = Some(anyhow::anyhow!(
-                    "fixture seek connection task panicked: {error}"
-                ));
-
-                tasks.abort_all();
-            }
-
-            Ok(_) => {}
-
-            Err(_) => {
-                tasks.abort_all();
-                break;
-            }
-        }
-    }
-
-    while let Some(joined) = tasks.join_next().await {
-        if let Err(error) = joined
-            && error.is_panic()
-        {
-            failure = Some(anyhow::anyhow!(
-                "fixture seek connection task panicked: {error}"
-            ));
-        }
-    }
-
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
-async fn connection<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(io: T, media: MediaProxy) {
-    let permit = Arc::new(Mutex::new(None));
-    let admitted = permit.clone();
-
+pub async fn run(listener: TcpListener, media: MediaProxy) -> anyhow::Result<()> {
     let router = Router::new().fallback(move |request| {
         let media = media.clone();
-        let admitted = admitted.clone();
 
-        async move {
-            let mut response = response(&media, request).await;
-
-            *admitted.lock().unwrap() = response
-                .extensions_mut()
-                .remove::<Arc<OwnedSemaphorePermit>>();
-
-            response
-        }
+        async move { response(&media, request).await }
     });
 
-    let transport = WriteDeadline::new(io, WRITE_IDLE_TIMEOUT);
+    axum::serve(listener, router).await?;
 
-    if transport::http1(HEADER_TIMEOUT)
-        .serve_connection(TokioIo::new(transport), TowerToHyperService::new(router))
-        .await
-        .is_err()
-    {
-        // Client framing, disconnects and timeouts are not listener failures.
-        tracing::debug!("fixture seek connection transport or framing failure");
-    }
-
-    // Hyper can consume the body before its buffered bytes reach the transport.
-    drop(permit);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -254,14 +123,14 @@ mod tests {
     use immich_dlna_proxy::media;
     use std::{
         io,
-        net::{Ipv4Addr, SocketAddr},
+        net::Ipv4Addr,
         sync::{Arc, Mutex},
         time::Duration,
     };
 
     use http::HeaderMap;
     use tokio::{
-        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+        io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
         task::JoinHandle,
         time::timeout,
@@ -273,7 +142,6 @@ mod tests {
     struct Upstream {
         media: MediaProxy,
         requests: Arc<Mutex<Vec<(Method, HeaderMap)>>>,
-        release: CancellationToken,
         task: JoinHandle<()>,
     }
 
@@ -291,12 +159,9 @@ mod tests {
 
             let requests = Arc::new(Mutex::new(Vec::new()));
             let recorded = requests.clone();
-            let release = CancellationToken::new();
-            let released = release.clone();
 
             let router = Router::new().fallback(move |request: Request| {
                 let recorded = recorded.clone();
-                let released = released.clone();
 
                 async move {
                     assert_eq!(
@@ -329,10 +194,6 @@ mod tests {
                     let condition = headers
                         .get(header::IF_NONE_MATCH)
                         .and_then(|value| value.to_str().ok());
-
-                    if condition == Some("\"headers\"") {
-                        released.cancelled().await;
-                    }
 
                     let range = headers
                         .get(header::RANGE)
@@ -382,7 +243,7 @@ mod tests {
                         Body::empty()
                     } else if condition == Some("\"stream\"") {
                         Body::from_stream(futures_util::stream::once(async move {
-                            released.cancelled().await;
+                            std::future::pending::<()>().await;
 
                             Ok::<_, io::Error>(bytes)
                         }))
@@ -403,7 +264,6 @@ mod tests {
             Self {
                 media,
                 requests,
-                release,
                 task,
             }
         }
@@ -512,7 +372,6 @@ mod tests {
                         .then(|| HeaderValue::from_static("DLNA.ORG_OP=01"))
                 );
 
-                assert_eq!(parts.headers[header::CONNECTION], "close");
                 assert!(!parts.headers.contains_key("x-api-key"));
                 assert!(!parts.headers.contains_key(header::SET_COOKIE));
                 let body = axum::body::to_bytes(body, 1024).await.unwrap();
@@ -576,7 +435,6 @@ mod tests {
             let request = Request::builder().uri(path).body(Body::empty()).unwrap();
             let result = response(&upstream.media, request).await;
             assert_eq!(result.status(), StatusCode::NOT_FOUND, "{path}");
-            assert_eq!(result.headers()[header::CONNECTION], "close");
             assert!(!result.headers().contains_key(CAPABILITY));
         }
 
@@ -683,11 +541,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_head_retains_admission_until_response_disposal() {
+    async fn direct_head_releases_admission_before_response_disposal() {
         let upstream = Upstream::start().await;
         let mut held = Vec::new();
 
-        for _ in 0..media::OPERATIONS {
+        for _ in 0..=media::OPERATIONS {
             let request = Request::builder()
                 .method(Method::HEAD)
                 .uri("/byte-seek")
@@ -696,24 +554,8 @@ mod tests {
 
             let result = response(&upstream.media, request).await;
             assert_eq!(result.status(), StatusCode::OK);
-
-            assert!(
-                result
-                    .extensions()
-                    .get::<Arc<OwnedSemaphorePermit>>()
-                    .is_some()
-            );
-
             held.push(result);
         }
-
-        let rejected = upstream
-            .media
-            .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
-            .await;
-
-        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
-        held.pop();
 
         let admitted = upstream
             .media
@@ -724,322 +566,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffered_responses_hold_per_connection_admission_until_teardown() {
-        for method in ["GET", "HEAD"] {
-            for finish in ["read", "disconnect", "cancel"] {
-                let upstream = Upstream::start().await;
-                let mut connections = Vec::new();
-
-                for _ in 0..media::OPERATIONS {
-                    let (mut client, io) = tokio::io::duplex(1);
-                    let task = tokio::spawn(connection(io, upstream.media.clone()));
-
-                    client
-                        .write_all(
-                            format!("{method} /byte-seek HTTP/1.1\r\nHost: fixture\r\n\r\n")
-                                .as_bytes(),
-                        )
-                        .await
-                        .unwrap();
-
-                    timeout(Duration::from_secs(2), async {
-                        if method == "GET" {
-                            let mut headers = Vec::new();
-
-                            while !headers.ends_with(b"\r\n\r\n") {
-                                headers.push(client.read_u8().await.unwrap());
-                                assert!(headers.len() < 2048);
-                            }
-
-                            assert!(headers.starts_with(b"HTTP/1.1 200 OK\r\n"));
-                            assert_eq!(client.read_u8().await.unwrap(), BYTES[0]);
-                        } else {
-                            assert_eq!(client.read_u8().await.unwrap(), b'H');
-                        }
-                    })
-                    .await
-                    .unwrap();
-
-                    assert!(!task.is_finished());
-                    connections.push((client, task));
-                }
-
-                let rejected = upstream
-                    .media
-                    .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
-                    .await;
-
-                assert_eq!(
-                    rejected.status(),
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "{method} {finish}"
-                );
-
-                for (mut client, task) in connections {
-                    match finish {
-                        "read" => {
-                            let mut rest = Vec::new();
-
-                            timeout(Duration::from_secs(2), client.read_to_end(&mut rest))
-                                .await
-                                .unwrap()
-                                .unwrap();
-
-                            if method == "GET" {
-                                assert_eq!(rest, &BYTES[1..]);
-                            }
-                        }
-
-                        "disconnect" => drop(client),
-
-                        "cancel" => task.abort(),
-
-                        _ => unreachable!(),
-                    }
-
-                    assert_eq!(
-                        timeout(Duration::from_secs(2), task)
-                            .await
-                            .unwrap()
-                            .is_err(),
-                        finish == "cancel"
-                    );
-                }
-
-                // All slots, not only the most recent connection's slot, must return.
-                let mut held = Vec::new();
-
-                for _ in 0..media::OPERATIONS {
-                    let result = upstream
-                        .media
-                        .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
-                        .await;
-
-                    assert_eq!(result.status(), StatusCode::OK, "{method} {finish}");
-                    held.push(result);
-                }
-            }
-        }
-    }
-
-    async fn wire(address: SocketAddr, request: &str) -> String {
-        let mut socket = TcpStream::connect(address).await.unwrap();
-        socket.write_all(request.as_bytes()).await.unwrap();
-        let mut result = String::new();
-
-        timeout(Duration::from_secs(2), socket.read_to_string(&mut result))
-            .await
-            .expect("one response must close the connection")
-            .unwrap();
-
-        result
-    }
-
-    #[tokio::test]
-    async fn tcp_reset_cancels_upstream_waiting_and_returns_all_admission() {
-        for condition in ["headers", "stream"] {
-            let upstream = Upstream::start().await;
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let stop = CancellationToken::new();
-            let task = tokio::spawn(run(listener, upstream.media.clone(), stop.clone()));
-            let mut clients = Vec::new();
-
-            for count in 1..=media::OPERATIONS {
-                let mut client = TcpStream::connect(address).await.unwrap();
-
-                client
-                    .write_all(format!("GET /byte-seek HTTP/1.1\r\nHost: fixture\r\nIf-None-Match: \"{condition}\"\r\n\r\n").as_bytes())
-                    .await
-                    .unwrap();
-
-                timeout(Duration::from_secs(2), async {
-                    while upstream.requests.lock().unwrap().len() < count {
-                        tokio::task::yield_now().await;
-                    }
-
-                    if condition == "stream" {
-                        let mut headers = Vec::new();
-
-                        while !headers.ends_with(b"\r\n\r\n") {
-                            headers.push(client.read_u8().await.unwrap());
-                            assert!(headers.len() < 2048);
-                        }
-
-                        assert!(headers.starts_with(b"HTTP/1.1 200 OK\r\n"));
-                    }
-                })
-                .await
-                .unwrap();
-
-                clients.push(client);
-            }
-
-            let rejected = upstream
-                .media
-                .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
-                .await;
-
-            assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-            for client in clients {
-                socket2::SockRef::from(&client)
-                    .set_linger(Some(Duration::ZERO))
-                    .unwrap();
-
-                drop(client);
-            }
-
-            let mut held = Vec::new();
-
-            timeout(Duration::from_secs(2), async {
-                while held.len() < media::OPERATIONS {
-                    let result = upstream
-                        .media
-                        .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
-                        .await;
-
-                    if result.status() == StatusCode::SERVICE_UNAVAILABLE {
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
-
-                    assert_eq!(result.status(), StatusCode::OK);
-                    held.push(result);
-                }
-            })
-            .await
-            .expect("disconnect must release admission before upstream deadlines");
-
-            stop.cancel();
-
-            timeout(Duration::from_secs(2), task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn listener_closes_after_one_response_and_leaves_upstream_alive() {
+    async fn client_disconnect_drops_streams_and_returns_all_admission() {
         let upstream = Upstream::start().await;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
-        let stop = CancellationToken::new();
-        let task = tokio::spawn(run(listener, upstream.media.clone(), stop.clone()));
+        let task = tokio::spawn(run(listener, upstream.media.clone()));
+        let mut clients = Vec::new();
 
-        for (path, capability) in [
-            ("/control", false),
-            ("/byte-seek", true),
-            ("/both", true),
-            ("/didl-only", false),
-        ] {
-            for method in ["GET", "HEAD"] {
-                let result = wire(address, &format!("{method} {path} HTTP/1.1\r\nHost: fixture\r\nConnection: keep-alive\r\n\r\nGET /byte-seek HTTP/1.1\r\nHost: fixture\r\n\r\n")).await;
-                let (headers, body) = result.split_once("\r\n\r\n").unwrap();
-                assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
-                assert!(headers.contains("connection: close"));
+        for count in 1..=media::OPERATIONS {
+            let mut client = TcpStream::connect(address).await.unwrap();
 
-                assert_eq!(
-                    headers.contains("contentfeatures.dlna.org: DLNA.ORG_OP=01"),
-                    capability
-                );
-
-                assert_eq!(
-                    body.as_bytes(),
-                    if method == "HEAD" { &[][..] } else { BYTES }
-                );
-            }
-        }
-
-        assert_eq!(upstream.requests.lock().unwrap().len(), 8);
-        stop.cancel();
-
-        timeout(Duration::from_secs(2), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-
-        assert!(TcpStream::connect(address).await.is_err());
-
-        let result = upstream
-            .media
-            .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
-            .await;
-
-        assert_eq!(result.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn admitted_stream_finishes_or_is_aborted_at_the_single_shutdown_deadline() {
-        for finish in [true, false] {
-            let upstream = Upstream::start().await;
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let stop = CancellationToken::new();
-            let task = tokio::spawn(run(listener, upstream.media.clone(), stop.clone()));
-            let mut socket = TcpStream::connect(address).await.unwrap();
-
-            socket
+            client
                 .write_all(b"GET /byte-seek HTTP/1.1\r\nHost: fixture\r\nIf-None-Match: \"stream\"\r\n\r\n")
                 .await
                 .unwrap();
 
-            let mut socket = BufReader::new(socket);
-            let mut headers = String::new();
-
             timeout(Duration::from_secs(2), async {
-                while !headers.ends_with("\r\n\r\n") {
-                    assert!(headers.len() < 2048);
-                    assert_ne!(socket.read_line(&mut headers).await.unwrap(), 0);
+                while upstream.requests.lock().unwrap().len() < count {
+                    tokio::task::yield_now().await;
                 }
+
+                let mut headers = Vec::new();
+
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(client.read_u8().await.unwrap());
+                    assert!(headers.len() < 2048);
+                }
+
+                assert!(headers.starts_with(b"HTTP/1.1 200 OK\r\n"));
             })
             .await
             .unwrap();
 
-            assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
-            assert!(!task.is_finished());
-
-            if !finish {
-                tokio::time::pause();
-            }
-
-            let started = Instant::now();
-            stop.cancel();
-            tokio::task::yield_now().await;
-            assert!(!task.is_finished());
-
-            if finish {
-                upstream.release.cancel();
-            }
-
-            timeout(SHUTDOWN_GRACE + Duration::from_secs(1), task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-
-            if !finish {
-                // Tokio rounds absolute deadlines up to its millisecond timer tick.
-                assert!(
-                    (SHUTDOWN_GRACE..=SHUTDOWN_GRACE + Duration::from_millis(1))
-                        .contains(&started.elapsed())
-                );
-
-                tokio::time::resume();
-            }
-
-            let mut body = Vec::new();
-
-            timeout(Duration::from_secs(2), socket.read_to_end(&mut body))
-                .await
-                .unwrap()
-                .unwrap();
-
-            assert_eq!(&body[..], if finish { BYTES } else { &[][..] });
-            assert!(TcpStream::connect(address).await.is_err());
+            clients.push(client);
         }
+
+        let rejected = upstream
+            .media
+            .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
+            .await;
+
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        for client in clients {
+            socket2::SockRef::from(&client)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+
+            drop(client);
+        }
+
+        let mut held = Vec::new();
+
+        timeout(Duration::from_secs(2), async {
+            while held.len() < media::OPERATIONS {
+                let result = upstream
+                    .media
+                    .serve(ASSET, "original", Method::GET, HeaderMap::new())
+                    .await;
+
+                if result.status() == StatusCode::SERVICE_UNAVAILABLE {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+
+                assert_eq!(result.status(), StatusCode::OK);
+                held.push(result);
+            }
+        })
+        .await
+        .expect("disconnect must drop streaming bodies before upstream deadlines");
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 }

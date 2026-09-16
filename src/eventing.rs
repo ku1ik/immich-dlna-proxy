@@ -13,11 +13,10 @@ use tokio::{
     sync::Notify,
     time::{Instant, timeout_at},
 };
-use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{protocol::Service, transport::HEADER_BYTES};
+use crate::protocol::{HEADER_BYTES, Service};
 
 pub(crate) const SUBSCRIPTIONS: usize = 32;
 const CALLBACK_URLS: usize = 4;
@@ -62,7 +61,6 @@ struct Subscription {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Initial {
-    ResponsePending,
     Owed,
     Delivering,
     Finished,
@@ -142,14 +140,13 @@ impl Subscriptions {
         self.wake.notify_one();
     }
 
-    /// Only new subscriptions return a transport-completion token.
     pub fn request(
         &self,
         service: Service,
         peer: Ipv4Addr,
         method: &Method,
         headers: &HeaderMap,
-    ) -> (Response, Option<Uuid>) {
+    ) -> Response {
         let result = (|| {
             if headers
                 .iter()
@@ -221,7 +218,7 @@ impl Subscriptions {
                 let granted = entry.lease;
                 state.expire(now);
 
-                return Ok((sid, granted, None));
+                return Ok((sid, granted));
             }
 
             if nt != Some("upnp:event") {
@@ -251,7 +248,7 @@ impl Subscriptions {
                 lease,
                 expires: now + lease,
                 active: true,
-                initial: Initial::ResponsePending,
+                initial: Initial::Owed,
                 system_update_id,
                 pending: None,
                 delivering: false,
@@ -259,24 +256,19 @@ impl Subscriptions {
                 next_attempt: now,
             });
 
-            Ok((sid, lease, Some(sid)))
+            Ok((sid, lease))
         })();
 
-        let mut response = Response::builder()
-            .header(header::CONTENT_LENGTH, "0")
-            .header(header::SERVER, crate::server_header())
-            .header(header::CONNECTION, "close");
+        let mut response = Response::builder().header(header::CONTENT_LENGTH, "0");
 
-        let token = match result {
-            Ok((sid, lease, token)) => {
+        match result {
+            Ok((sid, lease)) => {
                 response = response
                     .status(StatusCode::OK)
                     .header("sid", format!("uuid:{sid}"))
                     .header("timeout", format!("Second-{}", lease.as_secs()));
 
                 self.wake.notify_one();
-
-                token
             }
 
             Err(status) => {
@@ -285,10 +277,8 @@ impl Subscriptions {
                 if status == StatusCode::METHOD_NOT_ALLOWED {
                     response = response.header(header::ALLOW, "SUBSCRIBE, UNSUBSCRIBE");
                 }
-
-                None
             }
-        };
+        }
 
         let response = response.body(Body::empty()).unwrap();
 
@@ -304,39 +294,14 @@ impl Subscriptions {
             status = response.status().as_u16(),
             sid = ?response.headers().get("sid"),
             lease = ?response.headers().get("timeout"),
-            initial_response_pending = token.is_some(),
             "subscription response"
         );
 
-        (response, token)
-    }
-
-    /// Call exactly after the full response and TCP FIN complete, not body exhaustion.
-    /// Failure (including the server's response deadline) releases the reservation.
-    pub fn response_complete(&self, token: Uuid, success: bool) {
-        let mut state = self.state.lock().unwrap();
-
-        let Some(index) = state
-            .entries
-            .iter()
-            .position(|entry| entry.sid == token && entry.initial == Initial::ResponsePending)
-        else {
-            return;
-        };
-
-        if success {
-            state.entries[index].initial = Initial::Owed;
-        } else {
-            state.entries.remove(index);
-        }
-
-        drop(state);
-        self.wake.notify_one();
+        response
     }
 
     /// Runs the single bounded delivery scheduler. No catalog polling occurs.
-    /// Cancel separately from HTTP, after admitted responses finish or their shared grace expires.
-    pub async fn run(self, shutdown: CancellationToken) -> anyhow::Result<()> {
+    pub async fn run(self) -> anyhow::Result<()> {
         {
             let mut state = self.state.lock().unwrap();
 
@@ -352,10 +317,6 @@ impl Subscriptions {
         let mut deliveries = FuturesUnordered::new();
 
         loop {
-            if shutdown.is_cancelled() {
-                return Ok(());
-            }
-
             // Notify retains a permit if a request/publication races inspection and select.
             let notified = self.wake.notified();
 
@@ -430,8 +391,6 @@ impl Subscriptions {
 
             tokio::select! {
                 biased;
-                _ = shutdown.cancelled() => return Ok(()),
-
                 finished = deliveries.next(), if !deliveries.is_empty() => {
                     let (sid, deactivate) = finished.expect("nonempty delivery set");
                     let mut state = self.state.lock().unwrap();
@@ -674,6 +633,15 @@ mod tests {
         headers
     }
 
+    fn response_sid(response: &Response) -> Uuid {
+        response.headers()["sid"]
+            .to_str()
+            .unwrap()
+            .strip_prefix("uuid:")
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .unwrap()
+    }
+
     fn subscribe(subscriptions: &Subscriptions, lease: Option<&str>) -> (Response, Uuid) {
         let mut headers = headers(&[
             ("nt", "upnp:event"),
@@ -685,7 +653,7 @@ mod tests {
             headers.insert("timeout", lease.parse().unwrap());
         }
 
-        let (response, token) = subscriptions.request(
+        let response = subscriptions.request(
             SERVICE,
             PEER,
             &Method::from_bytes(b"SUBSCRIBE").unwrap(),
@@ -693,8 +661,9 @@ mod tests {
         );
 
         assert_eq!(response.status(), StatusCode::OK);
+        let sid = response_sid(&response);
 
-        (response, token.unwrap())
+        (response, sid)
     }
 
     fn sid_request(
@@ -711,16 +680,12 @@ mod tests {
             headers.insert("timeout", timeout.parse().unwrap());
         }
 
-        let (response, token) = subscriptions.request(
+        subscriptions.request(
             service,
             peer,
             &Method::from_bytes(method.as_bytes()).unwrap(),
             &headers,
-        );
-
-        assert!(token.is_none());
-
-        response
+        )
     }
 
     #[tokio::test(start_paused = true)]
@@ -736,8 +701,8 @@ mod tests {
             subscriptions.publish(42);
             let (response, sid) = subscribe(&subscriptions, requested);
             assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
-            assert_eq!(response.headers()[header::SERVER], crate::server_header());
-            assert_eq!(response.headers()[header::CONNECTION], "close");
+            assert!(!response.headers().contains_key(header::SERVER));
+            assert!(!response.headers().contains_key(header::CONNECTION));
             assert_eq!(response.headers()["sid"], format!("uuid:{sid}"));
             assert_eq!(response.headers()["timeout"], format!("Second-{expected}"));
             assert!(to_bytes(response.into_body(), 0).await.unwrap().is_empty());
@@ -751,7 +716,7 @@ mod tests {
             );
 
             assert_eq!(state.entries[0].system_update_id, 42);
-            assert!(state.entries[0].initial == Initial::ResponsePending);
+            assert!(state.entries[0].initial == Initial::Owed);
         }
     }
 
@@ -793,13 +758,12 @@ mod tests {
 
     #[test]
     fn concurrent_registration_captures_either_side_of_publication_atomically() {
-        let subscriptions = Subscriptions::new().unwrap();
-
         for _ in 0..64 {
+            let subscriptions = Subscriptions::new().unwrap();
             subscriptions.publish(7);
             let barrier = std::sync::Barrier::new(2);
 
-            let sid = std::thread::scope(|scope| {
+            std::thread::scope(|scope| {
                 scope.spawn(|| {
                     barrier.wait();
                     subscriptions.publish(8);
@@ -807,7 +771,7 @@ mod tests {
 
                 barrier.wait();
 
-                subscribe(&subscriptions, None).1
+                subscribe(&subscriptions, None);
             });
 
             {
@@ -819,8 +783,6 @@ mod tests {
                     (7, Some(8)) | (8, None)
                 ));
             }
-
-            subscriptions.response_complete(sid, false);
         }
     }
 
@@ -870,7 +832,7 @@ mod tests {
         ];
 
         for (method, values, expected) in cases {
-            let (response, token) = subscriptions.request(
+            let response = subscriptions.request(
                 SERVICE,
                 PEER,
                 &Method::from_bytes(method.as_bytes()).unwrap(),
@@ -879,9 +841,8 @@ mod tests {
 
             assert_eq!(response.status(), expected, "{method} {values:?}");
             assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
-            assert_eq!(response.headers()[header::CONNECTION], "close");
-            assert_eq!(response.headers()[header::SERVER], crate::server_header());
-            assert!(token.is_none());
+            assert!(!response.headers().contains_key(header::CONNECTION));
+            assert!(!response.headers().contains_key(header::SERVER));
         }
 
         for value in [
@@ -900,7 +861,7 @@ mod tests {
                 ("timeout", value),
             ]);
 
-            let (response, token) = subscriptions.request(
+            let response = subscriptions.request(
                 SERVICE,
                 PEER,
                 &Method::from_bytes(b"SUBSCRIBE").unwrap(),
@@ -908,10 +869,31 @@ mod tests {
             );
 
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{value}");
-            assert!(token.is_none());
         }
 
         assert!(subscriptions.state.lock().unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn subscription_capacity_is_bounded() {
+        let subscriptions = Subscriptions::new().unwrap();
+
+        for _ in 0..SUBSCRIPTIONS {
+            subscribe(&subscriptions, None);
+        }
+
+        let response = subscriptions.request(
+            SERVICE,
+            PEER,
+            &Method::from_bytes(b"SUBSCRIBE").unwrap(),
+            &headers(&[("nt", "upnp:event"), ("callback", "<http://192.168.1.20/>")]),
+        );
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            subscriptions.state.lock().unwrap().entries.len(),
+            SUBSCRIPTIONS
+        );
     }
 
     #[test]
@@ -930,7 +912,7 @@ mod tests {
             let mut values = vec![("nt", "upnp:event"), ("callback", "<http://192.168.1.20/>")];
             values.extend(extra);
 
-            let (response, token) = subscriptions.request(
+            let response = subscriptions.request(
                 SERVICE,
                 PEER,
                 &Method::from_bytes(b"SUBSCRIBE").unwrap(),
@@ -938,10 +920,9 @@ mod tests {
             );
 
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            assert!(token.is_none());
         }
 
-        let (response, token) = subscriptions.request(
+        let response = subscriptions.request(
             SERVICE,
             PEER,
             &Method::from_bytes(b"SUBSCRIBE").unwrap(),
@@ -953,7 +934,6 @@ mod tests {
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
         );
 
-        assert!(token.is_none());
         assert!(subscriptions.state.lock().unwrap().entries.is_empty());
     }
 
@@ -1024,7 +1004,6 @@ mod tests {
         let subscriptions = Subscriptions::new().unwrap();
         subscriptions.publish(42);
         let (_, sid) = subscribe(&subscriptions, Some("Second-10"));
-        subscriptions.response_complete(sid, true);
 
         for method in ["SUBSCRIBE", "UNSUBSCRIBE"] {
             for (service, peer, requested_sid) in [
@@ -1079,100 +1058,6 @@ mod tests {
         );
 
         assert_eq!(subscriptions.state.lock().unwrap().entries.len(), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pending_response_reservations_survive_unsubscribe_and_expiry_until_completion() {
-        for unsubscribe in [false, true] {
-            for success in [false, true] {
-                let subscriptions = Subscriptions::new().unwrap();
-                let (_, sid) = subscribe(&subscriptions, Some("Second-1"));
-                subscriptions.publish(1);
-
-                if unsubscribe {
-                    assert_eq!(
-                        sid_request(&subscriptions, sid, "UNSUBSCRIBE", SERVICE, PEER, None)
-                            .status(),
-                        StatusCode::OK
-                    );
-                } else {
-                    tokio::time::advance(Duration::from_secs(1)).await;
-                    subscriptions.state.lock().unwrap().expire(Instant::now());
-                }
-
-                {
-                    let state = subscriptions.state.lock().unwrap();
-                    assert_eq!(state.entries.len(), 1);
-                    assert!(!state.entries[0].active);
-                    assert!(state.entries[0].initial == Initial::ResponsePending);
-                    assert_eq!(state.entries[0].system_update_id, 0);
-                    assert_eq!(state.entries[0].pending, None);
-                }
-
-                subscriptions.response_complete(sid, success);
-                subscriptions.response_complete(sid, !success);
-                let state = subscriptions.state.lock().unwrap();
-                assert_eq!(state.entries.len(), usize::from(success));
-
-                if success {
-                    assert!(state.entries[0].initial == Initial::Owed);
-                    assert!(!state.entries[0].active);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn rapid_unsubscribe_cannot_grow_initial_obligations_past_capacity() {
-        let subscriptions = Subscriptions::new().unwrap();
-        let mut tokens = Vec::new();
-
-        for index in 0..SUBSCRIPTIONS {
-            let (_, sid) = subscribe(&subscriptions, None);
-
-            assert_eq!(
-                sid_request(&subscriptions, sid, "UNSUBSCRIBE", SERVICE, PEER, None).status(),
-                StatusCode::OK
-            );
-
-            if index % 2 == 0 {
-                subscriptions.response_complete(sid, true);
-            }
-
-            tokens.push(sid);
-        }
-
-        let (response, token) = subscriptions.request(
-            SERVICE,
-            PEER,
-            &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-            &headers(&[("nt", "upnp:event"), ("callback", "<http://192.168.1.20/>")]),
-        );
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(token.is_none());
-
-        assert_eq!(
-            subscriptions.state.lock().unwrap().entries.len(),
-            SUBSCRIPTIONS
-        );
-
-        subscriptions.response_complete(tokens[1], false);
-        subscribe(&subscriptions, None);
-
-        assert_eq!(
-            subscriptions.state.lock().unwrap().entries.len(),
-            SUBSCRIPTIONS
-        );
-
-        let subscriptions = Subscriptions::new().unwrap();
-
-        for _ in 0..100 {
-            let (_, sid) = subscribe(&subscriptions, None);
-            subscriptions.response_complete(sid, false);
-        }
-
-        assert!(subscriptions.state.lock().unwrap().entries.is_empty());
     }
 
     struct Callback {
@@ -1284,7 +1169,7 @@ mod tests {
         ) -> Uuid {
             let callbacks: String = paths.iter().map(|path| self.url(path)).collect();
 
-            let (response, token) = subscriptions.request(
+            let response = subscriptions.request(
                 service,
                 Ipv4Addr::LOCALHOST,
                 &Method::from_bytes(b"SUBSCRIBE").unwrap(),
@@ -1298,8 +1183,13 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::OK);
 
-            token.unwrap()
+            response_sid(&response)
         }
+    }
+
+    async fn abort_scheduler(task: JoinHandle<anyhow::Result<()>>) {
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     async fn finished(subscriptions: &Subscriptions, sid: Uuid) {
@@ -1327,23 +1217,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_completion_gates_captured_initial_event_and_renewal_does_not_replay() {
+    async fn initial_event_is_immediately_eligible_and_renewal_does_not_replay() {
         let subscriptions = Subscriptions::new().unwrap();
         subscriptions.publish(17);
         let mut callback = Callback::new().await;
         let sid = callback.register(&subscriptions, SERVICE, &["/event?q=a%26b"]);
-        let failed = callback.register(&subscriptions, SERVICE, &["/failed-response"]);
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), callback.received.recv())
-                .await
-                .is_err()
-        );
-
-        subscriptions.response_complete(failed, false);
-        subscriptions.response_complete(sid, true);
+        let task = tokio::spawn(subscriptions.clone().run());
         let (request, body) = callback.next().await;
         assert_eq!(request.method.as_str(), "NOTIFY");
         assert_eq!(request.uri.to_string(), "/event?q=a%26b");
@@ -1389,20 +1268,17 @@ mod tests {
             StatusCode::OK
         );
 
-        subscriptions.response_complete(sid, true);
-
         assert!(
             tokio::time::timeout(Duration::from_millis(30), callback.received.recv())
                 .await
                 .is_err()
         );
 
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
+        abort_scheduler(task).await;
     }
 
     #[tokio::test]
-    async fn pending_during_response_and_initial_coalesces_and_final_event_flushes_on_timer() {
+    async fn pending_during_initial_coalesces_and_final_event_flushes_on_timer() {
         let subscriptions = Subscriptions::new().unwrap();
         subscriptions.publish(10);
         let mut callback = Callback::new().await;
@@ -1410,24 +1286,25 @@ mod tests {
         subscriptions.publish(11);
         subscriptions.publish(12);
         let cm = callback.register(&subscriptions, Service::ConnectionManager, &["/cm"]);
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
+        let task = tokio::spawn(subscriptions.clone().run());
+        let mut initial = std::collections::BTreeSet::new();
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), callback.received.recv())
-                .await
-                .is_err()
-        );
+        for _ in 0..2 {
+            let (request, body) = callback.next().await;
+            let sid_header = request.headers["sid"].to_str().unwrap();
+            assert_eq!(request.headers["seq"], "0");
 
-        subscriptions.response_complete(cm, true);
-        let (request, body) = callback.next().await;
-        assert_eq!(request.headers["seq"], "0");
-        assert_eq!(body, event_body(Service::ConnectionManager, 12));
+            if sid_header == format!("uuid:{sid}") {
+                assert_eq!(body, event_body(SERVICE, 10));
+                assert!(initial.insert(sid));
+            } else {
+                assert_eq!(sid_header, format!("uuid:{cm}"));
+                assert_eq!(body, event_body(Service::ConnectionManager, 12));
+                assert!(initial.insert(cm));
+            }
+        }
+
         finished(&subscriptions, cm).await;
-        subscriptions.response_complete(sid, true);
-        let (request, body) = callback.next().await;
-        assert_eq!(request.headers["seq"], "0");
-        assert_eq!(body, event_body(SERVICE, 10));
 
         assert_eq!(
             subscriptions
@@ -1490,7 +1367,7 @@ mod tests {
                 .is_err()
         );
 
-        // No publication, request, or completion wakes the scheduler after this point.
+        // No publication or request wakes the scheduler after this point.
         let (request, body) = callback.next().await;
         assert!(Instant::now() >= deadline);
         assert_eq!(request.headers["seq"], "2");
@@ -1510,8 +1387,7 @@ mod tests {
         }
 
         assert!(callback.received.try_recv().is_err());
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
+        abort_scheduler(task).await;
     }
 
     #[tokio::test]
@@ -1519,9 +1395,7 @@ mod tests {
         let subscriptions = Subscriptions::new().unwrap();
         let mut callback = Callback::new().await;
         let sid = callback.register(&subscriptions, SERVICE, &["/gated-fail", "/fail"]);
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
-        subscriptions.response_complete(sid, true);
+        let task = tokio::spawn(subscriptions.clone().run());
 
         for (id, seq, future) in [(0, 0, None), (8, u32::MAX, Some(9)), (9, 1, None)] {
             let (request, body) = callback.next().await;
@@ -1574,8 +1448,7 @@ mod tests {
                 .is_err()
         );
 
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
+        abort_scheduler(task).await;
     }
 
     #[tokio::test]
@@ -1587,12 +1460,10 @@ mod tests {
 
         for _ in 0..SUBSCRIPTIONS {
             let sid = callback.register(&subscriptions, SERVICE, &["/gated"]);
-            subscriptions.response_complete(sid, true);
             tokens.push(sid);
         }
 
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
+        let task = tokio::spawn(subscriptions.clone().run());
 
         for _ in &tokens {
             assert_eq!(callback.next().await.0.headers["seq"], "0");
@@ -1677,133 +1548,77 @@ mod tests {
             );
         }
 
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
+        abort_scheduler(task).await;
         assert!(subscriptions.state.lock().unwrap().entries.is_empty());
     }
 
     #[tokio::test]
-    async fn continuing_churn_cannot_starve_an_old_inactive_initial_obligation() {
+    async fn inactive_initial_obligations_remain_eligible_behind_bounded_deliveries() {
         for unsubscribe in [false, true] {
             let subscriptions = Subscriptions::new().unwrap();
             subscriptions.publish(17);
             let mut callback = Callback::new().await;
+            let mut inflight = Vec::new();
 
-            let register = |callback: &Callback| {
-                let sid = callback.register(&subscriptions, SERVICE, &["/gated"]);
-
-                if unsubscribe {
-                    assert_eq!(
-                        sid_request(
-                            &subscriptions,
-                            sid,
-                            "UNSUBSCRIBE",
-                            SERVICE,
-                            Ipv4Addr::LOCALHOST,
-                            None
-                        )
-                        .status(),
-                        StatusCode::OK
-                    );
-                } else {
-                    let mut state = subscriptions.state.lock().unwrap();
-
-                    let entry = state
-                        .entries
-                        .iter_mut()
-                        .find(|entry| entry.sid == sid)
-                        .unwrap();
-
-                    entry.expires = Instant::now();
-                    state.expire(Instant::now());
-                }
-
-                sid
-            };
-
-            let target = register(&callback);
-            let shutdown = CancellationToken::new();
-            let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
-            let mut inflight = std::collections::VecDeque::new();
-
-            // Leave T response-pending while S1, S2, S3 and B fill the slots.
-            for _ in 0..3 {
-                let sid = register(&callback);
-                subscriptions.response_complete(sid, true);
-
-                assert_eq!(
-                    callback.next().await.0.headers["sid"],
-                    format!("uuid:{sid}")
-                );
-
-                inflight.push_back(sid);
+            for _ in 0..DELIVERIES {
+                inflight.push(callback.register(&subscriptions, SERVICE, &["/gated"]));
             }
 
-            let waiting = register(&callback);
-            let last = register(&callback);
-            subscriptions.response_complete(last, true);
+            let task = tokio::spawn(subscriptions.clone().run());
 
-            assert_eq!(
-                callback.next().await.0.headers["sid"],
-                format!("uuid:{last}")
-            );
+            let mut seen = std::collections::BTreeSet::new();
 
-            inflight.push_back(last);
-            subscriptions.response_complete(target, true);
-            subscriptions.response_complete(waiting, true);
-            let mut seen: std::collections::BTreeSet<_> = inflight.iter().copied().collect();
-
-            // Removing one completed delivery, then appending 2, 1, 0 entries
-            // repeatedly keeps the old numeric cursor skipping T indefinitely.
-            for turn in 0..36 {
-                callback.release.add_permits(1);
-                let (request, body) = callback.next().await;
-
-                let sid = Uuid::parse_str(
-                    request.headers["sid"]
+            for _ in &inflight {
+                seen.insert(
+                    callback.next().await.0.headers["sid"]
                         .to_str()
                         .unwrap()
-                        .strip_prefix("uuid:")
-                        .unwrap(),
-                )
-                .unwrap();
-
-                assert!(seen.insert(sid));
-                assert_eq!(request.headers["seq"], "0");
-                assert_eq!(body, event_body(SERVICE, 17));
-                let completed = inflight.pop_front().unwrap();
-                inflight.push_back(sid);
-
-                for _ in 0..2 - turn % 3 {
-                    let sid = register(&callback);
-                    subscriptions.response_complete(sid, true);
-                }
-
-                let state = subscriptions.state.lock().unwrap();
-                assert!((6..=7).contains(&state.entries.len()));
-                assert!(state.entries.iter().all(|entry| !entry.active));
-                assert!(state.entries.iter().all(|entry| entry.sid != completed));
-
-                assert!(inflight.iter().all(|sid| {
-                    state
-                        .entries
-                        .iter()
-                        .any(|entry| entry.sid == *sid && entry.delivering)
-                }));
-
-                assert_eq!(
-                    state
-                        .entries
-                        .iter()
-                        .filter(|entry| entry.delivering)
-                        .count(),
-                    DELIVERIES
+                        .to_owned(),
                 );
             }
 
-            shutdown.cancel();
-            task.await.unwrap().unwrap();
-            assert!(seen.contains(&target), "old T must not starve during churn");
+            assert_eq!(
+                seen,
+                inflight.iter().map(|sid| format!("uuid:{sid}")).collect()
+            );
+
+            let target = callback.register(&subscriptions, SERVICE, &["/gated"]);
+
+            if unsubscribe {
+                assert_eq!(
+                    sid_request(
+                        &subscriptions,
+                        target,
+                        "UNSUBSCRIBE",
+                        SERVICE,
+                        Ipv4Addr::LOCALHOST,
+                        None
+                    )
+                    .status(),
+                    StatusCode::OK
+                );
+            } else {
+                let mut state = subscriptions.state.lock().unwrap();
+                let entry = state
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.sid == target)
+                    .unwrap();
+
+                entry.expires = Instant::now();
+                state.expire(Instant::now());
+            }
+
+            for _ in 0..8 {
+                callback.register(&subscriptions, SERVICE, &["/gated"]);
+            }
+
+            callback.release.add_permits(1);
+            let (request, body) = callback.next().await;
+            assert_eq!(request.headers["sid"], format!("uuid:{target}"));
+            assert_eq!(request.headers["seq"], "0");
+            assert_eq!(body, event_body(SERVICE, 17));
+            abort_scheduler(task).await;
         }
     }
 
@@ -1814,9 +1629,7 @@ mod tests {
                 let subscriptions = Subscriptions::new().unwrap();
                 let mut callback = Callback::new().await;
                 let sid = callback.register(&subscriptions, SERVICE, &["/gated"]);
-                let shutdown = CancellationToken::new();
-                let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
-                subscriptions.response_complete(sid, true);
+                let task = tokio::spawn(subscriptions.clone().run());
                 assert_eq!(callback.next().await.0.headers["seq"], "0");
 
                 if !initial {
@@ -1862,8 +1675,7 @@ mod tests {
                 finished(&subscriptions, sid).await;
                 assert!(subscriptions.state.lock().unwrap().entries.is_empty());
                 assert!(callback.received.try_recv().is_err());
-                shutdown.cancel();
-                task.await.unwrap().unwrap();
+                abort_scheduler(task).await;
             }
         }
     }
@@ -1936,9 +1748,7 @@ mod tests {
             &["/redirect", "/fail", "/ok", "/unused"],
         );
 
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
-        subscriptions.response_complete(sid, true);
+        let task = tokio::spawn(subscriptions.clone().run());
 
         for path in ["/redirect", "/fail", "/ok"] {
             let (request, body) = callback.next().await;
@@ -1951,8 +1761,7 @@ mod tests {
         finished(&subscriptions, sid).await;
         assert!(callback.received.try_recv().is_err());
         assert!(subscriptions.state.lock().unwrap().entries[0].active);
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
+        abort_scheduler(task).await;
     }
 
     #[tokio::test]
@@ -1967,9 +1776,7 @@ mod tests {
             &["/oversized", "/chunked", "/reject", "/unused"],
         );
 
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
-        subscriptions.response_complete(sid, true);
+        let task = tokio::spawn(subscriptions.clone().run());
 
         for path in ["/oversized", "/chunked", "/reject"] {
             assert_eq!(callback.next().await.0.uri.path(), path);
@@ -1978,8 +1785,7 @@ mod tests {
         finished(&subscriptions, sid).await;
         assert!(subscriptions.state.lock().unwrap().entries.is_empty());
         assert!(callback.received.try_recv().is_err());
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
+        abort_scheduler(task).await;
     }
 
     #[tokio::test]
@@ -2002,10 +1808,7 @@ mod tests {
             StatusCode::OK
         );
 
-        subscriptions.response_complete(inactive, true);
-        subscriptions.response_complete(active, true);
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
+        let task = tokio::spawn(subscriptions.clone().run());
         callback.next().await;
         callback.next().await;
         finished(&subscriptions, inactive).await;
@@ -2032,18 +1835,16 @@ mod tests {
         );
 
         assert!(subscriptions.state.lock().unwrap().entries.is_empty());
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
+        abort_scheduler(task).await;
     }
 
     #[tokio::test]
-    async fn delivery_concurrency_is_bounded_and_shutdown_drops_work() {
+    async fn delivery_concurrency_is_bounded_and_scheduler_is_single_run() {
         let subscriptions = Subscriptions::new().unwrap();
         let mut callback = Callback::new().await;
 
         for _ in 0..SUBSCRIPTIONS {
             let sid = callback.register(&subscriptions, SERVICE, &["/slow-headers"]);
-            subscriptions.response_complete(sid, true);
 
             assert_eq!(
                 sid_request(
@@ -2059,8 +1860,7 @@ mod tests {
             );
         }
 
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
+        let task = tokio::spawn(subscriptions.clone().run());
 
         for _ in 0..DELIVERIES {
             callback.next().await;
@@ -2086,35 +1886,10 @@ mod tests {
             );
         }
 
-        assert!(
-            subscriptions
-                .clone()
-                .run(CancellationToken::new())
-                .await
-                .is_err()
-        );
+        assert!(subscriptions.clone().run().await.is_err());
 
-        shutdown.cancel();
-
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-
-        assert!(subscriptions.state.lock().unwrap().entries.is_empty());
-        assert!(subscriptions.state.lock().unwrap().stopped);
+        abort_scheduler(task).await;
         assert!(callback.received.try_recv().is_err());
-
-        let (response, token) = subscriptions.request(
-            SERVICE,
-            PEER,
-            &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-            &headers(&[("nt", "upnp:event"), ("callback", "<http://192.168.1.20/>")]),
-        );
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(token.is_none());
     }
 
     #[tokio::test]
@@ -2126,9 +1901,7 @@ mod tests {
             let subscriptions = Subscriptions::new().unwrap();
             let mut callback = Callback::new().await;
             let sid = callback.register(&subscriptions, SERVICE, &[path, "/fail"]);
-            let shutdown = CancellationToken::new();
-            let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
-            subscriptions.response_complete(sid, true);
+            let task = tokio::spawn(subscriptions.clone().run());
             assert_eq!(callback.next().await.0.uri.path(), path);
             tokio::time::pause();
             tokio::time::advance(deadline).await;
@@ -2136,8 +1909,7 @@ mod tests {
             assert_eq!(callback.next().await.0.uri.path(), "/fail");
             finished(&subscriptions, sid).await;
             assert!(subscriptions.state.lock().unwrap().entries[0].active);
-            shutdown.cancel();
-            task.await.unwrap().unwrap();
+            abort_scheduler(task).await;
         }
     }
 
@@ -2193,7 +1965,7 @@ mod tests {
                     callback.url("/unused")
                 );
 
-                let (response, token) = subscriptions.request(
+                let response = subscriptions.request(
                     SERVICE,
                     Ipv4Addr::LOCALHOST,
                     &Method::from_bytes(b"SUBSCRIBE").unwrap(),
@@ -2201,10 +1973,8 @@ mod tests {
                 );
 
                 assert_eq!(response.status(), StatusCode::OK);
-                let sid = token.unwrap();
-                subscriptions.response_complete(sid, true);
-                let shutdown = CancellationToken::new();
-                let scheduler = subscriptions.clone().run(shutdown.clone());
+                let sid = response_sid(&response);
+                let scheduler = subscriptions.clone().run();
                 tokio::pin!(scheduler);
                 let wake = Arc::new(CallbackWake(Notify::new()));
                 let waker = std::task::Waker::from(wake.clone());
@@ -2343,9 +2113,6 @@ mod tests {
                     assert_eq!(entry.next_seq, seq + 1);
                     assert_eq!(entry.pending, None);
                 }
-
-                shutdown.cancel();
-                scheduler.await.unwrap();
             }
         }
 
@@ -2356,8 +2123,7 @@ mod tests {
     #[tokio::test]
     async fn callback_port_churn_closes_keep_alive_sockets_after_delivery() {
         let subscriptions = Subscriptions::new().unwrap();
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
+        let task = tokio::spawn(subscriptions.clone().run());
         let mut listeners = Vec::new();
         let mut sockets = Vec::new();
 
@@ -2369,7 +2135,7 @@ mod tests {
         for listener in &listeners {
             let callback = format!("<http://{}/events>", listener.local_addr().unwrap());
 
-            let (response, token) = subscriptions.request(
+            let response = subscriptions.request(
                 SERVICE,
                 Ipv4Addr::LOCALHOST,
                 &Method::from_bytes(b"SUBSCRIBE").unwrap(),
@@ -2377,8 +2143,7 @@ mod tests {
             );
 
             assert_eq!(response.status(), StatusCode::OK);
-            let sid = token.unwrap();
-            subscriptions.response_complete(sid, true);
+            let sid = response_sid(&response);
 
             let socket = tokio::time::timeout(Duration::from_secs(3), async {
                 let (socket, _) = listener.accept().await.unwrap();
@@ -2430,7 +2195,7 @@ mod tests {
             sockets.push(socket);
         }
 
-        // Neither the callback servers nor scheduler shutdown may cause these EOFs.
+        // Callback servers remain alive while the client closes idle sockets.
         for socket in &mut sockets {
             let mut byte = [0];
 
@@ -2442,8 +2207,7 @@ mod tests {
             assert_eq!(read, 0);
         }
 
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
+        abort_scheduler(task).await;
     }
 
     #[tokio::test]
@@ -2456,22 +2220,13 @@ mod tests {
             subscriptions.publish(id);
             let sid = callback.register(&subscriptions, SERVICE, &["/ok"]);
             tokens.push(sid);
-
-            if id % 2 == 0 {
-                subscriptions.response_complete(sid, true);
-            }
         }
 
         tokio::time::pause();
         tokio::time::advance(SUBSCRIPTION_LEASE).await;
         tokio::time::resume();
 
-        for sid in &tokens {
-            subscriptions.response_complete(*sid, true);
-        }
-
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
+        let task = tokio::spawn(subscriptions.clone().run());
         let mut seen = std::collections::BTreeSet::new();
 
         for _ in 0..SUBSCRIPTIONS {
@@ -2485,10 +2240,7 @@ mod tests {
         }
 
         assert!(subscriptions.state.lock().unwrap().entries.is_empty());
-        let (_, sid) = subscribe(&subscriptions, None);
-        subscriptions.response_complete(sid, false);
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
+        abort_scheduler(task).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -2496,8 +2248,7 @@ mod tests {
         let subscriptions = Subscriptions::new().unwrap();
         let (_, sid) = subscribe(&subscriptions, None);
         subscriptions.state.lock().unwrap().entries[0].initial = Initial::Finished;
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(subscriptions.clone().run(shutdown.clone()));
+        let task = tokio::spawn(subscriptions.clone().run());
         tokio::task::yield_now().await;
 
         let response = sid_request(
@@ -2514,8 +2265,6 @@ mod tests {
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
         assert!(subscriptions.state.lock().unwrap().entries.is_empty());
-        subscriptions.response_complete(sid, true);
-        shutdown.cancel();
-        task.await.unwrap().unwrap();
+        abort_scheduler(task).await;
     }
 }

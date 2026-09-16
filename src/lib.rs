@@ -8,7 +8,6 @@ mod mime;
 pub mod protocol;
 pub mod server;
 pub mod ssdp;
-pub mod transport;
 
 pub fn server_header() -> &'static str {
     static HEADER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {

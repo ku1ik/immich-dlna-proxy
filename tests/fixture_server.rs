@@ -1,4 +1,4 @@
-//! Runnable fixture server and loopback-only integration tests for the production transport.
+//! Runnable fixture server and loopback-only integration tests for the production HTTP stack.
 
 mod fixture_catalog;
 
@@ -6,23 +6,19 @@ mod fixture_catalog;
 mod seek;
 
 use std::{
-    future::Future,
     io::{self, SeekFrom},
     net::{Ipv4Addr, SocketAddrV4},
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use anyhow::{Context, ensure};
 use axum::{Router, body::Body, extract::Request, response::Response};
 use clap::Parser;
-use futures_util::StreamExt;
 use http::{HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
     catalog::{BrowseResult, Catalog, ObjectId, parse_id},
     config::{is_unicast, resolve_interface},
     eventing::Subscriptions,
-    lifecycle::{self, SHUTDOWN_GRACE},
     media::MediaProxy,
     protocol::{BrowseArguments, Fault, Object},
     server::Server,
@@ -32,10 +28,7 @@ use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt},
     net::TcpListener,
-    task::JoinSet,
-    time::Instant,
 };
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const SERVER_UUID: Uuid = Uuid::from_u128(0x30000000_0000_4000_8000_000000000001);
@@ -93,7 +86,6 @@ fn listen_address(value: &str) -> anyhow::Result<SocketAddrV4> {
 pub async fn run(arguments: Arguments) -> anyhow::Result<()> {
     listen_address(&arguments.listen.to_string())?;
     let interface = resolve_interface(*arguments.listen.ip())?;
-    let shutdown = lifecycle::shutdown_signal()?;
 
     let mode = match (
         arguments.seek_test,
@@ -118,7 +110,7 @@ pub async fn run(arguments: Arguments) -> anyhow::Result<()> {
 
     tracing::info!(listen = %arguments.listen, upstream = %bound.upstream.local_addr()?, uuid = %bound.uuid, ?mode, "fixture server ready");
 
-    bound.run(Some(discovery), shutdown).await
+    bound.run(Some(discovery)).await
 }
 
 async fn validate_fixtures(directory: &Path, mode: FixtureMode) -> anyhow::Result<()> {
@@ -297,12 +289,7 @@ fn file_range(value: &str, length: u64) -> Result<(u64, u64), StatusCode> {
     Ok((start, end.min(length - 1)))
 }
 
-async fn upstream_request(
-    directory: PathBuf,
-    request: Request,
-    stop: CancellationToken,
-    mode: FixtureMode,
-) -> Response {
+async fn upstream_request(directory: PathBuf, request: Request, mode: FixtureMode) -> Response {
     let (parts, _) = request.into_parts();
 
     let empty = |status| {
@@ -440,9 +427,7 @@ async fn upstream_request(
                 Ok(Some((bytes, (file, remaining - read as u64))))
             });
 
-        Ok(builder
-            .body(Body::from_stream(stream.take_until(stop.cancelled_owned())))
-            .unwrap())
+        Ok(builder.body(Body::from_stream(stream)).unwrap())
     }
     .await;
 
@@ -552,57 +537,27 @@ impl Bound {
         })
     }
 
-    async fn run(
-        self,
-        discovery: Option<Discovery>,
-        shutdown: impl Future<Output = ()>,
-    ) -> anyhow::Result<()> {
-        let stop = CancellationToken::new();
-        let upstream_stop = CancellationToken::new();
-        let subscriptions_stop = CancellationToken::new();
-        let mut tasks = JoinSet::new();
+    async fn run(self, discovery: Option<Discovery>) -> anyhow::Result<()> {
         let directory = self.directory;
         let mode = self.mode;
-        let token = upstream_stop.clone();
 
         let router = Router::new().fallback(move |request| {
             let directory = directory.clone();
-            let token = token.clone();
 
-            async move {
-                tokio::select! {
-                    biased;
-                    _ = token.cancelled() => Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .body(Body::empty())
-                        .unwrap(),
-
-                    response = upstream_request(directory, request, token.clone(), mode) => response,
-                }
-            }
+            upstream_request(directory, request, mode)
         });
-
-        let token = upstream_stop.clone();
 
         let upstream = async move {
             axum::serve(self.upstream, router)
-                .with_graceful_shutdown(token.cancelled_owned())
                 .await
                 .context("fixture upstream failed")
         };
 
-        spawn(&mut tasks, "upstream", upstream_stop.clone(), upstream);
-
-        let http_stop = stop.clone();
-
         let http = async move {
-            let primary = self
-                .server
-                .run(self.http, http_stop.clone(), SHUTDOWN_GRACE);
+            let primary = self.server.run(self.http);
 
             if let Some((listener, media)) = self.seek {
-                // The shared upstream must outlive admitted streams on both listeners.
-                tokio::try_join!(primary, seek::run(listener, media, http_stop))?;
+                tokio::try_join!(primary, seek::run(listener, media))?;
             } else {
                 primary.await?;
             }
@@ -610,25 +565,25 @@ impl Bound {
             Ok(())
         };
 
-        spawn(&mut tasks, "HTTP", stop.clone(), http);
+        let subscriptions = self.subscriptions.run();
+        let discovery = async move {
+            match discovery {
+                Some(discovery) => discovery.run().await,
+                None => std::future::pending().await,
+            }
+        };
 
-        spawn(
-            &mut tasks,
-            "subscriptions",
-            subscriptions_stop.clone(),
-            self.subscriptions.run(subscriptions_stop.clone()),
-        );
+        let (name, result) = tokio::select! {
+            result = upstream => ("upstream", result),
+            result = http => ("HTTP", result),
+            result = subscriptions => ("subscriptions", result),
+            result = discovery => ("SSDP", result),
+        };
 
-        if let Some(discovery) = discovery {
-            spawn(
-                &mut tasks,
-                "SSDP",
-                stop.clone(),
-                discovery.run(stop.clone()),
-            );
+        match result {
+            Ok(()) => anyhow::bail!("{name} fixture service exited unexpectedly"),
+            Err(error) => Err(error.context(format!("{name} fixture service failed"))),
         }
-
-        supervise(tasks, stop, upstream_stop, subscriptions_stop, shutdown).await
     }
 }
 
@@ -671,112 +626,11 @@ fn seek_objects(address: SocketAddrV4, seek_address: SocketAddrV4) -> Vec<Object
     objects
 }
 
-type TaskResult = (&'static str, bool, anyhow::Result<()>);
-
-fn spawn(
-    tasks: &mut JoinSet<TaskResult>,
-    name: &'static str,
-    stop: CancellationToken,
-    future: impl Future<Output = anyhow::Result<()>> + Send + 'static,
-) {
-    tasks.spawn(async move {
-        let result = future.await;
-
-        (name, stop.is_cancelled(), result)
-    });
-}
-
-async fn supervise(
-    mut tasks: JoinSet<TaskResult>,
-    stop: CancellationToken,
-    upstream_stop: CancellationToken,
-    subscriptions_stop: CancellationToken,
-    shutdown: impl Future<Output = ()>,
-) -> anyhow::Result<()> {
-    tokio::pin!(shutdown);
-    let mut stopping = false;
-    let mut failure = None;
-    let mut deadline = None;
-
-    while !tasks.is_empty() {
-        let expired = async {
-            match deadline {
-                Some(deadline) => tokio::time::sleep_until(deadline).await,
-                None => std::future::pending().await,
-            }
-        };
-
-        tokio::select! {
-            biased;
-            joined = tasks.join_next() => {
-                let error = match joined.expect("nonempty essential tasks") {
-                    Ok((name, expected, result)) => {
-                        if name == "HTTP" {
-                            upstream_stop.cancel();
-                        }
-
-                        match result {
-                            Err(error) => Some(error.context(format!("{name} task failed"))),
-                            Ok(()) if !expected => Some(anyhow::anyhow!("{name} task exited prematurely")),
-                            Ok(()) => None,
-                        }
-                    }
-
-                    Err(error) => Some(anyhow::anyhow!("essential task panicked or was cancelled: {error}")),
-                };
-
-                if let Some(error) = error {
-                    failure.get_or_insert(error);
-                    stop.cancel();
-                    upstream_stop.cancel();
-                    subscriptions_stop.cancel();
-                    stopping = true;
-                    let cleanup = Instant::now() + Duration::from_secs(1);
-                    deadline = Some(deadline.map_or(cleanup, |deadline| deadline.min(cleanup)));
-                }
-            }
-
-            _ = &mut shutdown, if !stopping => {
-                stopping = true;
-                stop.cancel();
-                // Reservations can become owed after admission stops. Keep their scheduler
-                // alive for the remainder of this one grace period, even if HTTP finishes early.
-                deadline = Some(Instant::now() + SHUTDOWN_GRACE);
-            }
-
-            _ = expired => {
-                stop.cancel();
-                upstream_stop.cancel();
-                subscriptions_stop.cancel();
-                tasks.abort_all();
-
-                while let Some(joined) = tasks.join_next().await {
-                    match joined {
-                        Err(error) if error.is_panic() => {
-                            failure.get_or_insert_with(|| anyhow::anyhow!("essential task panicked: {error}"));
-                        }
-
-                        Ok((name, _, Err(error))) => {
-                            failure.get_or_insert_with(|| error.context(format!("{name} task failed")));
-                        }
-
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
-    use anyhow::bail;
     use fixture_catalog::{ALBUM_ID, GENERATED_JPEG_ID, ORIGINAL_JPEG_ID, VIDEO_ID};
     use immich_dlna_proxy::protocol::{self, Filter, Service};
 
@@ -785,7 +639,6 @@ mod tests {
         address: SocketAddrV4,
         upstream: String,
         client: reqwest::Client,
-        stop: CancellationToken,
         task: tokio::task::JoinHandle<anyhow::Result<()>>,
     }
 
@@ -846,8 +699,7 @@ mod tests {
                 );
             }
 
-            let stop = CancellationToken::new();
-            let task = tokio::spawn(bound.run(None, stop.clone().cancelled_owned()));
+            let task = tokio::spawn(bound.run(None));
 
             let client = reqwest::Client::builder()
                 .no_proxy()
@@ -861,7 +713,6 @@ mod tests {
                 address,
                 upstream,
                 client,
-                stop,
                 task,
             }
         }
@@ -927,19 +778,13 @@ mod tests {
         }
 
         async fn finish(mut self) {
-            self.stop.cancel();
-
-            tokio::time::timeout(SHUTDOWN_GRACE + Duration::from_secs(2), &mut self.task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            self.task.abort();
+            assert!((&mut self.task).await.unwrap_err().is_cancelled());
         }
     }
 
     impl Drop for Harness {
         fn drop(&mut self) {
-            self.stop.cancel();
             self.task.abort();
         }
     }
@@ -2063,218 +1908,5 @@ mod tests {
             ])
             .is_err()
         );
-    }
-
-    #[tokio::test]
-    async fn essential_success_error_and_panic_fail_and_cancel_siblings() {
-        for outcome in ["success", "error", "panic"] {
-            let stop = CancellationToken::new();
-            let upstream_stop = CancellationToken::new();
-            let subscriptions_stop = CancellationToken::new();
-            let mut tasks = JoinSet::new();
-
-            spawn(&mut tasks, "broken", stop.clone(), async move {
-                match outcome {
-                    "success" => Ok(()),
-                    "error" => bail!("deliberate error"),
-                    _ => panic!("deliberate panic"),
-                }
-            });
-
-            for (name, token) in [
-                ("HTTP", stop.clone()),
-                ("upstream", upstream_stop.clone()),
-                ("subscriptions", subscriptions_stop.clone()),
-            ] {
-                spawn(&mut tasks, name, token.clone(), async move {
-                    token.cancelled().await;
-
-                    Ok(())
-                });
-            }
-
-            let result = tokio::time::timeout(
-                Duration::from_secs(1),
-                supervise(
-                    tasks,
-                    stop.clone(),
-                    upstream_stop.clone(),
-                    subscriptions_stop.clone(),
-                    std::future::pending(),
-                ),
-            )
-            .await
-            .unwrap();
-
-            assert!(result.is_err(), "{outcome}");
-            assert!(stop.is_cancelled());
-            assert!(upstream_stop.is_cancelled());
-            assert!(subscriptions_stop.is_cancelled());
-        }
-    }
-
-    #[tokio::test]
-    async fn admitted_media_finishes_over_http_during_shutdown() {
-        let harness = Harness::start().await;
-
-        // Larger than socket buffers, but sparse on disk and never buffered by the server.
-        let length = 32 * 1024 * 1024;
-
-        let file = File::create(harness.directory.path().join("video-original.mp4"))
-            .await
-            .unwrap();
-
-        file.set_len(length).await.unwrap();
-
-        let mut response = harness
-            .client
-            .get(harness.url(&format!("/media/assets/{VIDEO_ID}/original")))
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let mut received = response.chunk().await.unwrap().unwrap().len() as u64;
-        assert!(received < length);
-        harness.stop.cancel();
-
-        while let Some(chunk) = response.chunk().await.unwrap() {
-            assert!(chunk.iter().all(|byte| *byte == 0));
-            received += chunk.len() as u64;
-        }
-
-        assert_eq!(received, length);
-        harness.finish().await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn shutdown_deadlines_abort_uncooperative_tasks_without_an_extra_grace() {
-        struct Dropped(CancellationToken);
-
-        impl Drop for Dropped {
-            fn drop(&mut self) {
-                self.0.cancel();
-            }
-        }
-
-        for fatal in [false, true] {
-            let stop = CancellationToken::new();
-            let upstream_stop = CancellationToken::new();
-            let subscriptions_stop = CancellationToken::new();
-            let mut tasks = JoinSet::new();
-            let mut dropped = Vec::new();
-
-            for (name, token) in [
-                ("HTTP", stop.clone()),
-                ("upstream", upstream_stop.clone()),
-                ("subscriptions", subscriptions_stop.clone()),
-            ] {
-                let finished = CancellationToken::new();
-                let guard = Dropped(finished.clone());
-                dropped.push(finished);
-
-                spawn(&mut tasks, name, token, async move {
-                    let _guard = guard;
-
-                    std::future::pending().await
-                });
-            }
-
-            if fatal {
-                spawn(&mut tasks, "broken", stop.clone(), async {
-                    bail!("deliberate failure")
-                });
-            }
-
-            let started = Instant::now();
-
-            let result = supervise(
-                tasks,
-                stop.clone(),
-                upstream_stop.clone(),
-                subscriptions_stop.clone(),
-                async {},
-            )
-            .await;
-
-            assert_eq!(result.is_err(), fatal);
-            assert!(stop.is_cancelled());
-            assert!(upstream_stop.is_cancelled());
-            assert!(subscriptions_stop.is_cancelled());
-            assert!(dropped.iter().all(CancellationToken::is_cancelled));
-
-            let budget = if fatal {
-                Duration::from_secs(1)
-            } else {
-                SHUTDOWN_GRACE
-            };
-
-            assert!(started.elapsed() <= budget);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn shutdown_stages_share_one_grace_deadline() {
-        let stop = CancellationToken::new();
-        let upstream_stop = CancellationToken::new();
-        let subscriptions_stop = CancellationToken::new();
-        let mut tasks = JoinSet::new();
-        let http_stop = stop.clone();
-        let upstream_check = upstream_stop.clone();
-        let (finish_http, http_finished) = tokio::sync::oneshot::channel();
-        let (drained, check_drained) = tokio::sync::oneshot::channel();
-
-        spawn(&mut tasks, "HTTP", stop.clone(), async move {
-            http_stop.cancelled().await;
-            http_finished.await.unwrap();
-            assert!(!upstream_check.is_cancelled());
-            drained.send(()).unwrap();
-
-            Ok(())
-        });
-
-        let upstream_wait = upstream_stop.clone();
-
-        spawn(&mut tasks, "upstream", upstream_stop.clone(), async move {
-            upstream_wait.cancelled().await;
-            check_drained.await.unwrap();
-
-            Ok(())
-        });
-
-        let scheduler = subscriptions_stop.clone();
-
-        spawn(
-            &mut tasks,
-            "subscriptions",
-            subscriptions_stop.clone(),
-            async move {
-                scheduler.cancelled().await;
-
-                Ok(())
-            },
-        );
-
-        let started = Instant::now();
-
-        let supervisor = tokio::spawn(supervise(
-            tasks,
-            stop.clone(),
-            upstream_stop.clone(),
-            subscriptions_stop.clone(),
-            async {},
-        ));
-
-        stop.cancelled().await;
-        assert!(!upstream_stop.is_cancelled());
-        assert!(!subscriptions_stop.is_cancelled());
-        tokio::time::advance(Duration::from_secs(9)).await;
-        assert!(!supervisor.is_finished());
-        assert!(!upstream_stop.is_cancelled());
-        finish_http.send(()).unwrap();
-        upstream_stop.cancelled().await;
-        supervisor.await.unwrap().unwrap();
-        assert!(subscriptions_stop.is_cancelled());
-        assert!(started.elapsed() <= SHUTDOWN_GRACE);
     }
 }

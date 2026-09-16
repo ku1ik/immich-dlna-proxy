@@ -10,7 +10,6 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
     catalog::{BrowseResult, Catalog},
     eventing::Subscriptions,
-    lifecycle::SHUTDOWN_GRACE,
     media::MediaProxy,
     protocol::{self, BrowseArguments, Fault, Object, Service},
     server::Server,
@@ -20,7 +19,6 @@ use tokio::{
     net::{TcpListener, TcpStream},
     task::JoinSet,
 };
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const ASSET: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
@@ -75,6 +73,7 @@ impl Catalog for TestCatalog {
 
 async fn exchange(address: SocketAddr, request: &str, status: u16) -> String {
     let mut socket = TcpStream::connect(address).await.unwrap();
+    let request = request.replacen("\r\n\r\n", "\r\nConnection: close\r\n\r\n", 1);
     socket.write_all(request.as_bytes()).await.unwrap();
     let mut response = String::new();
     socket.read_to_string(&mut response).await.unwrap();
@@ -102,7 +101,6 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
         .unwrap();
 
     tokio::time::timeout(Duration::from_secs(10), async {
-        let shutdown = CancellationToken::new();
         let mut tasks = JoinSet::new();
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_address = upstream.local_addr().unwrap();
@@ -136,13 +134,8 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
                 .unwrap()
         });
 
-        let stop = shutdown.clone();
-
         tasks.spawn(async move {
-            axum::serve(upstream, router)
-                .with_graceful_shutdown(stop.cancelled_owned())
-                .await
-                .unwrap();
+            axum::serve(upstream, router).await.unwrap();
         });
 
         let subscriptions = Subscriptions::new().unwrap();
@@ -159,7 +152,7 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
 
         headers.insert("timeout", HeaderValue::from_static("Second-60"));
 
-        let (response, pending) = subscriptions.request(
+        let response = subscriptions.request(
             Service::ContentDirectory,
             "192.0.2.1".parse().unwrap(),
             &Method::from_bytes(b"SUBSCRIBE").unwrap(),
@@ -169,7 +162,6 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["timeout"], "Second-60");
         assert!(response.headers().contains_key("sid"));
-        subscriptions.response_complete(pending.unwrap(), false);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -188,10 +180,8 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
             subscriptions,
         );
 
-        let stop = shutdown.clone();
-
         tasks.spawn(async move {
-            server.run(listener, stop, SHUTDOWN_GRACE).await.unwrap();
+            server.run(listener).await.unwrap();
         });
 
         let namespace = protocol::CONTENT_DIRECTORY;
@@ -256,10 +246,12 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
         let response = media.serve(ASSET, "original", Method::GET, headers).await;
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert!(axum::body::to_bytes(response.into_body(), 1024).await.is_err());
-        shutdown.cancel();
+        tasks.abort_all();
 
         while let Some(result) = tasks.join_next().await {
-            result.unwrap();
+            if let Err(error) = result {
+                assert!(error.is_cancelled());
+            }
         }
     })
     .await
@@ -280,9 +272,7 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
         "update_id=7",
         "control response",
         "subscription response",
-        "initial_response_pending=true",
         "Second-60",
-        "initial_response_pending=false",
         "sid_supplied=true",
         "status=412",
         "media request peer",

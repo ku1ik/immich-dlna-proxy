@@ -9,7 +9,6 @@ use std::{
 use anyhow::{Context, ensure};
 use socket2::{Domain, InterfaceIndexOrAddress, Protocol, Socket, Type};
 use tokio::{io::Interest, net::UdpSocket, time::Instant};
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const MAX_AGE: u64 = 1800;
@@ -79,30 +78,15 @@ impl Discovery {
         })
     }
 
-    pub async fn run(self, shutdown: CancellationToken) -> anyhow::Result<()> {
-        self.run_to(shutdown, MULTICAST).await
+    pub async fn run(self) -> anyhow::Result<()> {
+        self.run_to(MULTICAST).await
     }
 
-    async fn run_to(
-        self,
-        shutdown: CancellationToken,
-        announcement_destination: SocketAddrV4,
-    ) -> anyhow::Result<()> {
-        if shutdown.is_cancelled() {
-            return Ok(());
-        }
-
-        let result = self.serve(&shutdown, announcement_destination).await;
-        let withdrawal = self.announce(Message::Byebye, announcement_destination);
-
-        result.and(withdrawal)
+    async fn run_to(self, announcement_destination: SocketAddrV4) -> anyhow::Result<()> {
+        self.serve(announcement_destination).await
     }
 
-    async fn serve(
-        &self,
-        shutdown: &CancellationToken,
-        announcement_destination: SocketAddrV4,
-    ) -> anyhow::Result<()> {
+    async fn serve(&self, announcement_destination: SocketAddrV4) -> anyhow::Result<()> {
         self.announce(Message::Alive, announcement_destination)?;
 
         let start = Instant::now();
@@ -117,8 +101,6 @@ impl Discovery {
 
             tokio::select! {
                 biased;
-
-                _ = shutdown.cancelled() => return Ok(()),
 
                 _ = tokio::time::sleep_until(announcement) => {
                     self.announce(Message::Alive, announcement_destination)?;
@@ -209,24 +191,17 @@ impl Discovery {
         let mut message = match kind {
             Message::Response => format!("HTTP/1.1 200 OK\r\nEXT:\r\nST: {name}\r\n"),
 
-            Message::Alive | Message::Byebye => {
-                let nts = match kind {
-                    Message::Alive => "ssdp:alive",
-                    _ => "ssdp:byebye",
-                };
-
-                format!("NOTIFY * HTTP/1.1\r\nHOST: {MULTICAST}\r\nNT: {name}\r\nNTS: {nts}\r\n")
-            }
+            Message::Alive => format!(
+                "NOTIFY * HTTP/1.1\r\nHOST: {MULTICAST}\r\nNT: {name}\r\nNTS: ssdp:alive\r\n"
+            ),
         };
 
-        if !matches!(kind, Message::Byebye) {
-            message.push_str(&format!(
-                "CACHE-CONTROL: max-age={}\r\nLOCATION: {}\r\nSERVER: {}\r\n",
-                MAX_AGE,
-                self.location,
-                crate::server_header(),
-            ));
-        }
+        message.push_str(&format!(
+            "CACHE-CONTROL: max-age={}\r\nLOCATION: {}\r\nSERVER: {}\r\n",
+            MAX_AGE,
+            self.location,
+            crate::server_header(),
+        ));
 
         message.push_str(&format!("USN: {usn}\r\n\r\n"));
 
@@ -237,7 +212,6 @@ impl Discovery {
 #[derive(Clone, Copy)]
 enum Message {
     Alive,
-    Byebye,
     Response,
 }
 
@@ -590,7 +564,7 @@ fn send(
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
 
-    // Nonblocking, best-effort sends cannot hold up reception or shutdown.
+    // Nonblocking, best-effort sends cannot hold up reception.
     // SAFETY: the aligned control buffer exceeds CMSG_SPACE(in_pktinfo), and
     // CMSG_DATA has room for the copied value. No pointers escape this syscall.
     let sent = unsafe {
@@ -886,7 +860,7 @@ mod tests {
         let discovery = loopback();
 
         for target in 0..5 {
-            for kind in [Message::Alive, Message::Byebye, Message::Response] {
+            for kind in [Message::Alive, Message::Response] {
                 let message = discovery.message(target, kind);
 
                 let usn = if target == 1 {
@@ -909,16 +883,12 @@ mod tests {
                     assert!(message.starts_with("NOTIFY * HTTP/1.1\r\n"));
                     assert!(message.contains(&format!("HOST: {MULTICAST}\r\n")));
                     assert!(message.contains(&format!("NT: {}\r\n", discovery.targets[target])));
+                    assert!(message.contains("NTS: ssdp:alive\r\n"));
                 }
 
-                if matches!(kind, Message::Byebye) {
-                    assert!(message.contains("NTS: ssdp:byebye\r\n"));
-                    assert!(!message.contains("LOCATION:"));
-                } else {
-                    assert!(message.contains("CACHE-CONTROL: max-age=1800\r\n"));
-                    assert!(message.contains(&format!("LOCATION: http://{LOCAL}/device.xml\r\n")));
-                    assert!(message.contains(&format!("SERVER: {}\r\n", crate::server_header())));
-                }
+                assert!(message.contains("CACHE-CONTROL: max-age=1800\r\n"));
+                assert!(message.contains(&format!("LOCATION: http://{LOCAL}/device.xml\r\n")));
+                assert!(message.contains(&format!("SERVER: {}\r\n", crate::server_header())));
             }
         }
     }
@@ -1043,8 +1013,7 @@ mod tests {
             panic!("IPv4 socket");
         };
 
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(discovery.run_to(shutdown.clone(), destination));
+        let task = tokio::spawn(discovery.run_to(destination));
         let mut buffer = [0; DATAGRAM_BYTES];
 
         peer.send_to(search("ssdp:all", "1").as_bytes(), address)
@@ -1076,17 +1045,12 @@ mod tests {
         let mut expected = targets(UUID);
         expected.sort();
         assert_eq!(received, expected);
-        shutdown.cancel();
-
-        tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn lifecycle_repeats_reannounces_and_withdraws_on_isolated_unicast_socket() {
+    async fn sends_startup_repeat_and_periodic_alive_announcements() {
         let discovery = loopback();
         let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
 
@@ -1094,20 +1058,14 @@ mod tests {
             panic!("IPv4 socket");
         };
 
-        let shutdown = CancellationToken::new();
-        let task = tokio::spawn(discovery.run_to(shutdown.clone(), destination));
+        let task = tokio::spawn(discovery.run_to(destination));
         let mut buffer = [0; DATAGRAM_BYTES];
 
-        for (advance, nts) in [
-            (Duration::ZERO, "ssdp:alive"),
-            (STARTUP_REPEAT, "ssdp:alive"),
-            (ANNOUNCEMENT_INTERVAL - STARTUP_REPEAT, "ssdp:alive"),
-            (Duration::ZERO, "ssdp:byebye"),
+        for advance in [
+            Duration::ZERO,
+            STARTUP_REPEAT,
+            ANNOUNCEMENT_INTERVAL - STARTUP_REPEAT,
         ] {
-            if nts == "ssdp:byebye" {
-                shutdown.cancel();
-            }
-
             tokio::time::advance(advance).await;
             tokio::task::yield_now().await;
 
@@ -1118,7 +1076,7 @@ mod tests {
             while received < 5 {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "missing {nts} datagrams"
+                    "missing ssdp:alive datagrams"
                 );
 
                 match peer.try_recv_from(&mut buffer) {
@@ -1126,7 +1084,7 @@ mod tests {
                         assert!(
                             std::str::from_utf8(&buffer[..length])
                                 .unwrap()
-                                .contains(nts)
+                                .contains("ssdp:alive")
                         );
 
                         received += 1;
@@ -1146,6 +1104,7 @@ mod tests {
             );
         }
 
-        task.await.unwrap().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 }

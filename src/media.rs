@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use axum::{body::Body, response::Response};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use tokio::{
-    sync::Semaphore,
+    sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, timeout_at},
 };
 use url::Url;
@@ -162,21 +162,13 @@ impl MediaProxy {
             return response(StatusCode::SERVICE_UNAVAILABLE);
         };
 
-        let permit = Arc::new(permit);
         let started = std::time::Instant::now();
 
         let result = self
-            .request(
-                asset,
-                endpoint,
-                expected_mime,
-                method,
-                headers,
-                permit.clone(),
-            )
+            .request(asset, endpoint, expected_mime, method, headers, permit)
             .await;
 
-        let mut result = match result {
+        match result {
             Ok(response) => response,
 
             Err(failure) => {
@@ -187,12 +179,7 @@ impl MediaProxy {
                     Failure::Upstream(_) => StatusCode::BAD_GATEWAY,
                 })
             }
-        };
-
-        // The connection retains this through transmission, even after body EOF.
-        result.extensions_mut().insert(permit);
-
-        result
+        }
     }
 
     async fn request(
@@ -202,7 +189,7 @@ impl MediaProxy {
         expected_mime: Option<&str>,
         method: Method,
         headers: HeaderMap,
-        permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+        permit: OwnedSemaphorePermit,
     ) -> Result<Response, Failure> {
         let mut url = self
             .api_base
@@ -727,7 +714,7 @@ mod tests {
                             }
 
                             request.extend_from_slice(&buffer[..count]);
-                            assert!(request.len() <= crate::transport::HEADER_BYTES);
+                            assert!(request.len() <= crate::protocol::HEADER_BYTES);
                         }
 
                         let _ = sender.send(String::from_utf8(request).unwrap());
@@ -853,13 +840,6 @@ mod tests {
                 .await;
 
             assert_eq!(result.status(), status);
-
-            assert!(
-                result
-                    .extensions()
-                    .get::<Arc<tokio::sync::OwnedSemaphorePermit>>()
-                    .is_none()
-            );
         }
 
         assert!(server.requests.try_recv().is_err());
@@ -1606,14 +1586,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        assert!(
-            overloaded
-                .extensions()
-                .get::<Arc<tokio::sync::OwnedSemaphorePermit>>()
-                .is_none()
-        );
-
         assert!(server.requests.try_recv().is_err());
         drop(responses.pop());
         assert_eq!(proxy.operations.available_permits(), 1);
@@ -1623,8 +1595,6 @@ mod tests {
             .await;
 
         assert_eq!(result.status(), StatusCode::OK);
-        assert_eq!(proxy.operations.available_permits(), 0);
-        drop(result);
         assert_eq!(proxy.operations.available_permits(), 1);
         drop(responses);
 
@@ -1632,72 +1602,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_response_extensions_hold_permits_after_body_completion() {
-        for method in [Method::GET, Method::HEAD] {
-            for (wire, expected) in [
-                (JPEG, StatusCode::OK),
-                (
-                    "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n",
-                    StatusCode::NOT_MODIFIED,
-                ),
-                (
-                    "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    StatusCode::PRECONDITION_FAILED,
-                ),
-                (
-                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    StatusCode::NOT_FOUND,
-                ),
-                (
-                    "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    if method == Method::GET {
-                        StatusCode::RANGE_NOT_SATISFIABLE
-                    } else {
-                        StatusCode::BAD_GATEWAY
-                    },
-                ),
-                (
-                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    StatusCode::BAD_GATEWAY,
-                ),
-                (
-                    "HTTP/1.1 200 OK\r\nContent-Type: invalid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    StatusCode::BAD_GATEWAY,
-                ),
-                ("", StatusCode::BAD_GATEWAY),
-            ] {
-                let server = FakeServer::new(vec![Reply::new(wire)]).await;
-                let proxy = server.proxy();
+    async fn head_conditional_validation_and_upstream_errors_release_permits_immediately() {
+        for (method, wire, expected) in [
+            (Method::HEAD, JPEG, StatusCode::OK),
+            (
+                Method::GET,
+                "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n",
+                StatusCode::NOT_MODIFIED,
+            ),
+            (
+                Method::GET,
+                "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                StatusCode::PRECONDITION_FAILED,
+            ),
+            (
+                Method::GET,
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                StatusCode::RANGE_NOT_SATISFIABLE,
+            ),
+            (
+                Method::GET,
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                Method::GET,
+                "HTTP/1.1 200 OK\r\nContent-Type: invalid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                StatusCode::BAD_GATEWAY,
+            ),
+            (Method::GET, "", StatusCode::BAD_GATEWAY),
+        ] {
+            let server = FakeServer::new(vec![Reply::new(wire)]).await;
+            let proxy = server.proxy();
 
-                let result = proxy
-                    .serve(
-                        ASSET,
-                        "original",
-                        method.clone(),
-                        headers(&[("range", "bytes=0-2")]),
-                    )
-                    .await;
+            let result = proxy
+                .serve(
+                    ASSET,
+                    "original",
+                    method.clone(),
+                    headers(&[("range", "bytes=0-2")]),
+                )
+                .await;
 
-                assert_eq!(result.status(), expected, "{method}: {wire}");
-
-                assert_eq!(proxy.operations.available_permits(), OPERATIONS - 1);
-
-                let (mut parts, body) = result.into_parts();
-
-                let permit = parts
-                    .extensions
-                    .remove::<Arc<tokio::sync::OwnedSemaphorePermit>>()
-                    .expect("every admitted response retains its permit for transmission");
-
-                drop(parts);
-                to_bytes(body, 1024).await.unwrap();
-
-                assert_eq!(proxy.operations.available_permits(), OPERATIONS - 1);
-
-                drop(permit);
-
-                assert_eq!(proxy.operations.available_permits(), OPERATIONS);
-            }
+            assert_eq!(result.status(), expected, "{method}: {wire}");
+            assert_eq!(proxy.operations.available_permits(), OPERATIONS);
         }
     }
 
@@ -2017,18 +1970,6 @@ mod tests {
             .await;
 
         assert_eq!(result.status(), StatusCode::GATEWAY_TIMEOUT);
-
-        assert_eq!(proxy.operations.available_permits(), OPERATIONS - 1);
-
-        assert!(
-            result
-                .extensions()
-                .get::<Arc<tokio::sync::OwnedSemaphorePermit>>()
-                .is_some()
-        );
-
-        drop(result);
-
         assert_eq!(proxy.operations.available_permits(), OPERATIONS);
 
         server.request().await;

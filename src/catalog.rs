@@ -1164,7 +1164,7 @@ struct Inner {
     collator: CollatorBorrowed<'static>,
     store: Store,
     events: Subscriptions,
-    stop: CancellationToken,
+    failure: CancellationToken,
     state: Mutex<State>,
     commit: AsyncMutex<()>,
     permits: Arc<Semaphore>,
@@ -1401,9 +1401,7 @@ struct Running(Library);
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.0.inner.stop.cancel();
         self.0.inner.supervisor.lock().unwrap().tasks.abort_all();
-        self.0.inner.wake.notify_one();
     }
 }
 
@@ -1414,7 +1412,6 @@ impl Library {
         store: Store,
         ledger: Ledger,
         events: Subscriptions,
-        stop: CancellationToken,
     ) -> Result<Self> {
         let source = Source::new(
             immich::Client::new(config.api_base, config.api_key)?,
@@ -1431,7 +1428,7 @@ impl Library {
                 collator: config.collator,
                 store,
                 events,
-                stop,
+                failure: CancellationToken::new(),
                 state: Mutex::new(State {
                     ledger: Arc::new(ledger),
                     cache: Cache::new(),
@@ -1454,7 +1451,7 @@ impl Library {
         })
     }
 
-    /// Supervise until stopped, then drain preparation cancellation and any commit.
+    /// Supervise refresh tasks and fail after cancelling preparation on task failure.
     pub async fn run(&self) -> Result<()> {
         {
             let mut supervisor = self.inner.supervisor.lock().unwrap();
@@ -1476,13 +1473,13 @@ impl Library {
                     Poll::Ready(Some(result)) => {
                         if result.is_err() {
                             supervisor.failed = true;
-                            self.inner.stop.cancel();
+                            self.inner.failure.cancel();
                         }
 
                         Poll::Ready(false)
                     }
 
-                    Poll::Ready(None) if self.inner.stop.is_cancelled() => Poll::Ready(true),
+                    Poll::Ready(None) if supervisor.failed => Poll::Ready(true),
                     _ => Poll::Pending,
                 }
             });
@@ -1497,8 +1494,6 @@ impl Library {
                 }
 
                 _ = notified => {}
-
-                _ = self.inner.stop.cancelled(), if !self.inner.stop.is_cancelled() => {}
             }
         }
     }
@@ -1507,7 +1502,7 @@ impl Library {
         let mut receiver = {
             let mut state = self.inner.state.lock().unwrap();
 
-            if self.inner.stop.is_cancelled() {
+            if self.inner.failure.is_cancelled() {
                 return Err(FAILED);
             }
 
@@ -1539,7 +1534,7 @@ impl Library {
                 }
 
                 if supervisor.failed {
-                    self.inner.stop.cancel();
+                    self.inner.failure.cancel();
                     self.inner.wake.notify_one();
 
                     return Err(FAILED);
@@ -1606,8 +1601,8 @@ impl Library {
 
     async fn refresh(&self, scope: Scope, token: Token, preparation: Instant) -> Result<Arc<View>> {
         ensure!(
-            !self.inner.stop.is_cancelled() && Instant::now() < preparation,
-            "catalog preparation stopped or expired"
+            !self.inner.failure.is_cancelled() && Instant::now() < preparation,
+            "catalog preparation failed or expired"
         );
 
         let prepare = async {
@@ -1638,7 +1633,7 @@ impl Library {
 
         let (candidate, _gate) = tokio::select! {
             biased;
-            _ = self.inner.stop.cancelled() => return Err(anyhow!("catalog preparation stopped")),
+            _ = self.inner.failure.cancelled() => return Err(anyhow!("catalog preparation cancelled after task failure")),
 
             result = timeout_at(preparation, prepare) => {
                 result.map_err(|_| anyhow!("catalog preparation deadline exceeded"))??
@@ -1646,8 +1641,8 @@ impl Library {
         };
 
         ensure!(
-            !self.inner.stop.is_cancelled() && Instant::now() < preparation,
-            "catalog preparation stopped or expired"
+            !self.inner.failure.is_cancelled() && Instant::now() < preparation,
+            "catalog preparation failed or expired"
         );
 
         let deadline = Instant::now() + COMMIT_TIMEOUT;
@@ -1674,10 +1669,10 @@ impl Library {
         };
 
         ensure!(
-            !self.inner.stop.is_cancelled()
+            !self.inner.failure.is_cancelled()
                 && Instant::now() < preparation
                 && Instant::now() < deadline,
-            "catalog preparation stopped or expired"
+            "catalog preparation failed or expired"
         );
 
         let changed = next.is_some();
@@ -3855,7 +3850,6 @@ mod tests {
         upstream: Arc<Mutex<Upstream>>,
         address: std::net::SocketAddr,
         notifications: mpsc::Receiver<(HeaderMap, String)>,
-        stop: CancellationToken,
         task: JoinHandle<()>,
     }
 
@@ -3994,21 +3988,14 @@ mod tests {
                 }
             });
 
-            let stop = CancellationToken::new();
-            let shutdown = stop.clone();
-
             let task = tokio::spawn(async move {
-                axum::serve(listener, router)
-                    .with_graceful_shutdown(shutdown.cancelled_owned())
-                    .await
-                    .unwrap();
+                axum::serve(listener, router).await.unwrap();
             });
 
             Self {
                 upstream,
                 address,
                 notifications,
-                stop,
                 task,
             }
         }
@@ -4049,7 +4036,7 @@ mod tests {
                 format!("<http://{}/events>", self.address).parse().unwrap(),
             );
 
-            let (response, token) = library.inner.events.request(
+            let response = library.inner.events.request(
                 Service::ContentDirectory,
                 Ipv4Addr::LOCALHOST,
                 &Method::from_bytes(b"SUBSCRIBE").unwrap(),
@@ -4057,7 +4044,6 @@ mod tests {
             );
 
             assert_eq!(response.status(), 200);
-            library.inner.events.response_complete(token.unwrap(), true);
         }
 
         async fn event(&mut self, id: u32) {
@@ -4078,7 +4064,6 @@ mod tests {
 
     impl Drop for Fake {
         fn drop(&mut self) {
-            self.stop.cancel();
             self.task.abort();
         }
     }
@@ -4103,14 +4088,8 @@ mod tests {
             ledger.restart();
             store.persist(ledger.clone()).await;
 
-            let library = Library::new(
-                config,
-                store,
-                ledger,
-                Subscriptions::new().unwrap(),
-                CancellationToken::new(),
-            )
-            .unwrap();
+            let library =
+                Library::new(config, store, ledger, Subscriptions::new().unwrap()).unwrap();
 
             Self {
                 library,
@@ -4144,14 +4123,9 @@ mod tests {
             )
         }
 
-        async fn stop(&self, task: JoinHandle<Result<()>>) {
-            self.library.inner.stop.cancel();
-
-            timeout_at(Instant::now() + Duration::from_secs(3), task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+        async fn abort(&self, task: JoinHandle<Result<()>>) {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
 
             assert!(self.library.inner.state.lock().unwrap().flights.is_empty());
 
@@ -4399,14 +4373,10 @@ mod tests {
         store.persist(ledger.clone()).await;
         let media = MediaProxy::new(config.api_base.clone(), config.api_key.clone()).unwrap();
         let events = Subscriptions::new().unwrap();
-        let source_stop = CancellationToken::new();
-        let server_stop = CancellationToken::new();
-        let events_stop = CancellationToken::new();
         let name = config.friendly_name.clone();
         let uuid = config.server_uuid;
 
-        let library =
-            Library::new(config, store, ledger, events.clone(), source_stop.clone()).unwrap();
+        let library = Library::new(config, store, ledger, events.clone()).unwrap();
 
         let mut fixture = Fixture {
             library,
@@ -4415,13 +4385,9 @@ mod tests {
         };
 
         let catalog_task = fixture.run();
-        let events_task = tokio::spawn(events.clone().run(events_stop.clone()));
+        let events_task = tokio::spawn(events.clone().run());
         let server = Server::new(name, uuid, fixture.library.clone(), media, events);
-        let server_task = tokio::spawn(server.run(
-            listener,
-            server_stop.clone(),
-            crate::lifecycle::SHUTDOWN_GRACE,
-        ));
+        let server_task = tokio::spawn(server.run(listener));
 
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -4463,7 +4429,7 @@ mod tests {
 
         assert_eq!(subscription.status(), 200);
         assert_eq!(subscription.headers()["timeout"], "Second-60");
-        assert_eq!(subscription.headers()["connection"], "close");
+        assert!(!subscription.headers().contains_key("connection"));
         let sid = subscription.headers()["sid"].clone();
         assert!(subscription.bytes().await.unwrap().is_empty());
 
@@ -4746,46 +4712,21 @@ mod tests {
                 .is_err()
         );
 
-        server_stop.cancel();
-        source_stop.cancel();
-
-        tokio::time::timeout(Duration::from_secs(3), server_task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-
-        fixture.stop(catalog_task).await;
-        events_stop.cancel();
-
-        tokio::time::timeout(Duration::from_secs(3), events_task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-
-        fixture.fake.stop.cancel();
-
-        tokio::time::timeout(Duration::from_secs(3), &mut fixture.fake.task)
-            .await
-            .unwrap()
-            .unwrap();
+        server_task.abort();
+        assert!(server_task.await.unwrap_err().is_cancelled());
+        fixture.abort(catalog_task).await;
+        events_task.abort();
+        assert!(events_task.await.unwrap_err().is_cancelled());
+        fixture.fake.task.abort();
+        assert!((&mut fixture.fake.task).await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
     async fn local_id_startup_event_outage_and_metadata_scopes() {
         let mut fixture = Fixture::new(2).await;
         let task = fixture.run();
-        let events_stop = CancellationToken::new();
 
-        let events = tokio::spawn(
-            fixture
-                .library
-                .inner
-                .events
-                .clone()
-                .run(events_stop.clone()),
-        );
+        let events = tokio::spawn(fixture.library.inner.events.clone().run());
 
         fixture.fake.subscribe(&fixture.library);
         fixture.fake.event(1).await;
@@ -4836,9 +4777,9 @@ mod tests {
         fault(browse(&fixture.library, children(1)), 501).await;
         assert_eq!(fixture.library.system_update_id(), 2);
         assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
-        events_stop.cancel();
-        events.await.unwrap().unwrap();
-        fixture.stop(task).await;
+        events.abort();
+        assert!(events.await.unwrap_err().is_cancelled());
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -4936,7 +4877,7 @@ mod tests {
 
         assert_eq!(fixture.fake.calls("/api/albums"), 1);
         assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
-        fixture.stop(task).await;
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -4955,16 +4896,8 @@ mod tests {
         let before = fixture.library.browse(request()).await.unwrap();
         assert_eq!(before.objects[0].title, "Z");
         let disk = fixture.disk().1;
-        let events_stop = CancellationToken::new();
 
-        let events = tokio::spawn(
-            fixture
-                .library
-                .inner
-                .events
-                .clone()
-                .run(events_stop.clone()),
-        );
+        let events = tokio::spawn(fixture.library.inner.events.clone().run());
 
         fixture.fake.subscribe(&fixture.library);
         fixture.fake.event(before.update_id).await;
@@ -5011,9 +4944,9 @@ mod tests {
         assert_eq!(fixture.disk(), changed);
         assert_eq!(fixture.fake.calls("/api/albums"), 3);
         assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
-        events_stop.cancel();
-        events.await.unwrap().unwrap();
-        fixture.stop(task).await;
+        events.abort();
+        assert!(events.await.unwrap_err().is_cancelled());
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -5189,7 +5122,7 @@ mod tests {
         assert_eq!(newer.total_matches, 0);
         assert_eq!(newer.update_id, baseline.update_id + 1);
         assert_eq!(baseline.objects.len(), 3);
-        fixture.stop(task).await;
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -5222,16 +5155,8 @@ mod tests {
         );
 
         let before = fixture.disk();
-        let events_stop = CancellationToken::new();
 
-        let events = tokio::spawn(
-            fixture
-                .library
-                .inner
-                .events
-                .clone()
-                .run(events_stop.clone()),
-        );
+        let events = tokio::spawn(fixture.library.inner.events.clone().run());
 
         fixture.fake.subscribe(&fixture.library);
         fixture.fake.event(before.1.system_update_id).await;
@@ -5263,9 +5188,9 @@ mod tests {
         );
 
         assert_eq!(fixture.fake.calls("/api/server/version"), 1);
-        events_stop.cancel();
-        events.await.unwrap().unwrap();
-        fixture.stop(task).await;
+        events.abort();
+        assert!(events.await.unwrap_err().is_cancelled());
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -5368,7 +5293,7 @@ mod tests {
 
         fixture.library.browse(children(1)).await.unwrap();
         assert_eq!(fixture.disk(), grown);
-        fixture.stop(task).await;
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -5419,7 +5344,7 @@ mod tests {
 
         fixture.expire(Scope::Album(Uuid::from_u128(1)));
         fixture.library.browse(children(1)).await.unwrap();
-        fixture.stop(task).await;
+        fixture.abort(task).await;
         let mut restarted = fixture.disk().1;
         restarted.restart();
         let store = fixture.library.inner.store.clone();
@@ -5430,7 +5355,6 @@ mod tests {
             store,
             restarted.clone(),
             Subscriptions::new().unwrap(),
-            CancellationToken::new(),
         )
         .unwrap();
 
@@ -5446,7 +5370,7 @@ mod tests {
         fixture.library.browse(children(2)).await.unwrap();
         assert_eq!(fixture.disk(), disk);
         assert_eq!(fixture.fake.calls("/api/server/version"), 2);
-        fixture.stop(task).await;
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -5511,11 +5435,11 @@ mod tests {
             *fixture.library.inner.state.lock().unwrap().ledger
         );
 
-        fixture.stop(task).await;
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
-    async fn preparation_timeout_and_shutdown_drop_stalled_requests_across_pages() {
+    async fn preparation_timeout_drops_stalled_requests_across_pages() {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpStream;
 
@@ -5569,106 +5493,99 @@ mod tests {
         // Stall version checking, album listing, or a later search page.
         for stage in 0..3 {
             for body_pending in [false, true] {
-                for cancel in [false, true] {
-                    let mut fixture = Fixture::new(1).await;
-                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let inner = Arc::get_mut(&mut fixture.library.inner).unwrap();
-                    inner.preparation_timeout = Duration::from_secs(10);
+                let mut fixture = Fixture::new(1).await;
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let inner = Arc::get_mut(&mut fixture.library.inner).unwrap();
+                inner.preparation_timeout = Duration::from_secs(10);
 
-                    inner.source.client = Client::new(
-                        format!("http://{}/api/", listener.local_addr().unwrap())
-                            .parse()
-                            .unwrap(),
-                        HeaderValue::from_static("fake-key"),
-                    )
-                    .unwrap();
+                inner.source.client = Client::new(
+                    format!("http://{}/api/", listener.local_addr().unwrap())
+                        .parse()
+                        .unwrap(),
+                    HeaderValue::from_static("fake-key"),
+                )
+                .unwrap();
 
-                    tokio::time::pause();
+                tokio::time::pause();
 
-                    // Advance only explicitly while exchanging loopback responses.
-                    let clock_guard = tokio::spawn(async {
-                        loop {
-                            tokio::task::yield_now().await;
-                        }
-                    });
-
-                    let task = fixture.run();
-                    let caller = browse(&fixture.library, children(1));
-                    let (mut socket, _) = request(&listener, "/api/server/version").await;
-
-                    if stage > 0 {
-                        if stage == 1 {
-                            tokio::time::advance(Duration::from_secs(6)).await;
-                        }
-
-                        respond(
-                            socket,
-                            json!({"major": 3, "minor": 1, "patch": 0, "prerelease": null}),
-                        )
-                        .await;
-
-                        (socket, _) = request(&listener, "/api/albums").await;
+                // Advance only explicitly while exchanging loopback responses.
+                let clock_guard = tokio::spawn(async {
+                    loop {
+                        tokio::task::yield_now().await;
                     }
+                });
 
-                    if stage == 2 {
-                        respond(socket, json!([album(1, "Album")])).await;
-                        let (first, query) = request(&listener, "/api/search/metadata").await;
-                        assert_eq!(query["page"], 1);
+                let task = fixture.run();
+                let caller = browse(&fixture.library, children(1));
+                let (mut socket, _) = request(&listener, "/api/server/version").await;
+
+                if stage > 0 {
+                    if stage == 1 {
                         tokio::time::advance(Duration::from_secs(6)).await;
-
-                        respond(first, json!({"assets": {"items": [crate::immich::tests::asset(1, "IMAGE")], "nextPage": "2"}})).await;
-
-                        let query;
-                        (socket, query) = request(&listener, "/api/search/metadata").await;
-                        assert_eq!(query["page"], 2);
                     }
 
-                    if body_pending {
-                        socket
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n[")
-                            .await
-                            .unwrap();
-                    }
+                    respond(
+                        socket,
+                        json!({"major": 3, "minor": 1, "patch": 0, "prerelease": null}),
+                    )
+                    .await;
 
-                    assert!(!caller.is_finished());
-                    let before = fixture.disk();
-
-                    if cancel {
-                        fixture.library.inner.stop.cancel();
-                    } else {
-                        // Earlier requests consumed six seconds; a new page gets no new window.
-                        tokio::time::advance(Duration::from_secs(if stage == 0 { 11 } else { 5 }))
-                            .await;
-                    }
-
-                    clock_guard.abort();
-                    assert!(clock_guard.await.unwrap_err().is_cancelled());
-                    fault(caller, 501).await;
-                    assert_eq!(fixture.disk(), before);
-                    assert_eq!(fixture.library.inner.permits.available_permits(), REFRESHES);
-
-                    assert!(
-                        fixture
-                            .library
-                            .inner
-                            .state
-                            .lock()
-                            .unwrap()
-                            .flights
-                            .is_empty()
-                    );
-
-                    assert_eq!(
-                        tokio::time::timeout(Duration::from_secs(1), socket.read(&mut [0; 1]))
-                            .await
-                            .unwrap()
-                            .unwrap(),
-                        0
-                    );
-
-                    fixture.stop(task).await;
-                    tokio::time::resume();
+                    (socket, _) = request(&listener, "/api/albums").await;
                 }
+
+                if stage == 2 {
+                    respond(socket, json!([album(1, "Album")])).await;
+                    let (first, query) = request(&listener, "/api/search/metadata").await;
+                    assert_eq!(query["page"], 1);
+                    tokio::time::advance(Duration::from_secs(6)).await;
+
+                    respond(first, json!({"assets": {"items": [crate::immich::tests::asset(1, "IMAGE")], "nextPage": "2"}})).await;
+
+                    let query;
+                    (socket, query) = request(&listener, "/api/search/metadata").await;
+                    assert_eq!(query["page"], 2);
+                }
+
+                if body_pending {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n[")
+                        .await
+                        .unwrap();
+                }
+
+                assert!(!caller.is_finished());
+                let before = fixture.disk();
+
+                // Earlier requests consumed six seconds; a new page gets no new window.
+                tokio::time::advance(Duration::from_secs(if stage == 0 { 11 } else { 5 })).await;
+
+                clock_guard.abort();
+                assert!(clock_guard.await.unwrap_err().is_cancelled());
+                fault(caller, 501).await;
+                assert_eq!(fixture.disk(), before);
+                assert_eq!(fixture.library.inner.permits.available_permits(), REFRESHES);
+
+                assert!(
+                    fixture
+                        .library
+                        .inner
+                        .state
+                        .lock()
+                        .unwrap()
+                        .flights
+                        .is_empty()
+                );
+
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), socket.read(&mut [0; 1]))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+
+                fixture.abort(task).await;
+                tokio::time::resume();
             }
         }
     }
@@ -5718,7 +5635,7 @@ mod tests {
         drop(gate);
         *fixture.library.inner.prepared.lock().unwrap() = None;
         fixture.library.browse(children(1)).await.unwrap();
-        fixture.stop(task).await;
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -5791,7 +5708,7 @@ mod tests {
         *fixture.library.inner.prepared.lock().unwrap() = None;
         fixture.library.browse(children(1)).await.unwrap();
         assert_eq!(fixture.disk(), before);
-        fixture.stop(task).await;
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -5825,95 +5742,7 @@ mod tests {
             view.root.albums[&Uuid::from_u128(2)].object.title,
             "Other rename"
         );
-        fixture.stop(task).await;
-    }
-
-    #[tokio::test]
-    async fn shutdown_cancels_fetch_and_gate_wait_but_drains_durable_publication() {
-        for waiting_gate in [false, true] {
-            let fixture = Fixture::new(1).await;
-            let task = fixture.run();
-            let barrier = Barrier::new();
-            let gate = fixture.library.inner.commit.lock().await;
-
-            if waiting_gate {
-                *fixture.library.inner.prepared.lock().unwrap() =
-                    Some((Scope::Root, barrier.clone()));
-            } else {
-                fixture
-                    .fake
-                    .upstream
-                    .lock()
-                    .unwrap()
-                    .gates
-                    .insert(Scope::Root, barrier.clone());
-            }
-
-            let caller = browse(&fixture.library, action("0", true, 0, 0, None));
-            barrier.entered().await;
-
-            if waiting_gate {
-                barrier.release.add_permits(1);
-            }
-
-            let before = fixture.disk();
-            fixture.stop(task).await;
-            fault(caller, 501).await;
-            assert_eq!(fixture.disk(), before);
-            fault(browse(&fixture.library, children(1)), 501).await;
-            drop(gate);
-        }
-
-        let mut fixture = Fixture::new(1).await;
-        let mut task = fixture.run();
-        let barrier = Barrier::new();
-        *fixture.library.inner.publication.lock().unwrap() = Some(barrier.clone());
-        let caller = browse(&fixture.library, action("0", true, 0, 0, None));
-        barrier.entered().await;
-        assert_eq!(fixture.disk().1.system_update_id, 2);
-        assert_eq!(fixture.library.system_update_id(), 1);
-        assert_eq!(fixture.library.inner.permits.available_permits(), 3);
-        caller.abort();
-        fixture.library.inner.stop.cancel();
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), &mut task)
-                .await
-                .is_err()
-        );
-
-        barrier.release.add_permits(1);
-        task.await.unwrap().unwrap();
-        assert_eq!(fixture.library.system_update_id(), 2);
-        assert_eq!(fixture.library.inner.permits.available_permits(), 4);
-
-        assert!(
-            fixture
-                .library
-                .inner
-                .state
-                .lock()
-                .unwrap()
-                .cache
-                .root
-                .is_some()
-        );
-
-        let events_stop = CancellationToken::new();
-
-        let events = tokio::spawn(
-            fixture
-                .library
-                .inner
-                .events
-                .clone()
-                .run(events_stop.clone()),
-        );
-
-        fixture.fake.subscribe(&fixture.library);
-        fixture.fake.event(2).await;
-        events_stop.cancel();
-        events.await.unwrap().unwrap();
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -5930,14 +5759,7 @@ mod tests {
         ledger.restart();
         store.persist(ledger.clone()).await;
 
-        let library = Library::new(
-            config,
-            store,
-            ledger,
-            Subscriptions::new().unwrap(),
-            CancellationToken::new(),
-        )
-        .unwrap();
+        let library = Library::new(config, store, ledger, Subscriptions::new().unwrap()).unwrap();
 
         let supervised = library.clone();
         let mut supervisor = tokio::spawn(async move { supervised.run().await });
@@ -5949,7 +5771,7 @@ mod tests {
 
         let before = library.inner.state.lock().unwrap().ledger.clone();
 
-        let mut events = tokio::spawn(library.inner.events.clone().run(CancellationToken::new()));
+        let mut events = tokio::spawn(library.inner.events.clone().run());
 
         fake.subscribe(&library);
         fake.event(before.system_update_id).await;
@@ -6080,7 +5902,6 @@ mod tests {
             store,
             restored.clone(),
             Subscriptions::new().unwrap(),
-            CancellationToken::new(),
         )
         .unwrap();
 
@@ -6092,12 +5913,11 @@ mod tests {
         assert_eq!(result.objects[0].title, "Changed");
         assert_eq!(result.update_id, 4);
         assert_eq!(*library.inner.state.lock().unwrap().ledger, restored);
-        let stop = CancellationToken::new();
-        let events = tokio::spawn(library.inner.events.clone().run(stop.clone()));
+        let events = tokio::spawn(library.inner.events.clone().run());
         fake.subscribe(&library);
         fake.event(4).await;
-        stop.cancel();
-        events.await.unwrap().unwrap();
+        events.abort();
+        assert!(events.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
@@ -6130,7 +5950,7 @@ mod tests {
                 .is_err()
         );
 
-        assert!(fixture.library.inner.stop.is_cancelled());
+        assert!(fixture.library.inner.failure.is_cancelled());
         assert_eq!(fixture.library.inner.permits.available_permits(), 4);
 
         assert!(
@@ -6192,7 +6012,7 @@ mod tests {
                 .is_some()
         );
 
-        fixture.stop(task).await;
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -6292,7 +6112,7 @@ mod tests {
             !fixture.library.inner.state.lock().unwrap().ledger.albums[&Uuid::from_u128(1)].present
         );
 
-        fixture.stop(task).await;
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -6382,7 +6202,7 @@ mod tests {
                 .contains_key(&Uuid::from_u128(1))
         );
 
-        fixture.stop(task).await;
+        fixture.abort(task).await;
     }
 
     #[tokio::test]
@@ -6416,16 +6236,8 @@ mod tests {
         );
 
         assert_eq!(fixture.library.inner.permits.available_permits(), 4);
-        let events_stop = CancellationToken::new();
 
-        let events = tokio::spawn(
-            fixture
-                .library
-                .inner
-                .events
-                .clone()
-                .run(events_stop.clone()),
-        );
+        let events = tokio::spawn(fixture.library.inner.events.clone().run());
 
         fixture.fake.subscribe(&fixture.library);
         fixture.fake.event(2).await;
@@ -6435,8 +6247,8 @@ mod tests {
         assert_eq!(result.total_matches, 0);
         fixture.fake.event(3).await;
         assert_eq!(fixture.fake.calls("/api/albums"), 1);
-        events_stop.cancel();
-        events.await.unwrap().unwrap();
-        fixture.stop(task).await;
+        events.abort();
+        assert!(events.await.unwrap_err().is_cancelled());
+        fixture.abort(task).await;
     }
 }
