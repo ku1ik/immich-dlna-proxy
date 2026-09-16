@@ -1212,7 +1212,6 @@ impl State {
 struct Cache {
     root: Option<Cached<Root>>,
     albums: BTreeMap<Uuid, Cached<Contents>>,
-    freshness: Duration,
     album_limit: usize,
     byte_limit: usize,
 }
@@ -1222,7 +1221,6 @@ impl Cache {
         Self {
             root: None,
             albums: BTreeMap::new(),
-            freshness: FRESHNESS,
             album_limit: RESIDENT_ALBUMS,
             byte_limit: CACHE_BYTES,
         }
@@ -1233,12 +1231,12 @@ impl Cache {
             Scope::Root => self
                 .root
                 .as_mut()
-                .is_some_and(|cached| cached.is_fresh(now, self.freshness)),
+                .is_some_and(|cached| cached.is_fresh(now)),
 
             Scope::Album(id) => self
                 .albums
                 .get_mut(&id)
-                .is_some_and(|cached| cached.is_fresh(now, self.freshness)),
+                .is_some_and(|cached| cached.is_fresh(now)),
         }
     }
 
@@ -1304,9 +1302,10 @@ impl Cache {
             Scope::Root => self.root.as_mut().unwrap().completed = completed,
 
             Scope::Album(id) => {
-                if let Some(cached) = self.albums.get_mut(&id) {
-                    cached.completed = completed;
-                }
+                self.albums
+                    .get_mut(&id)
+                    .expect("published album remains cached")
+                    .completed = completed;
             }
         }
     }
@@ -1319,10 +1318,10 @@ struct Cached<T> {
 }
 
 impl<T> Cached<T> {
-    fn is_fresh(&mut self, now: Instant, freshness: Duration) -> bool {
+    fn is_fresh(&mut self, now: Instant) -> bool {
         self.used = now;
 
-        now.duration_since(self.completed) < freshness
+        now.duration_since(self.completed) < FRESHNESS
     }
 }
 
