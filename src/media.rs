@@ -192,7 +192,9 @@ impl MediaProxy {
             .join(&format!("assets/{asset}/{endpoint}"))
             .map_err(|_| Failure::Upstream("invalid media endpoint"))?;
 
-        let initial_url = url.clone();
+        let initial_edited = url
+            .query_pairs()
+            .any(|(key, value)| key == "edited" && value == "true");
         let mut forwarded = HeaderMap::new();
 
         for name in [
@@ -273,7 +275,7 @@ impl MediaProxy {
 
             if visited.len() > REDIRECTS
                 || visited.contains(&target)
-                || !self.allowed_redirect(&initial_url, &target, asset)
+                || !self.allowed_redirect(initial_edited, &target, asset)
             {
                 return Err(Failure::Upstream("unsafe or excessive media redirect"));
             }
@@ -477,7 +479,7 @@ impl MediaProxy {
         Ok(result)
     }
 
-    fn allowed_redirect(&self, initial: &Url, target: &Url, asset: Uuid) -> bool {
+    fn allowed_redirect(&self, initial_edited: bool, target: &Url, asset: Uuid) -> bool {
         if target.origin() != self.api_base.origin()
             || !target.username().is_empty()
             || target.password().is_some()
@@ -491,9 +493,6 @@ impl MediaProxy {
             return false;
         };
 
-        let initial_edited = initial
-            .query_pairs()
-            .any(|(k, v)| k == "edited" && v == "true");
         let mut edited = None;
         let mut size = None;
 
@@ -1471,18 +1470,13 @@ mod tests {
         )
         .unwrap();
 
-        let initial = proxy
-            .api_base
-            .join(&format!("assets/{ASSET}/original"))
-            .unwrap();
-
         for target in [
             format!("http://example.invalid/prefix/api/assets/{ASSET}/original"),
             format!("https://user:pass@example.invalid/prefix/api/assets/{ASSET}/original"),
             format!("https://example.invalid:444/prefix/api/assets/{ASSET}/original"),
         ] {
             assert!(!proxy.allowed_redirect(
-                &initial,
+                false,
                 &Url::parse(&target).unwrap(),
                 Uuid::parse_str(ASSET).unwrap()
             ));
