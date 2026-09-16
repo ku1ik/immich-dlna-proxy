@@ -86,7 +86,6 @@ impl Subscriptions {
             .no_deflate()
             .no_zstd()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(CALLBACK_TIMEOUT)
             .build()?;
 
         Ok(Self {
@@ -1880,16 +1879,7 @@ mod tests {
                 limit,
                 limit + Duration::from_secs(1),
             ] {
-                let mut subscriptions = Subscriptions::new().unwrap();
-
-                if body_pending {
-                    // Exercise our total deadline without reqwest's own timer masking it.
-                    subscriptions.client = reqwest::Client::builder()
-                        .no_proxy()
-                        .pool_max_idle_per_host(0)
-                        .build()
-                        .unwrap();
-                }
+                let subscriptions = Subscriptions::new().unwrap();
 
                 let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
                 let mut callback = Callback::new().await;
