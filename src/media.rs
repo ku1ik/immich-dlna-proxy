@@ -34,6 +34,13 @@ enum Failure {
     Timeout,
 }
 
+#[derive(Clone, Copy)]
+struct MediaRoute {
+    endpoint: &'static str,
+    expected_mime: Option<&'static str>,
+    edited: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ByteRange {
     From(u64, Option<u64>),
@@ -106,18 +113,30 @@ impl MediaProxy {
         };
 
         let route = match representation {
-            "original" => ("original", None, false),
-            "display" => (
-                "thumbnail?size=fullsize&edited=true",
-                Some("image/jpeg"),
-                true,
-            ),
-            "preview" => (
-                "thumbnail?size=preview&edited=true",
-                Some("image/jpeg"),
-                true,
-            ),
-            "playback" => ("video/playback", Some("video/mp4"), false),
+            "original" => MediaRoute {
+                endpoint: "original",
+                expected_mime: None,
+                edited: false,
+            },
+
+            "display" => MediaRoute {
+                endpoint: "thumbnail?size=fullsize&edited=true",
+                expected_mime: Some("image/jpeg"),
+                edited: true,
+            },
+
+            "preview" => MediaRoute {
+                endpoint: "thumbnail?size=preview&edited=true",
+                expected_mime: Some("image/jpeg"),
+                edited: true,
+            },
+
+            "playback" => MediaRoute {
+                endpoint: "video/playback",
+                expected_mime: Some("video/mp4"),
+                edited: false,
+            },
+
             _ => return response(StatusCode::NOT_FOUND),
         };
 
@@ -177,12 +196,16 @@ impl MediaProxy {
     async fn request(
         &self,
         asset: Uuid,
-        route: (&str, Option<&str>, bool),
+        route: MediaRoute,
         method: Method,
         headers: HeaderMap,
         permit: OwnedSemaphorePermit,
     ) -> Result<Response, Failure> {
-        let (endpoint, expected_mime, edited) = route;
+        let MediaRoute {
+            endpoint,
+            expected_mime,
+            edited,
+        } = route;
 
         let mut url = self
             .api_base
