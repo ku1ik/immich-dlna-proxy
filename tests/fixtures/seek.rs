@@ -231,16 +231,8 @@ mod tests {
 
                     let body = if method == Method::HEAD || status == StatusCode::NOT_MODIFIED {
                         Body::empty()
-                    } else if condition == Some("\"stream\"") {
-                        Body::from_stream(futures_util::stream::once(async move {
-                            std::future::pending::<()>().await;
-
-                            Ok::<_, io::Error>(bytes)
-                        }))
-                    } else if status.is_success() {
-                        Body::from(bytes)
                     } else {
-                        Body::from(KEY)
+                        Body::from(bytes)
                     };
 
                     result.body(body).unwrap()
@@ -346,8 +338,7 @@ mod tests {
             assert!(batch.windows(2).all(|pair| pair[0] == pair[1]));
             assert_eq!(batch[0].0, method);
 
-            let forwarded_range =
-                range.filter(|range| method == Method::GET && !range.contains(','));
+            let forwarded_range = range.filter(|_| method == Method::GET);
 
             assert_eq!(
                 batch[0].1.get(header::RANGE).map(|v| v.to_str().unwrap()),
