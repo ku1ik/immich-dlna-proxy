@@ -566,7 +566,7 @@ fn client_for(listener: &TcpListener) -> Client {
 }
 
 #[tokio::test(start_paused = true)]
-async fn ready_headers_before_at_and_after_header_or_request_deadline() {
+async fn headers_complete_before_deadline_or_stalled_requests_time_out() {
     use futures_util::FutureExt;
     use std::{future::Future, task::Wake};
     use tokio::{
@@ -635,14 +635,18 @@ async fn ready_headers_before_at_and_after_header_or_request_deadline() {
             assert!(request.as_mut().poll(&mut context).is_pending());
             let _ = wake.0.notified().now_or_never();
 
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]")
-                .await
-                .unwrap();
+            if elapsed < limit {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]")
+                    .await
+                    .unwrap();
 
-            wake.0.notified().await;
+                wake.0.notified().await;
+            }
+
             assert_eq!(Instant::now(), started);
-            tokio::time::advance(elapsed).await;
+            // Allow for Tokio's millisecond timer granularity.
+            tokio::time::advance(elapsed + Duration::from_millis(1)).await;
             let result = request.await;
 
             if elapsed < limit {

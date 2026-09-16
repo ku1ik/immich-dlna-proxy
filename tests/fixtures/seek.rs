@@ -6,7 +6,6 @@ use axum::{Router, body::Body, extract::Request, response::Response};
 use http::{HeaderValue, Method, StatusCode, header};
 use hyper_util::{rt::TokioIo, service::TowerToHyperService};
 use immich_dlna_proxy::{
-    deadline::timeout_at,
     lifecycle::SHUTDOWN_GRACE,
     media::MediaProxy,
     server::{CONNECTIONS, HEADER_TIMEOUT, WRITE_IDLE_TIMEOUT},
@@ -17,7 +16,7 @@ use tokio::{
     net::TcpListener,
     sync::OwnedSemaphorePermit,
     task::JoinSet,
-    time::Instant,
+    time::{Instant, timeout_at},
 };
 use tokio_util::sync::CancellationToken;
 

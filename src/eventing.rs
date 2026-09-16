@@ -9,12 +9,15 @@ use std::{
 use axum::{body::Body, response::Response};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use http::{HeaderMap, Method, StatusCode, header};
-use tokio::{sync::Notify, time::Instant};
+use tokio::{
+    sync::Notify,
+    time::{Instant, timeout_at},
+};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{deadline, protocol::Service, transport::HEADER_BYTES};
+use crate::{protocol::Service, transport::HEADER_BYTES};
 
 pub(crate) const SUBSCRIPTIONS: usize = 32;
 const CALLBACK_URLS: usize = 4;
@@ -589,11 +592,10 @@ async fn deliver(
                 .header(header::ACCEPT_ENCODING, "identity")
                 .body(body.clone());
 
-            let mut response =
-                deadline::timeout_at(header_deadline, async { request.send().await })
-                    .await
-                    .ok()?
-                    .ok()?;
+            let mut response = timeout_at(header_deadline, async { request.send().await })
+                .await
+                .ok()?
+                .ok()?;
 
             let status = response.status();
 
@@ -621,7 +623,7 @@ async fn deliver(
             Some(status)
         };
 
-        let result = deadline::timeout_at(deadline, attempt).await;
+        let result = timeout_at(deadline, attempt).await;
 
         match result {
             Ok(Some(StatusCode::OK)) => {
@@ -2140,7 +2142,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn callback_ready_at_deadline_obeys_header_and_total_limits() {
+    async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
         use std::{future::Future, task::Wake};
 
         use futures_util::FutureExt;
@@ -2255,25 +2257,30 @@ mod tests {
                         usize::from(body_pending)
                     );
 
-                    socket
-                        .get_mut()
-                        .write_all(response.as_bytes())
-                        .await
-                        .unwrap();
+                    if body_pending || elapsed < limit {
+                        socket
+                            .get_mut()
+                            .write_all(response.as_bytes())
+                            .await
+                            .unwrap();
 
-                    wake.0.notified().await;
-
-                    if body_pending {
-                        // Observe headers on time, then stop polling while the body becomes ready.
-                        assert!(scheduler.as_mut().poll(&mut context).is_pending());
-                        let _ = wake.0.notified().now_or_never();
-                        socket.get_mut().write_all(b"x").await.unwrap();
                         wake.0.notified().await;
                     }
 
-                    // The response has woken the scheduler, but only poll it at the chosen boundary.
+                    if body_pending {
+                        // Observe headers on time; only timely callbacks supply a body.
+                        assert!(scheduler.as_mut().poll(&mut context).is_pending());
+                        let _ = wake.0.notified().now_or_never();
+
+                        if elapsed < limit {
+                            socket.get_mut().write_all(b"x").await.unwrap();
+                            wake.0.notified().await;
+                        }
+                    }
+
+                    // Leave slow callbacks pending through expiry, allowing for timer granularity.
                     assert_eq!(Instant::now(), started);
-                    tokio::time::advance(elapsed).await;
+                    tokio::time::advance(elapsed + Duration::from_millis(1)).await;
                     assert!(scheduler.as_mut().poll(&mut context).is_pending());
                     let expired = elapsed >= limit;
                     let rejected = !expired && status == 412;

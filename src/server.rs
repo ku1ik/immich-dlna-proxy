@@ -313,29 +313,25 @@ impl<C: Catalog> Server<C> {
 
         let body_deadline = started + self.timing.body;
 
-        let body = match crate::deadline::timeout_at(
-            body_deadline,
-            axum::body::to_bytes(body, SOAP_BODY_BYTES),
-        )
-        .await
-        {
-            Ok(Ok(body)) => body,
+        let body =
+            match timeout_at(body_deadline, axum::body::to_bytes(body, SOAP_BODY_BYTES)).await {
+                Ok(Ok(body)) => body,
 
-            Err(_) => return empty(StatusCode::REQUEST_TIMEOUT),
+                Err(_) => return empty(StatusCode::REQUEST_TIMEOUT),
 
-            Ok(Err(error)) => {
-                use std::error::Error;
+                Ok(Err(error)) => {
+                    use std::error::Error;
 
-                if error
-                    .source()
-                    .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
-                {
-                    return soap(Err(Fault { code: 501 }));
+                    if error
+                        .source()
+                        .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+                    {
+                        return soap(Err(Fault { code: 501 }));
+                    }
+
+                    return empty(StatusCode::BAD_REQUEST);
                 }
-
-                return empty(StatusCode::BAD_REQUEST);
-            }
-        };
+            };
 
         // Acquisition has its own HTTP errors; only an acquired body enters SOAP processing.
         let deadline = started + self.timing.processing;
@@ -378,7 +374,7 @@ impl<C: Catalog> Server<C> {
             None
         };
 
-        let result = crate::deadline::timeout_at(deadline, async {
+        let result = timeout_at(deadline, async {
             let args = match action {
                 Action::Browse(args) => {
                     let filter = args.filter.clone();
@@ -1160,7 +1156,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn regression_ready_body_at_or_after_deadline_is_not_admitted() {
+    async fn ready_body_can_complete_after_body_deadline_but_processing_is_still_bounded() {
         for (poll_pending_first, late) in [
             (false, Duration::ZERO),
             (true, Duration::from_secs(1)),
@@ -1208,8 +1204,23 @@ mod tests {
             tokio::time::advance(server.timing.body + late).await;
             send.send(payload).unwrap();
             let response = response.await;
-            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
-            assert_eq!(server.catalog.calls.load(Ordering::SeqCst), 0);
+            let processing_expired = server.timing.body + late >= server.timing.processing;
+
+            assert_eq!(
+                response.status(),
+                if processing_expired {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                }
+            );
+
+            assert_eq!(
+                server.catalog.calls.load(Ordering::SeqCst),
+                usize::from(!processing_expired)
+            );
+
+            drop(response);
             assert_eq!(server.browses.available_permits(), BROWSES);
         }
     }

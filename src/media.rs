@@ -2,11 +2,12 @@ use std::{sync::Arc, time::Duration};
 
 use axum::{body::Body, response::Response};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
-use tokio::{sync::Semaphore, time::Instant};
+use tokio::{
+    sync::Semaphore,
+    time::{Instant, timeout_at},
+};
 use url::Url;
 use uuid::Uuid;
-
-use crate::deadline::timeout_at;
 
 pub const OPERATIONS: usize = 16;
 const REDIRECTS: usize = 3;
@@ -1906,7 +1907,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_chunks_and_eof_at_or_after_idle_deadline_are_rejected() {
+    async fn chunk_reads_allow_backpressure_but_time_out_when_upstream_stalls() {
         for eof in [false, true] {
             for elapsed in [59, 60, 61] {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1966,19 +1967,22 @@ mod tests {
                         .is_pending()
                 );
 
-                tokio::time::advance(Duration::from_secs(elapsed)).await;
+                tokio::time::advance(Duration::from_secs(elapsed) + Duration::from_millis(1)).await;
                 let _ = wake.0.notified().now_or_never();
 
-                socket
-                    .write_all(if eof { b"0\r\n\r\n" } else { b"1\r\nb\r\n" })
-                    .await
-                    .unwrap();
+                if elapsed < 60 {
+                    socket
+                        .write_all(if eof { b"0\r\n\r\n" } else { b"1\r\nb\r\n" })
+                        .await
+                        .unwrap();
 
-                wake.0.notified().await;
+                    wake.0.notified().await;
+                }
+
                 let result = next.await;
 
                 if elapsed >= 60 {
-                    let error = result.expect("late EOF must fail").unwrap_err();
+                    let error = result.expect("stalled read must fail").unwrap_err();
                     assert!(error.to_string().contains("upstream deadline exceeded"));
                 } else if eof {
                     assert!(result.is_none());

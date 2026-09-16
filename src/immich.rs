@@ -8,11 +8,14 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Result, anyhow, ensure};
 use http::{HeaderValue, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::{sync::OnceCell, time::Instant};
+use tokio::{
+    sync::OnceCell,
+    time::{Instant, timeout_at},
+};
 use url::Url;
 use uuid::Uuid;
 
-use crate::deadline::{self, Budget};
+use crate::deadline::Budget;
 
 pub(crate) const SEARCH_PAGE_SIZE: usize = 1_000;
 const JSON_BYTES: usize = 16 * 1024 * 1024;
@@ -201,7 +204,7 @@ impl Client {
             .deadline
             .min(Instant::now() + RESPONSE_HEADER_TIMEOUT);
 
-        let response = deadline::timeout_at(header_deadline, async { request.send().await }).await;
+        let response = timeout_at(header_deadline, async { request.send().await }).await;
 
         budget.check()?;
 
