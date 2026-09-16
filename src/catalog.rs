@@ -1165,7 +1165,6 @@ struct Inner {
     permits: Arc<Semaphore>,
     supervisor: Mutex<Supervisor>,
     wake: Notify,
-    preparation_timeout: Duration,
     #[cfg(test)]
     publication: Mutex<Option<Arc<tests::Barrier>>>,
     #[cfg(test)]
@@ -1435,7 +1434,6 @@ impl Library {
                     running: false,
                 }),
                 wake: Notify::new(),
-                preparation_timeout: PREPARATION_TIMEOUT,
                 #[cfg(test)]
                 publication: Mutex::new(None),
                 #[cfg(test)]
@@ -1555,7 +1553,7 @@ impl Library {
                 };
 
                 let library = self.clone();
-                let deadline = now + self.inner.preparation_timeout;
+                let deadline = now + PREPARATION_TIMEOUT;
 
                 supervisor.tasks.spawn(async move {
                     flight.result =
@@ -5422,113 +5420,105 @@ mod tests {
         }
 
         // Stall version checking, album listing, or a later search page.
-        for stage in 0..3 {
-            for body_pending in [false, true] {
-                let mut fixture = Fixture::new(1).await;
-                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let inner = Arc::get_mut(&mut fixture.library.inner).unwrap();
-                inner.preparation_timeout = Duration::from_secs(10);
+        for (stage, body_pending) in [(0, true), (1, false), (1, true), (2, false), (2, true)] {
+            let mut fixture = Fixture::new(1).await;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let inner = Arc::get_mut(&mut fixture.library.inner).unwrap();
 
-                inner.source.client = Client::new(
-                    format!("http://{}/api/", listener.local_addr().unwrap())
-                        .parse()
-                        .unwrap(),
-                    HeaderValue::from_static("fake-key"),
-                )
-                .unwrap();
+            inner.source.client = Client::new(
+                format!("http://{}/api/", listener.local_addr().unwrap())
+                    .parse()
+                    .unwrap(),
+                HeaderValue::from_static("fake-key"),
+            )
+            .unwrap();
 
-                tokio::time::pause();
+            tokio::time::pause();
 
-                // Advance only explicitly while exchanging loopback responses.
-                let clock_guard = tokio::spawn(async {
-                    loop {
-                        tokio::task::yield_now().await;
-                    }
-                });
-
-                let task = fixture.run();
-                let caller = browse(&fixture.library, children(1));
-                let (mut socket, _) = request(&listener, "/api/server/version").await;
-
-                if stage > 0 {
-                    if stage == 1 {
-                        tokio::time::advance(Duration::from_secs(6)).await;
-                    }
-
-                    respond(
-                        socket,
-                        json!({"major": 3, "minor": 1, "patch": 0, "prerelease": null}),
-                    )
-                    .await;
-
-                    (socket, _) = request(&listener, "/api/albums").await;
+            // Advance only explicitly while exchanging loopback responses.
+            let clock_guard = tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
                 }
+            });
 
-                if stage == 2 {
-                    respond(socket, json!([album(1, "Album")])).await;
-                    let (first, query) = request(&listener, "/api/search/metadata").await;
-                    assert_eq!(query["page"], 1);
+            let task = fixture.run();
+            let caller = browse(&fixture.library, children(1));
+            let (mut socket, _) = request(&listener, "/api/server/version").await;
+
+            if stage > 0 {
+                if stage == 1 {
                     tokio::time::advance(Duration::from_secs(6)).await;
-
-                    respond(first, json!({"assets": {"items": [crate::immich::tests::asset(1, "IMAGE")], "nextPage": "2"}})).await;
-
-                    let query;
-                    (socket, query) = request(&listener, "/api/search/metadata").await;
-                    assert_eq!(query["page"], 2);
                 }
 
-                if body_pending {
-                    socket
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n[")
-                        .await
-                        .unwrap();
-                }
+                respond(
+                    socket,
+                    json!({"major": 3, "minor": 1, "patch": 0, "prerelease": null}),
+                )
+                .await;
 
-                assert!(!caller.is_finished());
-                let before = fixture.disk();
-
-                // Earlier requests consumed six seconds; a new page gets no new window.
-                tokio::time::advance(Duration::from_secs(if stage == 0 { 11 } else { 5 })).await;
-
-                clock_guard.abort();
-                assert!(clock_guard.await.unwrap_err().is_cancelled());
-                fault(caller, 501).await;
-                assert_eq!(fixture.disk(), before);
-                assert_eq!(fixture.library.inner.permits.available_permits(), REFRESHES);
-
-                assert!(
-                    fixture
-                        .library
-                        .inner
-                        .state
-                        .lock()
-                        .unwrap()
-                        .flights
-                        .is_empty()
-                );
-
-                assert_eq!(
-                    tokio::time::timeout(Duration::from_secs(1), socket.read(&mut [0; 1]))
-                        .await
-                        .unwrap()
-                        .unwrap(),
-                    0
-                );
-
-                fixture.abort(task).await;
-                tokio::time::resume();
+                (socket, _) = request(&listener, "/api/albums").await;
             }
+
+            if stage == 2 {
+                respond(socket, json!([album(1, "Album")])).await;
+                let (first, query) = request(&listener, "/api/search/metadata").await;
+                assert_eq!(query["page"], 1);
+                tokio::time::advance(Duration::from_secs(6)).await;
+
+                respond(first, json!({"assets": {"items": [crate::immich::tests::asset(1, "IMAGE")], "nextPage": "2"}})).await;
+
+                let query;
+                (socket, query) = request(&listener, "/api/search/metadata").await;
+                assert_eq!(query["page"], 2);
+            }
+
+            if body_pending {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n[")
+                    .await
+                    .unwrap();
+            }
+
+            assert!(!caller.is_finished());
+            let before = fixture.disk();
+
+            // Earlier requests consumed six seconds; a new page gets no new window.
+            tokio::time::advance(Duration::from_secs(if stage == 0 { 21 } else { 15 })).await;
+
+            clock_guard.abort();
+            assert!(clock_guard.await.unwrap_err().is_cancelled());
+            fault(caller, 501).await;
+            assert_eq!(fixture.disk(), before);
+            assert_eq!(fixture.library.inner.permits.available_permits(), REFRESHES);
+
+            assert!(
+                fixture
+                    .library
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .flights
+                    .is_empty()
+            );
+
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), socket.read(&mut [0; 1]))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+
+            fixture.abort(task).await;
+            tokio::time::resume();
         }
     }
 
     #[tokio::test]
     async fn whole_permit_covers_commit_wait_and_preparation_timeout_cleans_flight() {
-        let mut fixture = Fixture::new(1).await;
-
-        Arc::get_mut(&mut fixture.library.inner)
-            .unwrap()
-            .preparation_timeout = Duration::from_millis(150);
-
+        let fixture = Fixture::new(1).await;
         let task = fixture.run();
 
         fixture
@@ -5545,9 +5535,13 @@ mod tests {
 
         let caller = browse(&fixture.library, children(1));
         barrier.entered().await;
+        tokio::time::pause();
         barrier.release.add_permits(1);
+        tokio::task::yield_now().await;
         assert_eq!(fixture.library.inner.permits.available_permits(), 3);
         let before = fixture.disk();
+        tokio::time::advance(PREPARATION_TIMEOUT + Duration::from_millis(1)).await;
+        tokio::time::resume();
         fault(caller, 501).await;
         assert_eq!(fixture.disk(), before);
         assert_eq!(fixture.library.inner.permits.available_permits(), 4);
