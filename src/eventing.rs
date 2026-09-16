@@ -25,7 +25,6 @@ const DELIVERIES: usize = 4;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 const CALLBACK_BODY_BYTES: usize = 8 * 1024;
 pub(crate) const MODERATION: Duration = Duration::from_secs(2);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
@@ -75,17 +74,9 @@ impl State {
 
 impl Subscriptions {
     pub fn new() -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
+        let client = crate::outbound_client_builder()
             // Callback-port churn must not accumulate idle sockets across origins.
             .pool_max_idle_per_host(0)
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd()
-            .connect_timeout(CONNECT_TIMEOUT)
             .build()?;
 
         Ok(Self {

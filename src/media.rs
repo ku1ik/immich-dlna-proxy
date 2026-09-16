@@ -13,7 +13,6 @@ use crate::config::is_normalized_api_base;
 
 const OPERATIONS: usize = 16;
 const REDIRECTS: usize = 3;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -83,16 +82,7 @@ impl MediaProxy {
 
         api_key.set_sensitive(true);
 
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()?;
+        let client = crate::outbound_client_builder().build()?;
 
         Ok(Self {
             client,

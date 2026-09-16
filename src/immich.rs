@@ -16,7 +16,6 @@ use crate::config::is_normalized_api_base;
 
 pub(crate) const SEARCH_PAGE_SIZE: usize = 1_000;
 const JSON_BYTES: usize = 16 * 1024 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
@@ -146,15 +145,7 @@ impl Client {
 
         api_key.set_sensitive(true);
 
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd()
-            .connect_timeout(CONNECT_TIMEOUT)
+        let client = crate::outbound_client_builder()
             .build()
             .map_err(|_| anyhow!("cannot initialize Immich HTTP client"))?;
 

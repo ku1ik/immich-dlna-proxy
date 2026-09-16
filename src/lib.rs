@@ -9,6 +9,18 @@ pub mod protocol;
 pub mod server;
 pub mod ssdp;
 
+pub(crate) fn outbound_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .connect_timeout(std::time::Duration::from_secs(5))
+}
+
 pub fn server_header() -> &'static str {
     static HEADER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
