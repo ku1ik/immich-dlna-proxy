@@ -26,7 +26,7 @@ use crate::{
 };
 
 pub const HEADER_BYTES: usize = 16 * 1024;
-pub(crate) const SOAP_BODY_BYTES: usize = 64 * 1024;
+const SOAP_BODY_BYTES: usize = 64 * 1024;
 const BROWSES: usize = 8;
 const BODY_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_PROCESSING_TIMEOUT: Duration = Duration::from_secs(25);
@@ -37,21 +37,6 @@ pub struct Server<C> {
     subscriptions: Subscriptions,
     device: String,
     browses: Semaphore,
-    timing: Timing,
-}
-
-struct Timing {
-    body: Duration,
-    processing: Duration,
-}
-
-impl Default for Timing {
-    fn default() -> Self {
-        Self {
-            body: BODY_TIMEOUT,
-            processing: CONTROL_PROCESSING_TIMEOUT,
-        }
-    }
 }
 
 impl<C: Catalog> Server<C> {
@@ -68,7 +53,6 @@ impl<C: Catalog> Server<C> {
             subscriptions,
             device: protocol::device_description(&friendly_name, uuid),
             browses: Semaphore::new(BROWSES),
-            timing: Timing::default(),
         }
     }
 
@@ -233,7 +217,7 @@ impl<C: Catalog> Server<C> {
             return soap(Err(Fault { code: 501 }));
         }
 
-        let body_deadline = started + self.timing.body;
+        let body_deadline = started + BODY_TIMEOUT;
 
         let body =
             match timeout_at(body_deadline, axum::body::to_bytes(body, SOAP_BODY_BYTES)).await {
@@ -256,7 +240,7 @@ impl<C: Catalog> Server<C> {
             };
 
         // Acquisition has its own HTTP errors; only an acquired body enters SOAP processing.
-        let deadline = started + self.timing.processing;
+        let deadline = started + CONTROL_PROCESSING_TIMEOUT;
 
         if Instant::now() >= deadline {
             return soap(Err(Fault { code: 501 }));
@@ -752,10 +736,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn soap_body_and_processing_deadlines_are_retained() {
-        let mut server = server(TestCatalog::default());
-        server.timing.body = Duration::from_secs(2);
-        server.timing.processing = Duration::from_secs(3);
+    async fn soap_body_bounds_and_processing_deadlines_are_retained() {
+        let server = server(TestCatalog::default());
 
         let (send, receive) = oneshot::channel::<bytes::Bytes>();
         let stalled_body = Body::from_stream(futures_util::stream::once(async move {
@@ -767,9 +749,27 @@ mod tests {
         let response = server.route(stalled, Ipv4Addr::LOCALHOST);
         tokio::pin!(response);
         assert!(futures_util::poll!(&mut response).is_pending());
-        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::advance(BODY_TIMEOUT).await;
         assert_eq!(response.await.status(), StatusCode::REQUEST_TIMEOUT);
         drop(send);
+
+        let (parts, exact_body) = action(CDS, "GetSystemUpdateID", "").into_parts();
+
+        let mut exact_body = axum::body::to_bytes(exact_body, SOAP_BODY_BYTES)
+            .await
+            .unwrap()
+            .to_vec();
+
+        exact_body.resize(SOAP_BODY_BYTES, b' ');
+        let mut exact = Request::from_parts(parts, Body::from(exact_body));
+
+        exact.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&SOAP_BODY_BYTES.to_string()).unwrap(),
+        );
+
+        let response = server.route(exact, Ipv4Addr::LOCALHOST).await;
+        assert_eq!(response.status(), StatusCode::OK);
 
         let mut declared = action(CDS, "GetSystemUpdateID", "");
         declared.headers_mut().insert(
@@ -792,7 +792,7 @@ mod tests {
                 Service::ContentDirectory,
                 parts.headers,
                 request_body,
-                Instant::now() - Duration::from_secs(3),
+                Instant::now() - CONTROL_PROCESSING_TIMEOUT,
                 Ipv4Addr::LOCALHOST,
             )
             .await;

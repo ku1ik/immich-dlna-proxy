@@ -1264,15 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn soap_accepts_the_server_body_bound_and_rejects_deep_argument_trees() {
-        let base = request("GetSortCapabilities", "");
-        let exact = format!(
-            "{}{}",
-            base,
-            " ".repeat(crate::server::SOAP_BODY_BYTES - base.len())
-        );
-        assert!(parse(&exact, "GetSortCapabilities").is_ok());
-
+    fn soap_rejects_deep_argument_trees() {
         let nested = format!(
             "{}x{}",
             "<nested>".repeat(XML_DEPTH + 1),
