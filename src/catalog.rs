@@ -1256,7 +1256,7 @@ impl Cache {
         let scope = match candidate {
             Candidate::Root(snapshot) => {
                 self.root = Some(Cached {
-                    snapshot,
+                    snapshot: Arc::new(snapshot),
                     completed: now,
                     used: now,
                 });
@@ -1268,7 +1268,7 @@ impl Cache {
                 self.albums.insert(
                     id,
                     Cached {
-                        snapshot,
+                        snapshot: Arc::new(snapshot),
                         completed: now,
                         used: now,
                     },
@@ -1351,8 +1351,8 @@ impl Token {
 }
 
 enum Candidate {
-    Root(Arc<Root>),
-    Album(Uuid, Arc<Contents>),
+    Root(Root),
+    Album(Uuid, Contents),
 }
 
 // Created before spawning, so even cancellation before the first poll cleans up.
@@ -1375,7 +1375,8 @@ impl Drop for Flight {
 
         state.flights.remove(&self.scope);
         drop(self.permit.take());
-        self.sender.send_replace(Some(self.result.clone()));
+        let result = std::mem::replace(&mut self.result, Err(FAILED));
+        self.sender.send_replace(Some(result));
         drop(state);
         self.library.inner.wake.notify_one();
     }
@@ -1598,10 +1599,8 @@ impl Library {
 
         let prepare = async {
             let candidate = match scope {
-                Scope::Root => Candidate::Root(Arc::new(self.inner.source.root().await?)),
-                Scope::Album(id) => {
-                    Candidate::Album(id, Arc::new(self.inner.source.contents(id).await?))
-                }
+                Scope::Root => Candidate::Root(self.inner.source.root().await?),
+                Scope::Album(id) => Candidate::Album(id, self.inner.source.contents(id).await?),
             };
 
             #[cfg(test)]
