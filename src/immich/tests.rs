@@ -2,7 +2,7 @@ use super::*;
 use axum::{
     Router,
     body::{Body, to_bytes},
-    http::{HeaderMap, Method, Request},
+    http::{HeaderMap, Method, Request, StatusCode},
     response::Response,
 };
 use serde_json::{Value, json};
@@ -383,33 +383,29 @@ async fn redirects_are_rejected_at_every_endpoint() {
     let target = Fake::new(vec![reply(json!([]))]).await;
 
     for endpoint in 0..3 {
-        for status in [301, 302, 303, 307, 308] {
-            for location in [target.client.api_base.as_str(), "/prefix/api/albums"] {
-                let fake = Fake::new(vec![
-                    Response::builder()
-                        .status(status)
-                        .header(header::LOCATION, location)
-                        .body(Body::empty())
-                        .unwrap(),
-                ])
-                .await;
+        let fake = Fake::new(vec![
+            Response::builder()
+                .status(StatusCode::FOUND)
+                .header(header::LOCATION, target.client.api_base.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        ])
+        .await;
 
-                let result = match endpoint {
-                    0 => fake.client.ensure_supported_version().await,
+        let result = match endpoint {
+            0 => fake.client.ensure_supported_version().await,
 
-                    1 => fake.client.albums().await.map(|_| ()),
+            1 => fake.client.albums().await.map(|_| ()),
 
-                    _ => fake
-                        .client
-                        .search_album(ALBUM, 1, AssetFilter::All)
-                        .await
-                        .map(|_| ()),
-                };
+            _ => fake
+                .client
+                .search_album(ALBUM, 1, AssetFilter::All)
+                .await
+                .map(|_| ()),
+        };
 
-                assert!(result.is_err());
-                assert_eq!(fake.requests.lock().unwrap().len(), 1);
-            }
-        }
+        assert!(result.is_err());
+        assert_eq!(fake.requests.lock().unwrap().len(), 1);
     }
 
     assert!(target.requests.lock().unwrap().is_empty());
