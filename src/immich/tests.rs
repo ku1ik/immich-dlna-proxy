@@ -136,11 +136,7 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
         Some("2024-01-01T00:30:00+02:00")
     );
 
-    let result = fake
-        .client
-        .search_album(ALBUM, 1, AssetFilter::All)
-        .await
-        .unwrap();
+    let result = fake.client.search_album(ALBUM, 1, false).await.unwrap();
 
     assert_eq!(result.next_page, Some(2));
     assert_eq!(result.items.len(), 2);
@@ -156,11 +152,7 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
 
     assert_eq!(fake.requests.lock().unwrap().len(), 2);
 
-    let result = fake
-        .client
-        .search_album(ALBUM, 2, AssetFilter::EncodedVideos)
-        .await
-        .unwrap();
+    let result = fake.client.search_album(ALBUM, 2, true).await.unwrap();
 
     assert_eq!(result.next_page, None);
     assert_eq!(result.items[0].id, Uuid::from_u128(2));
@@ -210,10 +202,7 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
             let fake = Fake::new(vec![page(vec![dto], None)]).await;
 
             assert!(
-                fake.client
-                    .search_album(ALBUM, 1, AssetFilter::All)
-                    .await
-                    .is_err(),
+                fake.client.search_album(ALBUM, 1, false).await.is_err(),
                 "{field}"
             );
         }
@@ -232,10 +221,7 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
         let fake = Fake::new(vec![page(vec![dto], None)]).await;
 
         assert!(
-            fake.client
-                .search_album(ALBUM, 1, AssetFilter::All)
-                .await
-                .is_err(),
+            fake.client.search_album(ALBUM, 1, false).await.is_err(),
             "{field}"
         );
     }
@@ -249,12 +235,7 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
     ] {
         let fake = Fake::new(vec![reply(response)]).await;
 
-        assert!(
-            fake.client
-                .search_album(ALBUM, 1, AssetFilter::All)
-                .await
-                .is_err()
-        );
+        assert!(fake.client.search_album(ALBUM, 1, false).await.is_err());
     }
 
     let mut dto = asset(1, "IMAGE");
@@ -275,11 +256,7 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
     dto["stack"] = json!({"unexpected": [1, 2, 3]});
     let fake = Fake::new(vec![page(vec![dto], None)]).await;
 
-    let result = fake
-        .client
-        .search_album(ALBUM, 1, AssetFilter::All)
-        .await
-        .unwrap();
+    let result = fake.client.search_album(ALBUM, 1, false).await.unwrap();
 
     assert_eq!(result.items.len(), 1);
     assert!(result.items[0].file_created_at.is_none());
@@ -293,10 +270,7 @@ async fn search_validates_page_numbers_and_continuation_tokens() {
         let fake = Fake::new(vec![page(vec![], Some(next))]).await;
 
         assert!(
-            fake.client
-                .search_album(ALBUM, 1, AssetFilter::All)
-                .await
-                .is_err(),
+            fake.client.search_album(ALBUM, 1, false).await.is_err(),
             "{next}"
         );
 
@@ -305,18 +279,13 @@ async fn search_validates_page_numbers_and_continuation_tokens() {
 
     let fake = Fake::new(vec![page(vec![], Some("0"))]).await;
 
-    assert!(
-        fake.client
-            .search_album(ALBUM, 0, AssetFilter::All)
-            .await
-            .is_err()
-    );
+    assert!(fake.client.search_album(ALBUM, 0, false).await.is_err());
 
     assert!(fake.requests.lock().unwrap().is_empty());
 
     assert!(
         fake.client
-            .search_album(ALBUM, usize::MAX, AssetFilter::All)
+            .search_album(ALBUM, usize::MAX, false)
             .await
             .is_err()
     );
@@ -397,11 +366,7 @@ async fn redirects_are_rejected_at_every_endpoint() {
 
             1 => fake.client.albums().await.map(|_| ()),
 
-            _ => fake
-                .client
-                .search_album(ALBUM, 1, AssetFilter::All)
-                .await
-                .map(|_| ()),
+            _ => fake.client.search_album(ALBUM, 1, false).await.map(|_| ()),
         };
 
         assert!(result.is_err());

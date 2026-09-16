@@ -66,29 +66,13 @@ pub(crate) struct AssetPage {
     pub(crate) next_page: Option<usize>,
 }
 
-/// Both searches exclude deleted assets and omit EXIF and people data.
-#[derive(Clone, Copy)]
-pub(crate) enum AssetFilter {
-    All,
-    EncodedVideos,
-}
-
 #[derive(Deserialize)]
 struct Version {
     major: u64,
     minor: u64,
     patch: u64,
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(deserialize_with = "Option::deserialize")]
     prerelease: Option<u64>,
-}
-
-// Unlike Option's default field handling, these API fields must be present.
-fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::deserialize(deserializer)
 }
 
 fn optional_date<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -117,7 +101,7 @@ struct SearchResponse {
 #[serde(rename_all = "camelCase")]
 struct SearchAssets {
     items: Vec<Asset>,
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(deserialize_with = "Option::deserialize")]
     next_page: Option<String>,
 }
 
@@ -232,10 +216,9 @@ impl Client {
         &self,
         album: Uuid,
         page: usize,
-        filter: AssetFilter,
+        encoded_videos: bool,
     ) -> Result<AssetPage> {
         ensure!(page > 0, "Immich search pages start at one");
-        let encoded = matches!(filter, AssetFilter::EncodedVideos);
 
         let query = Search {
             album_ids: [album],
@@ -244,8 +227,8 @@ impl Client {
             with_deleted: false,
             with_exif: false,
             with_people: false,
-            kind: encoded.then_some("VIDEO"),
-            is_encoded: encoded.then_some(true),
+            kind: encoded_videos.then_some("VIDEO"),
+            is_encoded: encoded_videos.then_some(true),
         };
 
         let result: SearchResponse = self

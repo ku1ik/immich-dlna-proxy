@@ -35,7 +35,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     eventing::Subscriptions,
-    immich::{self, Asset, AssetFilter, Client},
+    immich::{self, Asset, Client},
     protocol::{BrowseArguments, Fault, Object, Resource, xml_char},
 };
 
@@ -297,13 +297,7 @@ impl Source {
 
                 pages += 1;
 
-                let filter = if encoded {
-                    AssetFilter::EncodedVideos
-                } else {
-                    AssetFilter::All
-                };
-
-                let result = self.client.search_album(album, page, filter).await?;
+                let result = self.client.search_album(album, page, encoded).await?;
 
                 ensure!(
                     result.items.len() <= SEARCH_RECORDS - records,
