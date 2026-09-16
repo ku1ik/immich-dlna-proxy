@@ -102,12 +102,7 @@ pub async fn run(arguments: Arguments) -> anyhow::Result<()> {
 
     let bound = Bound::bind(arguments.listen, arguments.fixtures, mode).await?;
 
-    let discovery = Discovery::bind(
-        *arguments.listen.ip(),
-        interface_index,
-        bound.uuid,
-        arguments.listen,
-    )?;
+    let discovery = Discovery::bind(interface_index, bound.uuid, arguments.listen)?;
 
     tracing::info!(listen = %arguments.listen, upstream = %bound.upstream.local_addr()?, uuid = %bound.uuid, ?mode, "fixture server ready");
 

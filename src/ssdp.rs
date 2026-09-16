@@ -23,23 +23,25 @@ const MULTICAST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 2
 const STARTUP_REPEAT: Duration = Duration::from_secs(1);
 const RESPONSE_SPACING: Duration =
     Duration::from_nanos(1_000_000_000 / RESPONSES_PER_SECOND as u64);
+const TARGET_COUNT: usize = 5;
 
 pub struct Discovery {
     socket: UdpSocket,
     address: Ipv4Addr,
     interface_index: u32,
-    targets: [String; 5],
+    targets: [String; TARGET_COUNT],
     location: String,
 }
 
 impl Discovery {
     /// Bind without announcing; call `run` only after HTTP startup succeeds.
     pub fn bind(
-        address: Ipv4Addr,
         interface_index: u32,
         uuid: Uuid,
         http_address: SocketAddrV4,
     ) -> anyhow::Result<Self> {
+        let address = *http_address.ip();
+
         ensure!(is_unicast(address), "SSDP requires a unicast IPv4 address");
 
         ensure!(
@@ -48,8 +50,8 @@ impl Discovery {
         );
 
         ensure!(
-            *http_address.ip() == address && http_address.port() != 0 && !uuid.is_nil(),
-            "SSDP identity and HTTP address must match the configured server"
+            http_address.port() != 0 && !uuid.is_nil(),
+            "SSDP requires a nonzero HTTP port and server UUID"
         );
 
         let socket = make_socket(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MULTICAST.port()))
@@ -213,7 +215,7 @@ enum Message {
     Response,
 }
 
-fn targets(uuid: Uuid) -> [String; 5] {
+fn targets(uuid: Uuid) -> [String; TARGET_COUNT] {
     [
         "upnp:rootdevice".into(),
         format!("uuid:{uuid}"),
@@ -229,7 +231,7 @@ struct Search {
     mx: Duration,
 }
 
-fn parse_search(bytes: &[u8], targets: &[String; 5]) -> Option<Search> {
+fn parse_search(bytes: &[u8], targets: &[String; TARGET_COUNT]) -> Option<Search> {
     if bytes.len() > DATAGRAM_BYTES || !bytes.is_ascii() {
         return None;
     }
@@ -336,13 +338,17 @@ impl Responses {
     ) {
         self.pending.retain(|response| response.expires > now);
 
-        let count = if search.target.is_some() { 1 } else { 5 };
+        let count = if search.target.is_some() {
+            1
+        } else {
+            TARGET_COUNT
+        };
 
         if self.pending.len() + count > PENDING_RESPONSES {
             return;
         }
 
-        for target in 0..5 {
+        for target in 0..TARGET_COUNT {
             if search.target.is_some_and(|selected| selected != target) {
                 continue;
             }

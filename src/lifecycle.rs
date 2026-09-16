@@ -24,7 +24,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let http = TcpListener::bind(address)
         .await
         .context("cannot bind configured HTTP listener")?;
-    let discovery = Discovery::bind(*address.ip(), config.interface_index, uuid, address)?;
+    let discovery = Discovery::bind(config.interface_index, uuid, address)?;
     let library = Library::new(config, store, ledger, events.clone())?;
     let server = Server::new(name, uuid, library.clone(), media, events.clone());
     tracing::info!(%address, %uuid, "service started");
