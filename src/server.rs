@@ -436,13 +436,7 @@ fn soap(result: Result<String, Fault>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io,
-        sync::{
-            Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
-    };
+    use std::{io, sync::Mutex};
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -458,7 +452,6 @@ mod tests {
 
     #[derive(Default)]
     struct TestCatalog {
-        calls: AtomicUsize,
         actions: Mutex<Vec<BrowseArguments>>,
         entered: Notify,
         release: Option<Semaphore>,
@@ -470,7 +463,6 @@ mod tests {
         }
 
         async fn browse(&self, arguments: BrowseArguments) -> Result<BrowseResult, Fault> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
             self.actions.lock().unwrap().push(arguments);
             self.entered.notify_one();
 
@@ -629,7 +621,7 @@ mod tests {
             assert!(body(response).await.contains(fragment));
         }
 
-        assert_eq!(server.catalog.calls.load(Ordering::SeqCst), 0);
+        assert!(server.catalog.actions.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -715,7 +707,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(response.headers()[header::SERVER], crate::server_header());
-        assert_eq!(server.catalog.calls.load(Ordering::SeqCst), 0);
+        assert!(server.catalog.actions.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -783,7 +775,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body(response).await.contains("<errorCode>501</errorCode>"));
         assert_eq!(server.browses.available_permits(), BROWSES);
-        assert_eq!(server.catalog.calls.load(Ordering::SeqCst), 0);
+        assert!(server.catalog.actions.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -1892,14 +1892,13 @@ mod snapshot_tests {
     use http::Method;
     use serde_json::{Value, json};
 
-    use crate::immich::tests::{Fake as Api, Received, album, asset, page, reply, version};
+    use crate::immich::tests::{Fake as Api, album, asset, page, reply, version};
 
     const ALBUM: Uuid = Uuid::from_u128(100_000);
 
     struct SnapshotFixture {
         source: Source,
-        requests: Arc<Mutex<Vec<Received>>>,
-        _api: Api,
+        api: Api,
     }
 
     impl SnapshotFixture {
@@ -1912,11 +1911,7 @@ mod snapshot_tests {
                 "Photos".into(),
             );
 
-            Self {
-                source,
-                requests: api.requests.clone(),
-                _api: api,
-            }
+            Self { source, api }
         }
     }
 
@@ -2019,7 +2014,7 @@ mod snapshot_tests {
             assert!(parse_date(album.created_at.as_deref(), &mut 0).is_none());
         }
 
-        assert!(fake.requests.lock().unwrap().is_empty());
+        assert!(fake.api.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2075,7 +2070,7 @@ mod snapshot_tests {
 
         assert!(fake.source.root().await.unwrap().albums.is_empty());
 
-        let requests = fake.requests.lock().unwrap();
+        let requests = fake.api.requests.lock().unwrap();
         assert_eq!(requests.len(), 6);
         assert_eq!(requests[0].uri, "/prefix/api/server/version");
         assert_eq!(requests[1].uri, "/prefix/api/albums");
@@ -2189,7 +2184,7 @@ mod snapshot_tests {
 
         let result = fake.source.contents(ALBUM).await.unwrap();
         assert_eq!(result.items.len(), 1);
-        assert_eq!(fake.requests.lock().unwrap().len(), 1);
+        assert_eq!(fake.api.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -2311,7 +2306,7 @@ mod snapshot_tests {
 
             let fake = SnapshotFixture::new(replies).await;
             assert!(fake.source.contents(ALBUM).await.is_err());
-            assert_eq!(fake.requests.lock().unwrap().len(), 2);
+            assert_eq!(fake.api.requests.lock().unwrap().len(), 2);
         }
 
         for finish in [false, true] {
@@ -2332,7 +2327,7 @@ mod snapshot_tests {
 
             let fake = SnapshotFixture::new(replies).await;
             assert_eq!(fake.source.contents(ALBUM).await.is_ok(), finish);
-            assert_eq!(fake.requests.lock().unwrap().len(), SEARCH_PAGES);
+            assert_eq!(fake.api.requests.lock().unwrap().len(), SEARCH_PAGES);
         }
     }
 
@@ -2363,7 +2358,7 @@ mod snapshot_tests {
 
             assert_eq!(fake.source.contents(ALBUM).await.is_ok(), extra == 0);
 
-            assert_eq!(fake.requests.lock().unwrap().len(), 2);
+            assert_eq!(fake.api.requests.lock().unwrap().len(), 2);
         }
 
         let mut replies = Vec::new();
