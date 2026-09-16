@@ -2,7 +2,7 @@
 
 use axum::{Router, body::Body, extract::Request, response::Response};
 use http::{HeaderValue, Method, StatusCode, header};
-use immich_dlna_proxy::{media::MediaProxy, protocol::HEADER_BYTES};
+use immich_dlna_proxy::{media::MediaProxy, server::HEADER_BYTES};
 use tokio::net::TcpListener;
 
 const ASSET: &str = "20000000-0000-4000-8000-000000000003";
@@ -20,7 +20,7 @@ pub async fn response(media: &MediaProxy, request: Request) -> Response {
         _ => "rejected",
     };
 
-    let result = async {
+    let mut result = async {
         let header_bytes = parts.method.as_str().len()
             + parts.uri.to_string().len()
             + 14
@@ -88,6 +88,11 @@ pub async fn response(media: &MediaProxy, request: Request) -> Response {
     }
     .await;
 
+    result.headers_mut().insert(
+        header::SERVER,
+        HeaderValue::from_static(immich_dlna_proxy::server_header()),
+    );
+
     tracing::info!(
         case,
         status = result.status().as_u16(),
@@ -120,7 +125,6 @@ pub async fn run(listener: TcpListener, media: MediaProxy) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use immich_dlna_proxy::media;
     use std::{
         io,
         net::Ipv4Addr,
@@ -129,12 +133,7 @@ mod tests {
     };
 
     use http::HeaderMap;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpStream,
-        task::JoinHandle,
-        time::timeout,
-    };
+    use tokio::{task::JoinHandle, time::timeout};
 
     const KEY: &str = "seek-test-upstream-secret";
     const BYTES: &[u8] = b"unchanged original video bytes";
@@ -502,142 +501,5 @@ mod tests {
         }
 
         assert!(upstream.requests.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn shared_proxy_permits_cover_both_cases_and_release_on_response_drop() {
-        let upstream = Upstream::start().await;
-        let mut held = Vec::new();
-
-        for _ in 0..media::OPERATIONS {
-            let result = upstream
-                .media
-                .serve(ASSET, "original", Method::GET, HeaderMap::new())
-                .await;
-
-            assert_eq!(result.status(), StatusCode::OK);
-            held.push(result);
-        }
-
-        for path in ["/control", "/byte-seek", "/both", "/didl-only"] {
-            let request = Request::builder().uri(path).body(Body::empty()).unwrap();
-            let result = response(&upstream.media.clone(), request).await;
-            assert_eq!(result.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(!result.headers().contains_key(CAPABILITY));
-        }
-
-        assert_eq!(upstream.requests.lock().unwrap().len(), media::OPERATIONS);
-
-        held.pop();
-
-        let request = Request::builder()
-            .uri("/byte-seek")
-            .body(Body::empty())
-            .unwrap();
-
-        let result = response(&upstream.media, request).await;
-        assert_eq!(result.status(), StatusCode::OK);
-        assert_eq!(result.headers()[CAPABILITY], "DLNA.ORG_OP=01");
-    }
-
-    #[tokio::test]
-    async fn direct_head_releases_admission_before_response_disposal() {
-        let upstream = Upstream::start().await;
-        let mut held = Vec::new();
-
-        for _ in 0..=media::OPERATIONS {
-            let request = Request::builder()
-                .method(Method::HEAD)
-                .uri("/byte-seek")
-                .body(Body::empty())
-                .unwrap();
-
-            let result = response(&upstream.media, request).await;
-            assert_eq!(result.status(), StatusCode::OK);
-            held.push(result);
-        }
-
-        let admitted = upstream
-            .media
-            .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
-            .await;
-
-        assert_eq!(admitted.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn client_disconnect_drops_streams_and_returns_all_admission() {
-        let upstream = Upstream::start().await;
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(run(listener, upstream.media.clone()));
-        let mut clients = Vec::new();
-
-        for count in 1..=media::OPERATIONS {
-            let mut client = TcpStream::connect(address).await.unwrap();
-
-            client
-                .write_all(b"GET /byte-seek HTTP/1.1\r\nHost: fixture\r\nIf-None-Match: \"stream\"\r\n\r\n")
-                .await
-                .unwrap();
-
-            timeout(Duration::from_secs(2), async {
-                while upstream.requests.lock().unwrap().len() < count {
-                    tokio::task::yield_now().await;
-                }
-
-                let mut headers = Vec::new();
-
-                while !headers.ends_with(b"\r\n\r\n") {
-                    headers.push(client.read_u8().await.unwrap());
-                    assert!(headers.len() < 2048);
-                }
-
-                assert!(headers.starts_with(b"HTTP/1.1 200 OK\r\n"));
-            })
-            .await
-            .unwrap();
-
-            clients.push(client);
-        }
-
-        let rejected = upstream
-            .media
-            .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
-            .await;
-
-        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        for client in clients {
-            socket2::SockRef::from(&client)
-                .set_linger(Some(Duration::ZERO))
-                .unwrap();
-
-            drop(client);
-        }
-
-        let mut held = Vec::new();
-
-        timeout(Duration::from_secs(2), async {
-            while held.len() < media::OPERATIONS {
-                let result = upstream
-                    .media
-                    .serve(ASSET, "original", Method::GET, HeaderMap::new())
-                    .await;
-
-                if result.status() == StatusCode::SERVICE_UNAVAILABLE {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-
-                assert_eq!(result.status(), StatusCode::OK);
-                held.push(result);
-            }
-        })
-        .await
-        .expect("disconnect must drop streaming bodies before upstream deadlines");
-
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
     }
 }

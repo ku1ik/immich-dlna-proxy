@@ -22,9 +22,11 @@ use crate::{
     catalog::Catalog,
     eventing::Subscriptions,
     media::MediaProxy,
-    protocol::{self, Action, Fault, HEADER_BYTES, SOAP_BODY_BYTES, Service},
+    protocol::{self, Action, Fault, Service},
 };
 
+pub const HEADER_BYTES: usize = 16 * 1024;
+pub(crate) const SOAP_BODY_BYTES: usize = 64 * 1024;
 const BROWSES: usize = 8;
 const BODY_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_PROCESSING_TIMEOUT: Duration = Duration::from_secs(25);
@@ -34,11 +36,10 @@ pub struct Server<C> {
     media: MediaProxy,
     subscriptions: Subscriptions,
     device: String,
-    browses: Arc<Semaphore>,
+    browses: Semaphore,
     timing: Timing,
 }
 
-#[derive(Clone, Copy)]
 struct Timing {
     body: Duration,
     processing: Duration,
@@ -66,14 +67,18 @@ impl<C: Catalog> Server<C> {
             media,
             subscriptions,
             device: protocol::device_description(&friendly_name, uuid),
-            browses: Arc::new(Semaphore::new(BROWSES)),
+            browses: Semaphore::new(BROWSES),
             timing: Timing::default(),
         }
     }
 
     pub async fn run(self, listener: TcpListener) -> anyhow::Result<()> {
         let server = Arc::new(self);
-        let app = Self::router(server);
+        let app = Router::new().fallback(move |peer: ConnectInfo<SocketAddr>, request: Request| {
+            let server = server.clone();
+
+            async move { server.handle(peer, request).await }
+        });
 
         axum::serve(
             listener,
@@ -84,21 +89,13 @@ impl<C: Catalog> Server<C> {
         Ok(())
     }
 
-    fn router(server: Arc<Self>) -> Router {
-        Router::new().fallback(move |peer: ConnectInfo<SocketAddr>, request: Request| {
-            let server = server.clone();
-
-            async move { server.handle(peer, request).await }
-        })
-    }
-
     async fn handle(
         &self,
         ConnectInfo(peer): ConnectInfo<SocketAddr>,
         request: Request,
     ) -> Response {
         let mut response = match peer.ip() {
-            IpAddr::V4(peer) => self.route(request, peer, Instant::now()).await,
+            IpAddr::V4(peer) => self.route(request, peer).await,
             IpAddr::V6(_) => empty(StatusCode::BAD_REQUEST),
         };
 
@@ -110,7 +107,8 @@ impl<C: Catalog> Server<C> {
         response
     }
 
-    async fn route(&self, request: Request, peer: Ipv4Addr, started: Instant) -> Response {
+    async fn route(&self, request: Request, peer: Ipv4Addr) -> Response {
+        let started = Instant::now();
         let (parts, body) = request.into_parts();
         let path = parts.uri.path();
 
@@ -289,7 +287,7 @@ impl<C: Catalog> Server<C> {
 
         // Keep admission outside timed execution, including fault construction and handoff.
         let _permit = if matches!(action, Action::Browse(_)) {
-            let Ok(permit) = self.browses.clone().try_acquire_owned() else {
+            let Ok(permit) = self.browses.try_acquire() else {
                 return empty(StatusCode::SERVICE_UNAVAILABLE);
             };
 
@@ -646,11 +644,7 @@ mod tests {
             (CDS, "Search", "", 500, "<errorCode>401</errorCode>"),
         ] {
             let response = server
-                .route(
-                    action(path, name, args),
-                    Ipv4Addr::LOCALHOST,
-                    Instant::now(),
-                )
+                .route(action(path, name, args), Ipv4Addr::LOCALHOST)
                 .await;
 
             assert_eq!(response.status().as_u16(), status);
@@ -664,9 +658,7 @@ mod tests {
     #[tokio::test]
     async fn browse_serializes_snapshot_and_releases_permit_with_response() {
         let server = server(TestCatalog::default());
-        let response = server
-            .route(browse(), Ipv4Addr::LOCALHOST, Instant::now())
-            .await;
+        let response = server.route(browse(), Ipv4Addr::LOCALHOST).await;
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(server.browses.available_permits(), BROWSES);
@@ -772,18 +764,36 @@ mod tests {
 
         let mut stalled = action(CDS, "Browse", "");
         *stalled.body_mut() = stalled_body;
-        let response = server.route(stalled, Ipv4Addr::LOCALHOST, Instant::now());
+        let response = server.route(stalled, Ipv4Addr::LOCALHOST);
         tokio::pin!(response);
         assert!(futures_util::poll!(&mut response).is_pending());
         tokio::time::advance(Duration::from_secs(2)).await;
         assert_eq!(response.await.status(), StatusCode::REQUEST_TIMEOUT);
         drop(send);
 
+        let mut declared = action(CDS, "GetSystemUpdateID", "");
+        declared.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&(SOAP_BODY_BYTES + 1).to_string()).unwrap(),
+        );
+        let response = server.route(declared, Ipv4Addr::LOCALHOST).await;
+        assert!(body(response).await.contains("<errorCode>501</errorCode>"));
+
+        let mut streamed = action(CDS, "GetSystemUpdateID", "");
+        streamed.headers_mut().remove(header::CONTENT_LENGTH);
+        *streamed.body_mut() = Body::from(vec![b' '; SOAP_BODY_BYTES + 1]);
+        let response = server.route(streamed, Ipv4Addr::LOCALHOST).await;
+        assert!(body(response).await.contains("<errorCode>501</errorCode>"));
+
+        let request = browse();
+        let (parts, request_body) = request.into_parts();
         let response = server
-            .route(
-                browse(),
-                Ipv4Addr::LOCALHOST,
+            .control(
+                Service::ContentDirectory,
+                parts.headers,
+                request_body,
                 Instant::now() - Duration::from_secs(3),
+                Ipv4Addr::LOCALHOST,
             )
             .await;
 
@@ -805,29 +815,20 @@ mod tests {
             let worker = server.clone();
 
             active.push(tokio::spawn(async move {
-                worker
-                    .route(browse(), Ipv4Addr::LOCALHOST, Instant::now())
-                    .await
+                worker.route(browse(), Ipv4Addr::LOCALHOST).await
             }));
 
             server.catalog.entered.notified().await;
         }
 
         assert_eq!(
-            server
-                .route(browse(), Ipv4Addr::LOCALHOST, Instant::now())
-                .await
-                .status(),
+            server.route(browse(), Ipv4Addr::LOCALHOST).await.status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
 
         assert_eq!(
             server
-                .route(
-                    action(CDS, "GetSystemUpdateID", ""),
-                    Ipv4Addr::LOCALHOST,
-                    Instant::now(),
-                )
+                .route(action(CDS, "GetSystemUpdateID", ""), Ipv4Addr::LOCALHOST)
                 .await
                 .status(),
             StatusCode::OK
@@ -867,6 +868,14 @@ mod tests {
             .insert(header::UPGRADE, HeaderValue::from_static("websocket"));
 
         let response = server.handle(peer, upgrade).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key("sid"));
+
+        let mut declared = subscribe();
+        declared
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
+        let response = server.handle(peer, declared).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(!response.headers().contains_key("sid"));
 

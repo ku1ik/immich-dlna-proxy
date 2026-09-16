@@ -537,11 +537,6 @@ fn response(status: StatusCode) -> Response {
         HeaderValue::from_static("private, no-cache"),
     );
 
-    response.headers_mut().insert(
-        header::SERVER,
-        HeaderValue::from_static(crate::server_header()),
-    );
-
     response
 }
 
@@ -714,7 +709,7 @@ mod tests {
                             }
 
                             request.extend_from_slice(&buffer[..count]);
-                            assert!(request.len() <= crate::protocol::HEADER_BYTES);
+                            assert!(request.len() <= crate::server::HEADER_BYTES);
                         }
 
                         let _ = sender.send(String::from_utf8(request).unwrap());
@@ -1374,7 +1369,7 @@ mod tests {
 
         assert_eq!(result.status(), StatusCode::OK);
         assert_eq!(result.headers()[header::CACHE_CONTROL], "private, no-cache");
-        assert_eq!(result.headers()[header::SERVER], crate::server_header());
+        assert!(!result.headers().contains_key(header::SERVER));
 
         for name in [
             "etag",

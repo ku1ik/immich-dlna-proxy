@@ -6,8 +6,6 @@ use quick_xml::{
     name::{Namespace, NamespaceResolver, PrefixDeclaration, ResolveResult},
 };
 
-pub const HEADER_BYTES: usize = 16 * 1024;
-pub(crate) const SOAP_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const SOAP_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const XML_DEPTH: usize = 32;
 
@@ -60,7 +58,7 @@ pub struct Fault {
     pub code: u16,
 }
 
-pub fn fault_xml(fault: Fault) -> String {
+pub(crate) fn fault_xml(fault: Fault) -> String {
     let description = match fault.code {
         401 => "Invalid Action",
         402 => "Invalid Args",
@@ -87,7 +85,7 @@ pub fn device_description(friendly_name: &str, uuid: uuid::Uuid) -> String {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Action {
+pub(crate) enum Action {
     Browse(BrowseArguments),
     GetSearchCapabilities,
     GetSortCapabilities,
@@ -98,7 +96,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Browse(_) => "Browse",
             Self::GetSearchCapabilities => "GetSearchCapabilities",
@@ -234,12 +232,12 @@ fn resolved_namespace(namespace: ResolveResult<'_>) -> Result<&str, Fault> {
     }
 }
 
-pub fn parse_action(body: &[u8], soap_action: &str, service: Service) -> Result<Action, Fault> {
+pub(crate) fn parse_action(
+    body: &[u8],
+    soap_action: &str,
+    service: Service,
+) -> Result<Action, Fault> {
     let invalid = Fault { code: 402 };
-
-    if body.len() > SOAP_BODY_BYTES || soap_action.len() > HEADER_BYTES {
-        return Err(Fault { code: 501 });
-    }
 
     let source = std::str::from_utf8(body).map_err(|_| invalid)?;
 
@@ -568,7 +566,7 @@ impl Xml {
     }
 }
 
-pub fn action_response(
+pub(crate) fn action_response(
     service: Service,
     action: &str,
     args: &[(&str, &str)],
@@ -1266,24 +1264,14 @@ mod tests {
     }
 
     #[test]
-    fn soap_bounds_body_and_rejects_deep_argument_trees() {
+    fn soap_accepts_the_server_body_bound_and_rejects_deep_argument_trees() {
         let base = request("GetSortCapabilities", "");
-        let exact = format!("{}{}", base, " ".repeat(SOAP_BODY_BYTES - base.len()));
+        let exact = format!(
+            "{}{}",
+            base,
+            " ".repeat(crate::server::SOAP_BODY_BYTES - base.len())
+        );
         assert!(parse(&exact, "GetSortCapabilities").is_ok());
-
-        assert_eq!(
-            parse(&(exact + " "), "GetSortCapabilities"),
-            Err(Fault { code: 501 })
-        );
-
-        assert_eq!(
-            parse_action(
-                base.as_bytes(),
-                &"x".repeat(HEADER_BYTES + 1),
-                Service::ContentDirectory
-            ),
-            Err(Fault { code: 501 })
-        );
 
         let nested = format!(
             "{}x{}",

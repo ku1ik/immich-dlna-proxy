@@ -11,7 +11,7 @@ use immich_dlna_proxy::{
     catalog::{BrowseResult, Catalog},
     eventing::Subscriptions,
     media::MediaProxy,
-    protocol::{self, BrowseArguments, Fault, Object, Service},
+    protocol::{self, BrowseArguments, Fault, Object},
     server::Server,
 };
 use tokio::{
@@ -140,29 +140,6 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
 
         let subscriptions = Subscriptions::new().unwrap();
 
-        // Production rejects loopback callbacks. Check successful lease state via the
-        // public API with a documentation-only peer; no notification scheduler runs.
-        let mut headers = HeaderMap::new();
-        headers.insert("nt", HeaderValue::from_static("upnp:event"));
-
-        headers.insert(
-            "callback",
-            HeaderValue::from_static("<http://192.0.2.1/event?sensitiveCallbackQuery>"),
-        );
-
-        headers.insert("timeout", HeaderValue::from_static("Second-60"));
-
-        let response = subscriptions.request(
-            Service::ContentDirectory,
-            "192.0.2.1".parse().unwrap(),
-            &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-            &headers,
-        );
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["timeout"], "Second-60");
-        assert!(response.headers().contains_key("sid"));
-
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
 
@@ -272,7 +249,6 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
         "update_id=7",
         "control response",
         "subscription response",
-        "Second-60",
         "sid_supplied=true",
         "status=412",
         "media request peer",

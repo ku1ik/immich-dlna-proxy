@@ -16,7 +16,7 @@ use tokio::{
 use url::Url;
 use uuid::Uuid;
 
-use crate::protocol::{HEADER_BYTES, Service};
+use crate::protocol::Service;
 
 pub(crate) const SUBSCRIPTIONS: usize = 32;
 const CALLBACK_URLS: usize = 4;
@@ -40,7 +40,6 @@ struct State {
     entries: Vec<Subscription>,
     system_update_id: u32,
     running: bool,
-    stopped: bool,
 }
 
 struct Subscription {
@@ -51,19 +50,11 @@ struct Subscription {
     lease: Duration,
     expires: Instant,
     active: bool,
-    initial: Initial,
-    system_update_id: u32,
+    initial_update_id: Option<u32>,
     pending: Option<u32>,
     delivering: bool,
     next_seq: u32,
     next_attempt: Instant,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Initial {
-    Owed,
-    Delivering,
-    Finished,
 }
 
 impl State {
@@ -77,19 +68,8 @@ impl State {
                 entry.pending = None;
             }
 
-            entry.active || entry.initial != Initial::Finished || entry.delivering
+            entry.active || entry.initial_update_id.is_some() || entry.delivering
         });
-    }
-}
-
-// Dropping the scheduler also drops its delivery futures and closes admission.
-struct Running(Subscriptions);
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
-        state.stopped = true;
-        state.entries.clear();
     }
 }
 
@@ -120,7 +100,7 @@ impl Subscriptions {
     /// publication lock after assigning its ledger/snapshot. Initialize with the
     /// startup ID before discovery or subscription admission. No I/O occurs here,
     /// and subscription operations never acquire a catalog lock.
-    pub fn publish(&self, id: u32) {
+    pub(crate) fn publish(&self, id: u32) {
         let mut state = self.state.lock().unwrap();
 
         if state.system_update_id == id {
@@ -140,7 +120,7 @@ impl Subscriptions {
         self.wake.notify_one();
     }
 
-    pub fn request(
+    pub(crate) fn request(
         &self,
         service: Service,
         peer: Ipv4Addr,
@@ -148,22 +128,6 @@ impl Subscriptions {
         headers: &HeaderMap,
     ) -> Response {
         let result = (|| {
-            if headers
-                .iter()
-                .map(|(name, value)| name.as_str().len() + value.len() + 4)
-                .sum::<usize>()
-                > HEADER_BYTES
-            {
-                return Err(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
-            }
-
-            if headers.contains_key(header::TRANSFER_ENCODING)
-                || single_header(headers, "content-length")?
-                    .is_some_and(|value| decimal(value) != Some(0))
-            {
-                return Err(StatusCode::BAD_REQUEST);
-            }
-
             if !matches!(method.as_str(), "SUBSCRIBE" | "UNSUBSCRIBE") {
                 return Err(StatusCode::METHOD_NOT_ALLOWED);
             }
@@ -192,10 +156,6 @@ impl Subscriptions {
                 let mut state = self.state.lock().unwrap();
                 let now = Instant::now();
                 state.expire(now);
-
-                if state.stopped {
-                    return Err(StatusCode::SERVICE_UNAVAILABLE);
-                }
 
                 let entry = state
                     .entries
@@ -232,12 +192,12 @@ impl Subscriptions {
             let now = Instant::now();
             state.expire(now);
 
-            if state.stopped || state.entries.len() >= SUBSCRIPTIONS {
+            if state.entries.len() >= SUBSCRIPTIONS {
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
 
             let sid = Uuid::new_v4();
-            let system_update_id = state.system_update_id;
+            let initial_update_id = Some(state.system_update_id);
 
             // Registration and publication share this lock; older changes are not replayed.
             state.entries.push(Subscription {
@@ -248,8 +208,7 @@ impl Subscriptions {
                 lease,
                 expires: now + lease,
                 active: true,
-                initial: Initial::Owed,
-                system_update_id,
+                initial_update_id,
                 pending: None,
                 delivering: false,
                 next_seq: 0,
@@ -305,15 +264,11 @@ impl Subscriptions {
         {
             let mut state = self.state.lock().unwrap();
 
-            anyhow::ensure!(
-                !state.running && !state.stopped,
-                "eventing scheduler already started or stopped"
-            );
+            anyhow::ensure!(!state.running, "eventing scheduler already started");
 
             state.running = true;
         }
 
-        let _running = Running(self.clone());
         let mut deliveries = FuturesUnordered::new();
 
         loop {
@@ -328,8 +283,8 @@ impl Subscriptions {
                 while deliveries.len() < DELIVERIES {
                     let Some(index) = state.entries.iter().position(|entry| {
                         !entry.delivering
-                            && (entry.initial == Initial::Owed
-                                || (entry.initial == Initial::Finished
+                            && (entry.initial_update_id.is_some()
+                                || (entry.initial_update_id.is_none()
                                     && entry.active
                                     && entry.next_attempt <= now
                                     && entry.pending.is_some()))
@@ -339,10 +294,8 @@ impl Subscriptions {
 
                     let mut entry = state.entries.remove(index);
 
-                    let id = if entry.initial == Initial::Owed {
-                        entry.initial = Initial::Delivering;
-
-                        entry.system_update_id
+                    let id = if let Some(id) = entry.initial_update_id.take() {
+                        id
                     } else {
                         entry.pending.take().expect("eligible pending event")
                     };
@@ -372,7 +325,7 @@ impl Subscriptions {
                     .flat_map(|entry| {
                         // A ready event waits on completion when all delivery slots are full.
                         let moderation = (deliveries.len() < DELIVERIES
-                            && entry.initial == Initial::Finished
+                            && entry.initial_update_id.is_none()
                             && !entry.delivering
                             && entry.pending.is_some())
                         .then_some(entry.next_attempt);
@@ -396,7 +349,6 @@ impl Subscriptions {
                     let mut state = self.state.lock().unwrap();
 
                     if let Some(entry) = state.entries.iter_mut().find(|entry| entry.sid == sid) {
-                        entry.initial = Initial::Finished;
                         entry.delivering = false;
                         entry.active &= !deactivate;
                     }
@@ -715,8 +667,7 @@ mod tests {
                 Instant::now() + Duration::from_secs(expected)
             );
 
-            assert_eq!(state.entries[0].system_update_id, 42);
-            assert!(state.entries[0].initial == Initial::Owed);
+            assert_eq!(state.entries[0].initial_update_id, Some(42));
         }
     }
 
@@ -740,9 +691,9 @@ mod tests {
                 .iter()
                 .find(|entry| entry.sid == second)
                 .unwrap();
-            assert_eq!(first.system_update_id, 0);
+            assert_eq!(first.initial_update_id, Some(0));
             assert_eq!(first.pending, Some(u32::MAX));
-            assert_eq!(second.system_update_id, u32::MAX);
+            assert_eq!(second.initial_update_id, Some(u32::MAX));
             assert_eq!(second.pending, None);
         }
 
@@ -779,8 +730,8 @@ mod tests {
                 let entry = &state.entries[0];
 
                 assert!(matches!(
-                    (entry.system_update_id, entry.pending),
-                    (7, Some(8)) | (8, None)
+                    (entry.initial_update_id, entry.pending),
+                    (Some(7), Some(8)) | (Some(8), None)
                 ));
             }
         }
@@ -897,14 +848,10 @@ mod tests {
     }
 
     #[test]
-    fn body_and_duplicate_headers_are_rejected_before_admission() {
+    fn duplicate_event_headers_are_rejected_before_admission() {
         let subscriptions = Subscriptions::new().unwrap();
 
         for extra in [
-            vec![("content-length", "1")],
-            vec![("content-length", "bad")],
-            vec![("content-length", "0"), ("content-length", "0")],
-            vec![("transfer-encoding", "chunked")],
             vec![("timeout", "Second-1"), ("timeout", "Second-1")],
             vec![("callback", "<http://192.168.1.20/>")],
             vec![("sid", "bad"), ("sid", "bad")],
@@ -921,18 +868,6 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
-
-        let response = subscriptions.request(
-            SERVICE,
-            PEER,
-            &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-            &headers(&[("x-large", &"a".repeat(HEADER_BYTES))]),
-        );
-
-        assert_eq!(
-            response.status(),
-            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
-        );
 
         assert!(subscriptions.state.lock().unwrap().entries.is_empty());
     }
@@ -1036,8 +971,7 @@ mod tests {
 
         {
             let state = subscriptions.state.lock().unwrap();
-            assert!(state.entries[0].initial == Initial::Owed);
-            assert_eq!(state.entries[0].system_update_id, 42);
+            assert_eq!(state.entries[0].initial_update_id, Some(42));
 
             assert_eq!(
                 state.entries[0].expires,
@@ -1202,8 +1136,7 @@ mod tests {
                     .entries
                     .iter()
                     .all(|entry| {
-                        entry.sid != sid
-                            || (entry.initial == Initial::Finished && !entry.delivering)
+                        entry.sid != sid || (entry.initial_update_id.is_none() && !entry.delivering)
                     })
                 {
                     return;
@@ -1327,7 +1260,8 @@ mod tests {
             let entry = state.entries.iter().find(|entry| entry.sid == sid).unwrap();
             let cm = state.entries.iter().find(|entry| entry.sid == cm).unwrap();
             assert_eq!(entry.pending, Some(14));
-            assert!(entry.initial == Initial::Delivering);
+            assert!(entry.initial_update_id.is_none());
+            assert!(entry.delivering);
             assert_eq!(cm.pending, None);
         }
 
@@ -1549,7 +1483,6 @@ mod tests {
         }
 
         abort_scheduler(task).await;
-        assert!(subscriptions.state.lock().unwrap().entries.is_empty());
     }
 
     #[tokio::test]
@@ -1880,13 +1813,16 @@ mod tests {
                 state
                     .entries
                     .iter()
-                    .filter(|entry| entry.initial == Initial::Delivering)
+                    .filter(|entry| entry.delivering)
                     .count(),
                 DELIVERIES
             );
         }
 
-        assert!(subscriptions.clone().run().await.is_err());
+        assert_eq!(
+            subscriptions.clone().run().await.unwrap_err().to_string(),
+            "eventing scheduler already started"
+        );
 
         abort_scheduler(task).await;
         assert!(callback.received.try_recv().is_err());
@@ -2109,7 +2045,7 @@ mod tests {
                     let state = subscriptions.state.lock().unwrap();
                     let entry = &state.entries[0];
                     assert!(entry.active);
-                    assert!(entry.initial == Initial::Finished);
+                    assert!(entry.initial_update_id.is_none());
                     assert_eq!(entry.next_seq, seq + 1);
                     assert_eq!(entry.pending, None);
                 }
@@ -2247,7 +2183,7 @@ mod tests {
     async fn scheduler_expires_idle_leases_without_requests() {
         let subscriptions = Subscriptions::new().unwrap();
         let (_, sid) = subscribe(&subscriptions, None);
-        subscriptions.state.lock().unwrap().entries[0].initial = Initial::Finished;
+        subscriptions.state.lock().unwrap().entries[0].initial_update_id = None;
         let task = tokio::spawn(subscriptions.clone().run());
         tokio::task::yield_now().await;
 
