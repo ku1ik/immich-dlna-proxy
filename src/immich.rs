@@ -20,7 +20,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
-pub struct Client {
+pub(crate) struct Client {
     client: reqwest::Client,
     api_base: Url,
     api_key: HeaderValue,
@@ -29,47 +29,47 @@ pub struct Client {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Album {
-    pub id: Uuid,
-    pub album_name: String,
+pub(crate) struct Album {
+    pub(crate) id: Uuid,
+    pub(crate) album_name: String,
     #[serde(default, deserialize_with = "optional_date")]
-    pub created_at: Option<String>,
+    pub(crate) created_at: Option<String>,
     #[serde(default, deserialize_with = "optional_date")]
-    pub end_date: Option<String>,
-    pub album_thumbnail_asset_id: Option<Uuid>,
+    pub(crate) end_date: Option<String>,
+    pub(crate) album_thumbnail_asset_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Asset {
-    pub id: Uuid,
+pub(crate) struct Asset {
+    pub(crate) id: Uuid,
     #[serde(rename = "type")]
-    pub kind: String,
-    pub visibility: String,
-    pub is_trashed: bool,
-    pub is_edited: bool,
-    pub original_file_name: Option<String>,
-    pub original_mime_type: Option<String>,
+    pub(crate) kind: String,
+    pub(crate) visibility: String,
+    pub(crate) is_trashed: bool,
+    pub(crate) is_edited: bool,
+    pub(crate) original_file_name: Option<String>,
+    pub(crate) original_mime_type: Option<String>,
     /// Duration in milliseconds, as supplied by Immich.
-    pub duration: Option<i64>,
+    pub(crate) duration: Option<i64>,
     #[serde(default, deserialize_with = "optional_date")]
-    pub file_created_at: Option<String>,
+    pub(crate) file_created_at: Option<String>,
     #[serde(default, deserialize_with = "optional_date")]
-    pub local_date_time: Option<String>,
-    pub checksum: Option<String>,
-    pub updated_at: Option<String>,
-    pub thumbhash: Option<String>,
+    pub(crate) local_date_time: Option<String>,
+    pub(crate) checksum: Option<String>,
+    pub(crate) updated_at: Option<String>,
+    pub(crate) thumbhash: Option<String>,
 }
 
 #[derive(Debug)]
-pub struct AssetPage {
-    pub items: Vec<Asset>,
-    pub next_page: Option<usize>,
+pub(crate) struct AssetPage {
+    pub(crate) items: Vec<Asset>,
+    pub(crate) next_page: Option<usize>,
 }
 
 /// Both searches exclude deleted assets and omit EXIF and people data.
 #[derive(Clone, Copy)]
-pub enum AssetFilter {
+pub(crate) enum AssetFilter {
     All,
     EncodedVideos,
 }
@@ -138,7 +138,7 @@ struct Search {
 }
 
 impl Client {
-    pub fn new(api_base: Url, mut api_key: HeaderValue) -> Result<Self> {
+    pub(crate) fn new(api_base: Url, mut api_key: HeaderValue) -> Result<Self> {
         ensure!(
             is_normalized_api_base(&api_base),
             "Immich requires a normalized HTTP(S) API directory"
@@ -210,7 +210,7 @@ impl Client {
     }
 
     /// Cache a successful minimum-version check across client clones.
-    pub async fn ensure_supported_version(&self) -> Result<()> {
+    pub(crate) async fn ensure_supported_version(&self) -> Result<()> {
         self.version_checked
             .get_or_try_init(|| async {
                 let version: Version = self
@@ -231,13 +231,13 @@ impl Client {
         Ok(())
     }
 
-    pub async fn albums(&self) -> Result<Vec<Album>> {
+    pub(crate) async fn albums(&self) -> Result<Vec<Album>> {
         self.json(self.client.get(self.api_base.join("albums")?))
             .await
     }
 
     /// Fetch one page; traversal and filtering of returned assets belong to the caller.
-    pub async fn search_album(
+    pub(crate) async fn search_album(
         &self,
         album: Uuid,
         page: usize,

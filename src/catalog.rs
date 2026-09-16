@@ -622,23 +622,23 @@ fn media_type(value: &str) -> Option<String> {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct Ledger {
-    pub server_uuid: Uuid,
-    pub system_update_id: u32,
+pub(crate) struct Ledger {
+    server_uuid: Uuid,
+    system_update_id: u32,
     #[serde(deserialize_with = "Option::deserialize")]
-    pub root_digest: Option<String>,
+    root_digest: Option<String>,
     #[serde(deserialize_with = "deserialize_albums")]
-    pub albums: BTreeMap<Uuid, AlbumRevision>,
+    albums: BTreeMap<Uuid, AlbumRevision>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct AlbumRevision {
-    pub update_id: u32,
-    pub present: bool,
-    pub metadata_digest: String,
+struct AlbumRevision {
+    update_id: u32,
+    present: bool,
+    metadata_digest: String,
     #[serde(deserialize_with = "Option::deserialize")]
-    pub contents_digest: Option<String>,
+    contents_digest: Option<String>,
 }
 
 fn deserialize_albums<'de, D>(deserializer: D) -> Result<BTreeMap<Uuid, AlbumRevision>, D::Error>
@@ -734,7 +734,7 @@ impl Ledger {
 
     /// Invalidate every retained counter once, without forgetting any digest.
     /// Persist this transition before binding listeners or announcing the device.
-    pub fn restart(&mut self) {
+    pub(crate) fn restart(&mut self) {
         self.system_update_id = self.system_update_id.wrapping_add(1);
 
         for album in self.albums.values_mut() {
@@ -835,7 +835,7 @@ impl Ledger {
 
 /// Owns the exclusive directory lock, also retained by every disk worker.
 #[derive(Clone)]
-pub struct Store {
+pub(crate) struct Store {
     inner: Arc<StoreInner>,
 }
 
@@ -883,7 +883,7 @@ impl Store {
     /// The existing directory must be private, writable, trusted local storage.
     /// Resolve a configured symlink once, as used by systemd DynamicUser. The
     /// directory and its parent paths must not be moved or replaced while running.
-    pub fn open(directory: &Path, uuid: Uuid) -> anyhow::Result<(Self, Ledger)> {
+    pub(crate) fn open(directory: &Path, uuid: Uuid) -> anyhow::Result<(Self, Ledger)> {
         ensure!(!uuid.is_nil(), "server UUID must not be nil");
 
         let path = directory
@@ -987,7 +987,7 @@ impl Store {
     /// subscriber updates. This method does not serialize callers or publish state.
     /// Never wrap it in a client/request timeout. The blocking worker retains the
     /// process lock; failure/timeout exits without waiting for worker/runtime drop.
-    pub async fn persist(&self, ledger: Ledger) {
+    pub(crate) async fn persist(&self, ledger: Ledger) {
         struct Commit;
 
         impl Drop for Commit {
@@ -1152,7 +1152,7 @@ const _: () = {
 };
 
 #[derive(Clone)]
-pub struct Library {
+pub(crate) struct Library {
     inner: Arc<Inner>,
 }
 
@@ -1404,7 +1404,7 @@ impl Drop for Running {
 
 impl Library {
     /// The caller must restart and persist the ledger before construction/admission.
-    pub fn new(
+    pub(crate) fn new(
         config: Config,
         store: Store,
         ledger: Ledger,
@@ -1447,7 +1447,7 @@ impl Library {
     }
 
     /// Supervise refresh tasks and fail after cancelling preparation on task failure.
-    pub async fn run(&self) -> Result<()> {
+    pub(crate) async fn run(&self) -> Result<()> {
         {
             let mut supervisor = self.inner.supervisor.lock().unwrap();
             ensure!(!supervisor.running, "catalog supervisor already started");

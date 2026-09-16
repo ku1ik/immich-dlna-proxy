@@ -1,7 +1,7 @@
 pub mod catalog;
 pub mod config;
 pub mod eventing;
-pub mod immich;
+mod immich;
 pub mod lifecycle;
 pub mod media;
 mod mime;

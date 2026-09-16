@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::config::is_normalized_api_base;
 
-pub const OPERATIONS: usize = 16;
+const OPERATIONS: usize = 16;
 const REDIRECTS: usize = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);

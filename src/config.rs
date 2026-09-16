@@ -51,15 +51,15 @@ fn default_log_level() -> String {
 
 // Intentionally no Debug: configuration owns the upstream credential.
 pub struct Config {
-    pub api_base: Url,
-    pub api_key: HeaderValue,
-    pub listen_address: SocketAddrV4,
-    pub friendly_name: String,
-    pub collator: CollatorBorrowed<'static>,
-    pub server_uuid: Uuid,
-    pub state_directory: PathBuf,
+    pub(crate) api_base: Url,
+    pub(crate) api_key: HeaderValue,
+    pub(crate) listen_address: SocketAddrV4,
+    pub(crate) friendly_name: String,
+    pub(crate) collator: CollatorBorrowed<'static>,
+    pub(crate) server_uuid: Uuid,
+    pub(crate) state_directory: PathBuf,
     pub log_level: tracing::Level,
-    pub interface_index: u32,
+    pub(crate) interface_index: u32,
 }
 
 impl Config {
@@ -126,7 +126,7 @@ fn parse_settings(text: &str) -> anyhow::Result<Settings> {
     Ok(settings)
 }
 
-pub fn normalize_api_base(value: &str) -> anyhow::Result<Url> {
+fn normalize_api_base(value: &str) -> anyhow::Result<Url> {
     let mut url = Url::parse(value).map_err(|_| anyhow::anyhow!("invalid immich_url"))?;
 
     ensure!(
@@ -161,7 +161,7 @@ pub(crate) fn is_normalized_api_base(url: &Url) -> bool {
         && url.path().ends_with("/api/")
 }
 
-pub fn collator(locale: &str) -> anyhow::Result<CollatorBorrowed<'static>> {
+pub(crate) fn collator(locale: &str) -> anyhow::Result<CollatorBorrowed<'static>> {
     let locale: Locale = locale.parse().context("invalid sort_locale identifier")?;
     let mut options = CollatorOptions::default();
     options.strength = Some(Strength::Secondary);
