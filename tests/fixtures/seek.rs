@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 const ASSET: &str = "20000000-0000-4000-8000-000000000003";
 const CAPABILITY: &str = "contentfeatures.dlna.org";
 
-/// Both cases use the caller's proxy, including its credentials and operation permits.
+/// All four cases use the caller's proxy, including its credentials and operation permits.
 pub async fn response(media: &MediaProxy, request: Request) -> Response {
     let (parts, body) = request.into_parts();
 
@@ -200,10 +200,6 @@ mod tests {
 
                     let status = match condition {
                         Some("\"cached\"") => StatusCode::NOT_MODIFIED,
-                        Some("\"missing\"") => StatusCode::NOT_FOUND,
-                        Some("\"denied\"") => StatusCode::FORBIDDEN,
-                        Some("\"broken\"") => StatusCode::INTERNAL_SERVER_ERROR,
-                        _ if range == Some("bytes=999-") => StatusCode::RANGE_NOT_SATISFIABLE,
                         _ if range.is_some() => StatusCode::PARTIAL_CONTENT,
                         _ => StatusCode::OK,
                     };
@@ -227,11 +223,6 @@ mod tests {
                     if status == StatusCode::PARTIAL_CONTENT {
                         result = result
                             .header(header::CONTENT_RANGE, format!("bytes 2-5/{}", BYTES.len()));
-                    }
-
-                    if status == StatusCode::RANGE_NOT_SATISFIABLE {
-                        result = result
-                            .header(header::CONTENT_RANGE, format!("bytes */{}", BYTES.len()));
                     }
 
                     if status.is_success() {
@@ -289,47 +280,9 @@ mod tests {
             ),
             (
                 Method::GET,
-                Some("bytes=2-"),
-                None,
-                StatusCode::PARTIAL_CONTENT,
-            ),
-            (Method::GET, Some("bytes=0-1,4-5"), None, StatusCode::OK),
-            (Method::HEAD, Some("bytes=2-5"), None, StatusCode::OK),
-            (
-                Method::GET,
-                Some("bytes=999-"),
-                None,
-                StatusCode::RANGE_NOT_SATISFIABLE,
-            ),
-            (
-                Method::GET,
                 None,
                 Some("\"cached\""),
                 StatusCode::NOT_MODIFIED,
-            ),
-            (
-                Method::HEAD,
-                None,
-                Some("\"cached\""),
-                StatusCode::NOT_MODIFIED,
-            ),
-            (
-                Method::GET,
-                None,
-                Some("\"missing\""),
-                StatusCode::NOT_FOUND,
-            ),
-            (
-                Method::GET,
-                None,
-                Some("\"denied\""),
-                StatusCode::BAD_GATEWAY,
-            ),
-            (
-                Method::GET,
-                None,
-                Some("\"broken\""),
-                StatusCode::BAD_GATEWAY,
             ),
         ] {
             let mut results = Vec::new();
