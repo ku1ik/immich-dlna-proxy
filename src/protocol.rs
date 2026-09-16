@@ -9,6 +9,7 @@ use quick_xml::{
 pub(crate) const SOAP_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const XML_DEPTH: usize = 32;
 
+pub(crate) const MEDIA_SERVER: &str = "urn:schemas-upnp-org:device:MediaServer:1";
 pub const CONTENT_DIRECTORY: &str = "urn:schemas-upnp-org:service:ContentDirectory:1";
 pub const CONNECTION_MANAGER: &str = "urn:schemas-upnp-org:service:ConnectionManager:1";
 const SOAP: &str = "http://schemas.xmlsoap.org/soap/envelope/";
@@ -78,7 +79,7 @@ pub(crate) fn fault_xml(fault: Fault) -> String {
 
 pub fn device_description(friendly_name: &str, uuid: uuid::Uuid) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><root xmlns=\"urn:schemas-upnp-org:device-1-0\"><specVersion><major>1</major><minor>0</minor></specVersion><device><deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType><friendlyName>{}</friendlyName><manufacturer>immich-dlna-proxy</manufacturer><modelName>immich-dlna-proxy</modelName><modelNumber>{}</modelNumber><UDN>uuid:{uuid}</UDN><serviceList><service><serviceType>{CONTENT_DIRECTORY}</serviceType><serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId><SCPDURL>/upnp/content-directory/scpd.xml</SCPDURL><controlURL>/upnp/content-directory/control</controlURL><eventSubURL>/upnp/content-directory/events</eventSubURL></service><service><serviceType>{CONNECTION_MANAGER}</serviceType><serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId><SCPDURL>/upnp/connection-manager/scpd.xml</SCPDURL><controlURL>/upnp/connection-manager/control</controlURL><eventSubURL>/upnp/connection-manager/events</eventSubURL></service></serviceList></device></root>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><root xmlns=\"urn:schemas-upnp-org:device-1-0\"><specVersion><major>1</major><minor>0</minor></specVersion><device><deviceType>{MEDIA_SERVER}</deviceType><friendlyName>{}</friendlyName><manufacturer>immich-dlna-proxy</manufacturer><modelName>immich-dlna-proxy</modelName><modelNumber>{}</modelNumber><UDN>uuid:{uuid}</UDN><serviceList><service><serviceType>{CONTENT_DIRECTORY}</serviceType><serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId><SCPDURL>/upnp/content-directory/scpd.xml</SCPDURL><controlURL>/upnp/content-directory/control</controlURL><eventSubURL>/upnp/content-directory/events</eventSubURL></service><service><serviceType>{CONNECTION_MANAGER}</serviceType><serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId><SCPDURL>/upnp/connection-manager/scpd.xml</SCPDURL><controlURL>/upnp/connection-manager/control</controlURL><eventSubURL>/upnp/connection-manager/events</eventSubURL></service></serviceList></device></root>",
         escape_text(friendly_name),
         env!("CARGO_PKG_VERSION")
     )

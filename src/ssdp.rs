@@ -217,9 +217,9 @@ fn targets(uuid: Uuid) -> [String; 5] {
     [
         "upnp:rootdevice".into(),
         format!("uuid:{uuid}"),
-        "urn:schemas-upnp-org:device:MediaServer:1".into(),
-        "urn:schemas-upnp-org:service:ContentDirectory:1".into(),
-        "urn:schemas-upnp-org:service:ConnectionManager:1".into(),
+        crate::protocol::MEDIA_SERVER.into(),
+        crate::protocol::CONTENT_DIRECTORY.into(),
+        crate::protocol::CONNECTION_MANAGER.into(),
     ]
 }
 
