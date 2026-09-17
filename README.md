@@ -139,7 +139,6 @@ Add the flake input and import its module in your existing NixOS configuration:
             sortLocale = "pl";
             serverUuid = "7b37df49-b75d-4bcb-89a6-0c917a934643";
             openFirewall = true;
-            firewallInterface = "enp3s0";
           };
         }
       ];
@@ -148,14 +147,14 @@ Add the flake input and import its module in your existing NixOS configuration:
 }
 ```
 
-Replace the UUID/address/interface. Keep `immichApiKeyFile` a **quoted runtime path string**,
+Replace the UUID/address. Keep `immichApiKeyFile` a **quoted runtime path string**,
 never a Nix path literal or `builtins.readFile` of the key: secrets must not enter the store.
 Provision/rotate externally, then restart. The module generates non-secret TOML, uses
 `LoadCredential`, and manages private `/var/lib/immich-dlna-proxy` with the hardening above.
 Optional `package`, `friendlyName` (default `Immich`), and `logLevel` (default `info`)
-are overridable. `openFirewall` defaults to **false**; enabling it requires an exact trusted
-`firewallInterface` matching `listenAddress`, opening only that interface's TCP service
-port and UDP 1900. No wildcard or `default` interface.
+are overridable. `openFirewall` defaults to **false**; enabling it opens the TCP service
+port and UDP 1900 on all interfaces. Use it only when every interface is trusted; otherwise,
+leave it disabled and configure interface-scoped firewall rules separately.
 
 ## Media Preparation
 

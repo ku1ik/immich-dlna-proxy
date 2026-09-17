@@ -21,10 +21,6 @@ let
   };
   addressMatch = builtins.match "[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:([0-9]{1,5})" cfg.listenAddress;
   port = if addressMatch == null then 0 else lib.toIntBase10 (builtins.head addressMatch);
-  validInterface =
-    cfg.firewallInterface != null
-    && cfg.firewallInterface != "default"
-    && builtins.match "[a-zA-Z0-9_.-]+" cfg.firewallInterface != null;
   secretPath = toString (/. + cfg.immichApiKeyFile);
 in
 {
@@ -93,18 +89,7 @@ in
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Open the HTTP TCP port and SSDP UDP port 1900 on firewallInterface only. DLNA is unauthenticated; use a trusted LAN.";
-    };
-
-    firewallInterface = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "enp3s0";
-      description = ''
-        Required when openFirewall is enabled. Exact trusted LAN interface name
-        using letters, digits, underscores, dots or hyphens; no wildcards or the
-        reserved NixOS name "default". Must correspond to listenAddress.
-      '';
+      description = "Open the HTTP TCP port and SSDP UDP port 1900 on all interfaces. DLNA is unauthenticated; use only on a trusted network.";
     };
   };
 
@@ -117,10 +102,6 @@ in
           && secretPath != builtins.storeDir
           && !lib.hasPrefix "${builtins.storeDir}/" secretPath;
         message = "services.immich-dlna-proxy.immichApiKeyFile must be an absolute runtime path string outside the Nix store, not secret contents or a store reference.";
-      }
-      {
-        assertion = !cfg.openFirewall || validInterface;
-        message = "services.immich-dlna-proxy.firewallInterface must name one nonempty LAN interface when openFirewall is true (letters, digits, _, ., -; not 'default' or a wildcard).";
       }
       {
         assertion = !cfg.openFirewall || (port >= 1024 && port <= 65535);
@@ -168,11 +149,9 @@ in
       };
     };
 
-    networking.firewall.interfaces = lib.mkIf (cfg.openFirewall && validInterface) {
-      ${cfg.firewallInterface} = {
-        allowedTCPPorts = lib.optional (port >= 1024 && port <= 65535) port;
-        allowedUDPPorts = [ 1900 ];
-      };
+    networking.firewall = lib.mkIf cfg.openFirewall {
+      allowedTCPPorts = lib.optional (port >= 1024 && port <= 65535) port;
+      allowedUDPPorts = [ 1900 ];
     };
   };
 }

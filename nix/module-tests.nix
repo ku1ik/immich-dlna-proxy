@@ -32,13 +32,7 @@ let
   disabled = evaluate { };
   enabled = evaluate required;
   service = enabled.config.systemd.services.${name};
-  firewall = evaluate (
-    required
-    // {
-      openFirewall = true;
-      firewallInterface = "enp3s0";
-    }
-  );
+  firewall = evaluate (required // { openFirewall = true; });
   valid =
     evaluated:
     let
@@ -106,8 +100,7 @@ let
       enabled.config.services.${name}.package.outPath == defaultPackage.outPath
       && enabled.config.services.${name}.friendlyName == "Immich"
       && enabled.config.services.${name}.logLevel == "info"
-      && !enabled.config.services.${name}.openFirewall
-      && enabled.config.services.${name}.firewallInterface == null;
+      && !enabled.config.services.${name}.openFirewall;
     nonsecretTomlAndExecEscaping =
       valid inspected
       &&
@@ -159,17 +152,11 @@ let
       &&
         enabled.config.networking.firewall.allowedUDPPorts
         == disabled.config.networking.firewall.allowedUDPPorts;
-    firewallInterfaceOnly =
+    firewallOpen =
       valid firewall
-      && builtins.attrNames firewall.config.networking.firewall.interfaces == [ "enp3s0" ]
-      && firewall.config.networking.firewall.interfaces.enp3s0.allowedTCPPorts == [ 8200 ]
-      && firewall.config.networking.firewall.interfaces.enp3s0.allowedUDPPorts == [ 1900 ]
-      &&
-        firewall.config.networking.firewall.allowedTCPPorts
-        == disabled.config.networking.firewall.allowedTCPPorts
-      &&
-        firewall.config.networking.firewall.allowedUDPPorts
-        == disabled.config.networking.firewall.allowedUDPPorts;
+      && firewall.config.networking.firewall.interfaces == { }
+      && firewall.config.networking.firewall.allowedTCPPorts == [ 8200 ]
+      && firewall.config.networking.firewall.allowedUDPPorts == [ 1900 ];
     packageOverride =
       valid overridden
       &&
@@ -191,35 +178,12 @@ let
   )
   // lib.listToAttrs (
     map
-      (interface: {
-        name = "rejectInterface:${builtins.toJSON interface}";
-        value = rejects (
-          required
-          // {
-            openFirewall = true;
-            firewallInterface = interface;
-          }
-        );
-      })
-      [
-        null
-        ""
-        " "
-        "default"
-        "+"
-        "enp*"
-        "enp+"
-      ]
-  )
-  // lib.listToAttrs (
-    map
       (address: {
         name = "rejectPort:${address}";
         value = rejects (
           required
           // {
             openFirewall = true;
-            firewallInterface = "enp3s0";
             listenAddress = address;
           }
         );
