@@ -43,6 +43,8 @@
         defaultPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.default;
       };
 
+      formatter = builtins.mapAttrs (_system: pkgs: pkgs.nixfmt-tree) nixpkgs.legacyPackages;
+
       checks = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (system: {
         module-eval = import ./nix/module-tests.nix {
           inherit nixpkgs;
