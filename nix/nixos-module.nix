@@ -22,6 +22,7 @@ let
   addressMatch = builtins.match "[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:([0-9]{1,5})" cfg.listenAddress;
   port = if addressMatch == null then 0 else lib.toIntBase10 (builtins.head addressMatch);
   secretPath = toString (/. + cfg.immichApiKeyFile);
+  credentialSource = lib.replaceStrings [ "%" ] [ "%%" ] "immich-api-key:${cfg.immichApiKeyFile}";
 in
 {
   options.services.immich-dlna-proxy = {
@@ -107,6 +108,13 @@ in
         assertion = !cfg.openFirewall || (port >= 1024 && port <= 65535);
         message = "services.immich-dlna-proxy.listenAddress must use IPv4:PORT with a decimal port in 1024-65535 to open the firewall.";
       }
+      {
+        assertion =
+          !lib.hasInfix "\n" cfg.immichApiKeyFile
+          && !lib.hasInfix "\r" cfg.immichApiKeyFile
+          && !lib.hasSuffix "\\" cfg.immichApiKeyFile;
+        message = "services.immich-dlna-proxy.immichApiKeyFile cannot contain line breaks or end with a backslash.";
+      }
     ];
 
     systemd.services.immich-dlna-proxy = {
@@ -120,10 +128,8 @@ in
           "--config"
           configFile
         ];
-        # LoadCredential expands % specifiers, but unlike ExecStart not $ variables.
-        LoadCredential = [
-          (builtins.toJSON (lib.replaceStrings [ "%" ] [ "%%" ] "immich-api-key:${cfg.immichApiKeyFile}"))
-        ];
+        # LoadCredential expands % specifiers, but does not accept a quoted ID:path pair.
+        LoadCredential = [ credentialSource ];
         DynamicUser = true;
         StateDirectory = "immich-dlna-proxy";
         StateDirectoryMode = "0700";

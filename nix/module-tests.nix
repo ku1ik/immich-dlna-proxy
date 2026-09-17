@@ -48,7 +48,7 @@ let
 
   specialSecret = "/run/secrets/key %n $TOKEN \"quoted\" \\ suffix";
   escaped = evaluate (required // { immichApiKeyFile = specialSecret; });
-  expectedCredential = ''"immich-api-key:/run/secrets/key %%n $TOKEN \"quoted\" \\ suffix"'';
+  expectedCredential = ''immich-api-key:/run/secrets/key %%n $TOKEN "quoted" \ suffix'';
 
   expectedSettings = {
     immich_url = required.immichUrl;
@@ -107,7 +107,7 @@ let
         inspected.config.systemd.services.${name}.serviceConfig.ExecStart
         == ''"${lib.getExe defaultPackage}" "--config" "/config path/$$name%%/\"settings\".toml"'';
     credentials =
-      service.serviceConfig.LoadCredential == [ ''"immich-api-key:/run/secrets/immich-api-key"'' ]
+      service.serviceConfig.LoadCredential == [ "immich-api-key:/run/secrets/immich-api-key" ]
       && valid escaped
       && escaped.config.systemd.services.${name}.serviceConfig.LoadCredential == [ expectedCredential ]
       &&
@@ -210,6 +210,9 @@ let
         "/nix/store"
         "/run/../nix/store/key"
         "//nix/store/key"
+        "/run/secrets/key\ninjected"
+        "/run/secrets/key\rinjected"
+        "/run/secrets/key\\"
       ]
   );
   failures = builtins.attrNames (lib.filterAttrs (_: passed: !passed) tests);
