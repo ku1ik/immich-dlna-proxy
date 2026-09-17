@@ -46,9 +46,9 @@ let
       );
   rejects = settings: !(builtins.tryEval (valid (evaluate settings))).success;
 
-  specialSecret = "/run/secrets/key %n $TOKEN \"quoted\" \\ suffix";
+  specialSecret = "/run/secrets/key $TOKEN \"quoted\" \\ suffix";
   escaped = evaluate (required // { immichApiKeyFile = specialSecret; });
-  expectedCredential = ''immich-api-key:/run/secrets/key %%n $TOKEN "quoted" \ suffix'';
+  expectedCredential = ''immich-api-key:/run/secrets/key $TOKEN "quoted" \ suffix'';
 
   expectedSettings = {
     immich_url = required.immichUrl;

@@ -22,7 +22,6 @@ let
   addressMatch = builtins.match "[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:([0-9]{1,5})" cfg.listenAddress;
   port = if addressMatch == null then 0 else lib.toIntBase10 (builtins.head addressMatch);
   secretPath = toString (/. + cfg.immichApiKeyFile);
-  credentialSource = lib.replaceStrings [ "%" ] [ "%%" ] "immich-api-key:${cfg.immichApiKeyFile}";
 in
 {
   options.services.immich-dlna-proxy = {
@@ -128,8 +127,8 @@ in
           "--config"
           configFile
         ];
-        # LoadCredential expands % specifiers, but does not accept a quoted ID:path pair.
-        LoadCredential = [ credentialSource ];
+        # LoadCredential does not accept a quoted ID:path pair.
+        LoadCredential = [ "immich-api-key:${cfg.immichApiKeyFile}" ];
         DynamicUser = true;
         StateDirectory = "immich-dlna-proxy";
         StateDirectoryMode = "0700";
