@@ -123,7 +123,7 @@ Add the flake input and import its module in your existing NixOS configuration:
 ```nix
 {
   inputs.immich-dlna-proxy.url = "github:ku1ik/immich-dlna-proxy";
-  inputs.nixpkgs.follows = "immich-dlna-proxy/nixpkgs";
+  inputs.immich-dlna-proxy.inputs.nixpkgs.follows = "nixpkgs";
 
   outputs = { nixpkgs, immich-dlna-proxy, ... }: {
     nixosConfigurations.media = nixpkgs.lib.nixosSystem {
