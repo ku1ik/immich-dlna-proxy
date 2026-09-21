@@ -735,6 +735,20 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
     Ok(xml.value)
 }
 
+pub(crate) fn event_body(service: Service, system_update_id: u32) -> String {
+    let properties = match service {
+        Service::ContentDirectory => {
+            format!("<e:property><SystemUpdateID>{system_update_id}</SystemUpdateID></e:property>")
+        }
+
+        Service::ConnectionManager => "<e:property><SourceProtocolInfo>http-get:*:*:*</SourceProtocolInfo></e:property><e:property><SinkProtocolInfo></SinkProtocolInfo></e:property><e:property><CurrentConnectionIDs>0</CurrentConnectionIDs></e:property>".into(),
+    };
+
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">{properties}</e:propertyset>"
+    )
+}
+
 pub fn scpd(service: Service) -> &'static str {
     match service {
         Service::ContentDirectory => CONTENT_DIRECTORY_SCPD,
@@ -907,6 +921,66 @@ mod tests {
 
         assert_eq!(depth, 0);
         assert_eq!(roots, 1);
+    }
+
+    #[test]
+    fn event_propertyset_namespaces_and_static_values_are_correct() {
+        for (service, expected) in [
+            (
+                Service::ContentDirectory,
+                vec![("SystemUpdateID", "4294967295")],
+            ),
+            (
+                Service::ConnectionManager,
+                vec![
+                    ("SourceProtocolInfo", "http-get:*:*:*"),
+                    ("SinkProtocolInfo", ""),
+                    ("CurrentConnectionIDs", "0"),
+                ],
+            ),
+        ] {
+            let body = event_body(service, u32::MAX);
+            let mut reader = NsReader::from_str(&body);
+            let mut variables = Vec::new();
+
+            loop {
+                match reader.read_resolved_event().unwrap() {
+                    (namespace, Event::Start(start)) => {
+                        let name = String::from_utf8(start.local_name().as_ref().to_vec()).unwrap();
+
+                        if matches!(name.as_str(), "propertyset" | "property") {
+                            assert_eq!(
+                                namespace,
+                                ResolveResult::Bound(quick_xml::name::Namespace(
+                                    b"urn:schemas-upnp-org:event-1-0"
+                                ))
+                            );
+                        } else {
+                            assert_eq!(namespace, ResolveResult::Unbound);
+                            variables.push((name, String::new()));
+                        }
+                    }
+
+                    (_, Event::Text(text)) => variables
+                        .last_mut()
+                        .unwrap()
+                        .1
+                        .push_str(&text.decode().unwrap()),
+
+                    (_, Event::Eof) => break,
+
+                    _ => {}
+                }
+            }
+
+            assert_eq!(
+                variables,
+                expected
+                    .into_iter()
+                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

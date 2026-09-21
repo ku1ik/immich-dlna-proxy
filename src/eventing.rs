@@ -16,7 +16,7 @@ use tokio::{
 use url::Url;
 use uuid::Uuid;
 
-use crate::protocol::Service;
+use crate::protocol::{self, Service};
 
 pub(crate) const SUBSCRIPTIONS: usize = 32;
 const CALLBACK_URLS: usize = 4;
@@ -297,7 +297,7 @@ impl Subscriptions {
                         entry.sid,
                         entry.callbacks.clone(),
                         seq,
-                        event_body(entry.service, id),
+                        protocol::event_body(entry.service, id),
                     ));
 
                     // Preserve waiting order across removals and new registrations.
@@ -457,20 +457,6 @@ fn callbacks(value: &str, peer: Ipv4Addr) -> Option<Vec<Url>> {
     (!urls.is_empty()).then_some(urls)
 }
 
-fn event_body(service: Service, system_update_id: u32) -> String {
-    let properties = match service {
-        Service::ContentDirectory => {
-            format!("<e:property><SystemUpdateID>{system_update_id}</SystemUpdateID></e:property>")
-        }
-
-        Service::ConnectionManager => "<e:property><SourceProtocolInfo>http-get:*:*:*</SourceProtocolInfo></e:property><e:property><SinkProtocolInfo></SinkProtocolInfo></e:property><e:property><CurrentConnectionIDs>0</CurrentConnectionIDs></e:property>".into(),
-    };
-
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">{properties}</e:propertyset>"
-    )
-}
-
 async fn deliver(
     client: reqwest::Client,
     sid: Uuid,
@@ -548,7 +534,6 @@ async fn deliver(
 mod tests {
     use super::*;
     use axum::{Router, body::to_bytes, routing::any};
-    use quick_xml::{NsReader, events::Event, name::ResolveResult};
     use tokio::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
         net::TcpListener,
@@ -1172,7 +1157,7 @@ mod tests {
             assert!(!request.headers.contains_key(name));
         }
 
-        assert_eq!(body, event_body(SERVICE, 17));
+        assert_eq!(body, protocol::event_body(SERVICE, 17));
         finished(&subscriptions, sid).await;
 
         assert_eq!(
@@ -1215,11 +1200,11 @@ mod tests {
             assert_eq!(request.headers["seq"], "0");
 
             if sid_header == format!("uuid:{sid}") {
-                assert_eq!(body, event_body(SERVICE, 10));
+                assert_eq!(body, protocol::event_body(SERVICE, 10));
                 assert!(initial.insert(sid));
             } else {
                 assert_eq!(sid_header, format!("uuid:{cm}"));
-                assert_eq!(body, event_body(Service::ConnectionManager, 12));
+                assert_eq!(body, protocol::event_body(Service::ConnectionManager, 12));
                 assert!(initial.insert(cm));
             }
         }
@@ -1266,7 +1251,7 @@ mod tests {
         callback.release.add_permits(1);
         let (request, body) = callback.next().await;
         assert_eq!(request.headers["seq"], "1");
-        assert_eq!(body, event_body(SERVICE, 14));
+        assert_eq!(body, protocol::event_body(SERVICE, 14));
         subscriptions.publish(15);
         subscriptions.publish(16);
         callback.release.add_permits(1);
@@ -1292,7 +1277,7 @@ mod tests {
         let (request, body) = callback.next().await;
         assert!(Instant::now() >= deadline);
         assert_eq!(request.headers["seq"], "2");
-        assert_eq!(body, event_body(SERVICE, 16));
+        assert_eq!(body, protocol::event_body(SERVICE, 16));
         callback.release.add_permits(1);
         finished(&subscriptions, sid).await;
         subscriptions.publish(16);
@@ -1322,7 +1307,7 @@ mod tests {
             let (request, body) = callback.next().await;
             assert_eq!(request.uri.path(), "/gated-fail");
             assert_eq!(request.headers["seq"], seq.to_string());
-            assert_eq!(body, event_body(SERVICE, id));
+            assert_eq!(body, protocol::event_body(SERVICE, id));
 
             if let Some(future) = future {
                 subscriptions.publish(future);
@@ -1407,7 +1392,7 @@ mod tests {
         for _ in 0..DELIVERIES {
             let (request, body) = callback.next().await;
             assert_eq!(request.headers["seq"], "1");
-            assert_eq!(body, event_body(SERVICE, 1));
+            assert_eq!(body, protocol::event_body(SERVICE, 1));
 
             let seq = sequences
                 .get_mut(request.headers["sid"].to_str().unwrap())
@@ -1454,7 +1439,7 @@ mod tests {
             let seq = sequences.get_mut(sid).unwrap();
             *seq += 1;
             assert_eq!(request.headers["seq"], seq.to_string());
-            assert_eq!(body, event_body(SERVICE, 2));
+            assert_eq!(body, protocol::event_body(SERVICE, 2));
 
             assert_eq!(
                 subscriptions
@@ -1537,7 +1522,7 @@ mod tests {
             let (request, body) = callback.next().await;
             assert_eq!(request.headers["sid"], format!("uuid:{target}"));
             assert_eq!(request.headers["seq"], "0");
-            assert_eq!(body, event_body(SERVICE, 17));
+            assert_eq!(body, protocol::event_body(SERVICE, 17));
             abort_scheduler(task).await;
         }
     }
@@ -1600,63 +1585,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn propertyset_namespaces_and_static_values_are_correct() {
-        for (service, expected) in [
-            (SERVICE, vec![("SystemUpdateID", "4294967295")]),
-            (
-                Service::ConnectionManager,
-                vec![
-                    ("SourceProtocolInfo", "http-get:*:*:*"),
-                    ("SinkProtocolInfo", ""),
-                    ("CurrentConnectionIDs", "0"),
-                ],
-            ),
-        ] {
-            let body = event_body(service, u32::MAX);
-            let mut reader = NsReader::from_str(&body);
-            let mut variables = Vec::new();
-
-            loop {
-                match reader.read_resolved_event().unwrap() {
-                    (namespace, Event::Start(start)) => {
-                        let name = String::from_utf8(start.local_name().as_ref().to_vec()).unwrap();
-
-                        if matches!(name.as_str(), "propertyset" | "property") {
-                            assert_eq!(
-                                namespace,
-                                ResolveResult::Bound(quick_xml::name::Namespace(
-                                    b"urn:schemas-upnp-org:event-1-0"
-                                ))
-                            );
-                        } else {
-                            assert_eq!(namespace, ResolveResult::Unbound);
-                            variables.push((name, String::new()));
-                        }
-                    }
-
-                    (_, Event::Text(text)) => variables
-                        .last_mut()
-                        .unwrap()
-                        .1
-                        .push_str(&text.decode().unwrap()),
-
-                    (_, Event::Eof) => break,
-
-                    _ => {}
-                }
-            }
-
-            assert_eq!(
-                variables,
-                expected
-                    .into_iter()
-                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
-
     #[tokio::test]
     async fn alternatives_keep_identical_seq_and_body_and_do_not_follow_redirects() {
         let subscriptions = Subscriptions::new().unwrap();
@@ -1675,7 +1603,7 @@ mod tests {
             assert_eq!(request.uri.path(), path);
             assert_eq!(request.headers["seq"], "0");
             assert_eq!(request.headers["sid"], format!("uuid:{sid}"));
-            assert_eq!(body, event_body(Service::ConnectionManager, 0));
+            assert_eq!(body, protocol::event_body(Service::ConnectionManager, 0));
         }
 
         finished(&subscriptions, sid).await;
@@ -1910,7 +1838,7 @@ mod tests {
                     };
 
                     let mut socket = BufReader::new(socket);
-                    let expected_body = event_body(SERVICE, id);
+                    let expected_body = protocol::event_body(SERVICE, id);
 
                     let read_request = async {
                         let mut request = String::new();
@@ -2078,7 +2006,7 @@ mod tests {
                     }
                 }
 
-                let expected = event_body(SERVICE, 0);
+                let expected = protocol::event_body(SERVICE, 0);
                 let mut body = vec![0; expected.len()];
                 socket.read_exact(&mut body).await.unwrap();
                 assert_eq!(body, expected.as_bytes());
