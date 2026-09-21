@@ -273,81 +273,9 @@ impl<C: Catalog> Server<C> {
             None
         };
 
-        let result = timeout_at(deadline, async {
-            let args = match action {
-                Action::Browse { query, filter } => {
-                    let object = crate::catalog::parse_id(&query.object_id).ok();
-
-                    tracing::debug!(
-                        %peer, ?object,
-                        metadata = query.metadata,
-                        starting_index = query.starting_index,
-                        requested_count = query.requested_count,
-                        sort = ?query.sort,
-                        resources_selected = filter.res(),
-                        "Browse request"
-                    );
-
-                    let result = self.catalog.browse(query).await?;
-                    let didl = protocol::didl(&result.objects, &filter)?;
-                    let envelope = protocol::action_response(
-                        service,
-                        "Browse",
-                        &[
-                            ("Result", &didl),
-                            ("NumberReturned", &result.objects.len().to_string()),
-                            ("TotalMatches", &result.total_matches.to_string()),
-                            ("UpdateID", &result.update_id.to_string()),
-                        ],
-                    )?;
-
-                    tracing::debug!(%peer, ?object, returned = result.objects.len(), total = result.total_matches, update_id = result.update_id, "Browse response");
-
-                    return Ok(envelope);
-                }
-
-                Action::GetSearchCapabilities => vec![("SearchCaps", String::new())],
-                Action::GetSortCapabilities => vec![("SortCaps", "dc:date".into())],
-
-                Action::GetSystemUpdateId => {
-                    let id = self.catalog.system_update_id();
-                    tracing::debug!(%peer, id, "published update ID");
-
-                    vec![("Id", id.to_string())]
-                }
-
-                Action::GetProtocolInfo => {
-                    vec![("Source", "http-get:*:*:*".into()), ("Sink", String::new())]
-                }
-
-                Action::GetCurrentConnectionIds => vec![("ConnectionIDs", "0".into())],
-
-                Action::GetCurrentConnectionInfo(id) => {
-                    if id != 0 {
-                        return Err(Fault { code: 706 });
-                    }
-
-                    vec![
-                        ("RcsID", "-1".into()),
-                        ("AVTransportID", "-1".into()),
-                        ("ProtocolInfo", String::new()),
-                        ("PeerConnectionManager", String::new()),
-                        ("PeerConnectionID", "-1".into()),
-                        ("Direction", "Output".into()),
-                        ("Status", "Unknown".into()),
-                    ]
-                }
-            };
-
-            let args: Vec<_> = args
-                .iter()
-                .map(|(name, value)| (*name, value.as_str()))
-                .collect();
-
-            protocol::action_response(service, name, &args)
-        })
-        .await
-        .unwrap_or(Err(Fault { code: 501 }));
+        let result = timeout_at(deadline, execute(&self.catalog, service, action, peer))
+            .await
+            .unwrap_or(Err(Fault { code: 501 }));
 
         let result = if Instant::now() < deadline {
             result
@@ -361,6 +289,87 @@ impl<C: Catalog> Server<C> {
 
         soap(result)
     }
+}
+
+async fn execute<C: Catalog>(
+    catalog: &C,
+    service: Service,
+    action: Action,
+    peer: Ipv4Addr,
+) -> Result<String, Fault> {
+    let name = action.name();
+
+    let args = match action {
+        Action::Browse { query, filter } => {
+            let object = crate::catalog::parse_id(&query.object_id).ok();
+
+            tracing::debug!(
+                %peer, ?object,
+                metadata = query.metadata,
+                starting_index = query.starting_index,
+                requested_count = query.requested_count,
+                sort = ?query.sort,
+                resources_selected = filter.res(),
+                "Browse request"
+            );
+
+            let result = catalog.browse(query).await?;
+            let didl = protocol::didl(&result.objects, &filter)?;
+            let envelope = protocol::action_response(
+                service,
+                "Browse",
+                &[
+                    ("Result", &didl),
+                    ("NumberReturned", &result.objects.len().to_string()),
+                    ("TotalMatches", &result.total_matches.to_string()),
+                    ("UpdateID", &result.update_id.to_string()),
+                ],
+            )?;
+
+            tracing::debug!(%peer, ?object, returned = result.objects.len(), total = result.total_matches, update_id = result.update_id, "Browse response");
+
+            return Ok(envelope);
+        }
+
+        Action::GetSearchCapabilities => vec![("SearchCaps", String::new())],
+        Action::GetSortCapabilities => vec![("SortCaps", "dc:date".into())],
+
+        Action::GetSystemUpdateId => {
+            let id = catalog.system_update_id();
+            tracing::debug!(%peer, id, "published update ID");
+
+            vec![("Id", id.to_string())]
+        }
+
+        Action::GetProtocolInfo => {
+            vec![("Source", "http-get:*:*:*".into()), ("Sink", String::new())]
+        }
+
+        Action::GetCurrentConnectionIds => vec![("ConnectionIDs", "0".into())],
+
+        Action::GetCurrentConnectionInfo(id) => {
+            if id != 0 {
+                return Err(Fault { code: 706 });
+            }
+
+            vec![
+                ("RcsID", "-1".into()),
+                ("AVTransportID", "-1".into()),
+                ("ProtocolInfo", String::new()),
+                ("PeerConnectionManager", String::new()),
+                ("PeerConnectionID", "-1".into()),
+                ("Direction", "Output".into()),
+                ("Status", "Unknown".into()),
+            ]
+        }
+    };
+
+    let args: Vec<_> = args
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+
+    protocol::action_response(service, name, &args)
 }
 
 fn single<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
