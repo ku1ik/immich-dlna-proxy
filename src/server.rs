@@ -290,17 +290,7 @@ impl<C: Catalog> Server<C> {
                     );
 
                     let result = self.catalog.browse(args).await?;
-
-                    if Instant::now() >= deadline {
-                        return Err(Fault { code: 501 });
-                    }
-
                     let didl = protocol::didl(&result.objects, &filter)?;
-
-                    if Instant::now() >= deadline {
-                        return Err(Fault { code: 501 });
-                    }
-
                     let envelope = protocol::action_response(
                         service,
                         "Browse",
@@ -314,7 +304,7 @@ impl<C: Catalog> Server<C> {
 
                     tracing::debug!(%peer, ?object, returned = result.objects.len(), total = result.total_matches, update_id = result.update_id, "Browse response");
 
-                    return Ok(soap(Ok(envelope)));
+                    return Ok(envelope);
                 }
 
                 Action::GetSearchCapabilities => vec![("SearchCaps", String::new())],
@@ -355,20 +345,22 @@ impl<C: Catalog> Server<C> {
                 .map(|(name, value)| (*name, value.as_str()))
                 .collect();
 
-            Ok(soap(protocol::action_response(
-                service,
-                name,
-                &args,
-            )))
+            protocol::action_response(service, name, &args)
         })
         .await
         .unwrap_or(Err(Fault { code: 501 }));
 
-        result.unwrap_or_else(|fault| {
-            tracing::debug!(%peer, ?service, code = fault.code, "SOAP action failed");
+        let result = if Instant::now() < deadline {
+            result
+        } else {
+            Err(Fault { code: 501 })
+        };
 
-            soap(Err(fault))
-        })
+        if let Err(fault) = &result {
+            tracing::debug!(%peer, ?service, code = fault.code, "SOAP action failed");
+        }
+
+        soap(result)
     }
 }
 
@@ -455,6 +447,7 @@ mod tests {
         actions: Mutex<Vec<BrowseArguments>>,
         entered: Notify,
         release: Option<Semaphore>,
+        block: Option<Duration>,
     }
 
     impl Catalog for TestCatalog {
@@ -465,6 +458,10 @@ mod tests {
         async fn browse(&self, arguments: BrowseArguments) -> Result<BrowseResult, Fault> {
             self.actions.lock().unwrap().push(arguments);
             self.entered.notify_one();
+
+            if let Some(duration) = self.block {
+                std::thread::sleep(duration);
+            }
 
             if let Some(release) = &self.release {
                 release.acquire().await.unwrap().forget();
@@ -776,6 +773,32 @@ mod tests {
         assert!(body(response).await.contains("<errorCode>501</errorCode>"));
         assert_eq!(server.browses.available_permits(), BROWSES);
         assert!(server.catalog.actions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn synchronous_completion_after_control_deadline_is_rejected() {
+        let server = server(TestCatalog {
+            block: Some(Duration::from_millis(200)),
+            ..TestCatalog::default()
+        });
+
+        let (parts, request_body) = browse().into_parts();
+        let started = Instant::now() - CONTROL_PROCESSING_TIMEOUT + Duration::from_millis(100);
+
+        let response = server
+            .control(
+                Service::ContentDirectory,
+                parts.headers,
+                request_body,
+                started,
+                Ipv4Addr::LOCALHOST,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body(response).await.contains("<errorCode>501</errorCode>"));
+        assert_eq!(server.browses.available_permits(), BROWSES);
+        assert_eq!(server.catalog.actions.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
