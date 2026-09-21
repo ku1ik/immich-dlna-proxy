@@ -155,16 +155,7 @@ impl MediaProxy {
             range = ?single(&headers, header::RANGE).and_then(ByteRange::parse),
             range_end_to_end = end_to_end(&headers, &header::RANGE),
             if_range_present = headers.contains_key(header::IF_RANGE),
-            content_features_present = headers.contains_key("getcontentfeatures.dlna.org"),
-            content_features_requested = single(
-                &headers,
-                header::HeaderName::from_static("getcontentfeatures.dlna.org"),
-            ) == Some("1"),
-            time_seek_present = headers.contains_key("timeseekrange.dlna.org"),
-            available_seek_range_present = headers.contains_key("getavailableseekrange.dlna.org"),
-            play_speed_present = headers.contains_key("playspeed.dlna.org"),
-            transfer_mode_present = headers.contains_key("transfermode.dlna.org"),
-            "media request capabilities"
+            "media proxy request"
         );
 
         let Ok(permit) = self.operations.clone().try_acquire_owned() else {
@@ -347,27 +338,19 @@ impl MediaProxy {
         match status {
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {}
 
-            StatusCode::NOT_MODIFIED => {
-                safe.remove(header::CONTENT_RANGE);
-                let mut result = response(status);
-                result.headers_mut().extend(safe);
+            StatusCode::NOT_MODIFIED
+            | StatusCode::PRECONDITION_FAILED
+            | StatusCode::NOT_FOUND
+            | StatusCode::RANGE_NOT_SATISFIABLE => {
+                if status != StatusCode::NOT_MODIFIED {
+                    safe.remove(header::CONTENT_TYPE);
+                    safe.remove(header::CONTENT_LENGTH);
+                }
 
-                return Ok(result);
-            }
+                if status != StatusCode::RANGE_NOT_SATISFIABLE {
+                    safe.remove(header::CONTENT_RANGE);
+                }
 
-            StatusCode::PRECONDITION_FAILED | StatusCode::NOT_FOUND => {
-                safe.remove(header::CONTENT_TYPE);
-                safe.remove(header::CONTENT_LENGTH);
-                safe.remove(header::CONTENT_RANGE);
-                let mut result = response(status);
-                result.headers_mut().extend(safe);
-
-                return Ok(result);
-            }
-
-            StatusCode::RANGE_NOT_SATISFIABLE => {
-                safe.remove(header::CONTENT_TYPE);
-                safe.remove(header::CONTENT_LENGTH);
                 let mut result = response(status);
                 result.headers_mut().extend(safe);
 
