@@ -650,7 +650,7 @@ impl Filter {
         Ok(filter)
     }
 
-    pub fn res(&self) -> bool {
+    pub(crate) fn res(&self) -> bool {
         self.res
     }
 }

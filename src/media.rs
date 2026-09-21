@@ -16,7 +16,7 @@ const REDIRECTS: usize = 3;
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub const ASSET_ROUTE_PREFIX: &str = "/media/assets/";
+pub(crate) const ASSET_ROUTE_PREFIX: &str = "/media/assets/";
 pub const ORIGINAL: &str = "original";
 pub const DISPLAY: &str = "display";
 pub const PREVIEW: &str = "preview";
