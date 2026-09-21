@@ -1240,14 +1240,11 @@ impl Cache {
         }
     }
 
-    fn invalidate(&mut self, ledger: &Ledger) {
-        self.albums
-            .retain(|id, _| ledger.albums.get(id).is_some_and(|album| album.present));
-    }
-
     fn insert(&mut self, candidate: Candidate, now: Instant) {
         let scope = match candidate {
             Candidate::Root(snapshot) => {
+                self.albums.retain(|id, _| snapshot.albums.contains_key(id));
+
                 self.root = Some(Cached {
                     snapshot: Arc::new(snapshot),
                     completed: now,
@@ -1688,9 +1685,7 @@ impl Library {
             );
 
             if let Some(next) = next {
-                let State { ledger, cache, .. } = &mut *state;
-                cache.invalidate(&next);
-                *ledger = Arc::new(next);
+                state.ledger = Arc::new(next);
             }
 
             state.cache.insert(candidate, Instant::now());
