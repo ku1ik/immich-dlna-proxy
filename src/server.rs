@@ -298,8 +298,9 @@ async fn execute<C: Catalog>(
     peer: Ipv4Addr,
 ) -> Result<String, Fault> {
     let name = action.name();
+    let response = |args: &[(&'static str, &str)]| protocol::action_response(service, name, args);
 
-    let args = match action {
+    match action {
         Action::Browse { query, filter } => {
             let object = crate::catalog::parse_id(&query.object_id).ok();
 
@@ -315,61 +316,49 @@ async fn execute<C: Catalog>(
 
             let result = catalog.browse(query).await?;
             let didl = protocol::didl(&result.objects, &filter)?;
-            let envelope = protocol::action_response(
-                service,
-                "Browse",
-                &[
-                    ("Result", &didl),
-                    ("NumberReturned", &result.objects.len().to_string()),
-                    ("TotalMatches", &result.total_matches.to_string()),
-                    ("UpdateID", &result.update_id.to_string()),
-                ],
-            )?;
+            let envelope = response(&[
+                ("Result", &didl),
+                ("NumberReturned", &result.objects.len().to_string()),
+                ("TotalMatches", &result.total_matches.to_string()),
+                ("UpdateID", &result.update_id.to_string()),
+            ])?;
 
             tracing::debug!(%peer, ?object, returned = result.objects.len(), total = result.total_matches, update_id = result.update_id, "Browse response");
 
-            return Ok(envelope);
+            Ok(envelope)
         }
 
-        Action::GetSearchCapabilities => vec![("SearchCaps", String::new())],
-        Action::GetSortCapabilities => vec![("SortCaps", "dc:date".into())],
+        Action::GetSearchCapabilities => response(&[("SearchCaps", "")]),
+        Action::GetSortCapabilities => response(&[("SortCaps", "dc:date")]),
 
         Action::GetSystemUpdateId => {
             let id = catalog.system_update_id();
             tracing::debug!(%peer, id, "published update ID");
+            let id = id.to_string();
 
-            vec![("Id", id.to_string())]
+            response(&[("Id", &id)])
         }
 
-        Action::GetProtocolInfo => {
-            vec![("Source", "http-get:*:*:*".into()), ("Sink", String::new())]
-        }
+        Action::GetProtocolInfo => response(&[("Source", "http-get:*:*:*"), ("Sink", "")]),
 
-        Action::GetCurrentConnectionIds => vec![("ConnectionIDs", "0".into())],
+        Action::GetCurrentConnectionIds => response(&[("ConnectionIDs", "0")]),
 
         Action::GetCurrentConnectionInfo(id) => {
             if id != 0 {
                 return Err(Fault { code: 706 });
             }
 
-            vec![
-                ("RcsID", "-1".into()),
-                ("AVTransportID", "-1".into()),
-                ("ProtocolInfo", String::new()),
-                ("PeerConnectionManager", String::new()),
-                ("PeerConnectionID", "-1".into()),
-                ("Direction", "Output".into()),
-                ("Status", "Unknown".into()),
-            ]
+            response(&[
+                ("RcsID", "-1"),
+                ("AVTransportID", "-1"),
+                ("ProtocolInfo", ""),
+                ("PeerConnectionManager", ""),
+                ("PeerConnectionID", "-1"),
+                ("Direction", "Output"),
+                ("Status", "Unknown"),
+            ])
         }
-    };
-
-    let args: Vec<_> = args
-        .iter()
-        .map(|(name, value)| (*name, value.as_str()))
-        .collect();
-
-    protocol::action_response(service, name, &args)
+    }
 }
 
 fn single<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
