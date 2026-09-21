@@ -30,13 +30,10 @@ mod browse;
 mod revisions;
 mod snapshots;
 
+use browse::View;
 pub use browse::{ObjectId, parse_id};
-use revisions::AlbumRevision;
-use revisions::{Ledger, Store};
+use revisions::{AlbumRevision, Ledger, Store};
 use snapshots::{Contents, Root, Source};
-
-#[cfg(test)]
-use browse::compare_dates;
 
 const FRESHNESS: Duration = Duration::from_secs(60);
 const RESIDENT_ALBUMS: usize = 32;
@@ -140,14 +137,6 @@ struct State {
     ledger: Arc<Ledger>,
     cache: Cache,
     flights: BTreeMap<Scope, watch::Receiver<Option<RefreshResult>>>,
-}
-
-// A response pins one publication independently of subsequent cache eviction.
-#[derive(Clone)]
-struct View {
-    root: Arc<Root>,
-    contents: Option<Arc<Contents>>,
-    ledger: Arc<Ledger>,
 }
 
 type RefreshResult = Result<View, Fault>;

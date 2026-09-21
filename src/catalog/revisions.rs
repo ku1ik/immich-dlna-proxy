@@ -23,7 +23,7 @@ const PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Ledger {
+pub(super) struct Ledger {
     pub(super) server_uuid: Uuid,
     pub(super) system_update_id: u32,
     #[serde(deserialize_with = "Option::deserialize")]
@@ -135,7 +135,7 @@ impl Ledger {
 
     /// Invalidate every retained counter once, without forgetting any digest.
     /// Persist this transition before binding listeners or announcing the device.
-    pub(crate) fn restart(&mut self) {
+    pub(super) fn restart(&mut self) {
         self.system_update_id = self.system_update_id.wrapping_add(1);
 
         for album in self.albums.values_mut() {
@@ -240,7 +240,7 @@ impl Ledger {
 
 /// Owns the exclusive directory lock, also retained by every disk worker.
 #[derive(Clone)]
-pub(crate) struct Store {
+pub(super) struct Store {
     inner: Arc<StoreInner>,
 }
 
@@ -288,7 +288,7 @@ impl Store {
     /// The existing directory must be private, writable, trusted local storage.
     /// Resolve a configured symlink once, as used by systemd DynamicUser. The
     /// directory and its parent paths must not be moved or replaced while running.
-    pub(crate) fn open(directory: &Path, uuid: Uuid) -> anyhow::Result<(Self, Ledger)> {
+    pub(super) fn open(directory: &Path, uuid: Uuid) -> anyhow::Result<(Self, Ledger)> {
         ensure!(!uuid.is_nil(), "server UUID must not be nil");
 
         let path = directory
@@ -393,7 +393,7 @@ impl Store {
     /// subscriber updates. This method does not serialize callers or publish state.
     /// Never wrap it in a client/request timeout. The blocking worker retains the
     /// process lock; failure/timeout exits without waiting for worker/runtime drop.
-    pub(crate) async fn persist(&self, ledger: Ledger) -> Ledger {
+    pub(super) async fn persist(&self, ledger: Ledger) -> Ledger {
         struct Commit;
 
         impl Drop for Commit {

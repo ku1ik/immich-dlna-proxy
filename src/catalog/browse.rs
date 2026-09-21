@@ -1,11 +1,23 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use icu_collator::CollatorBorrowed;
 use uuid::Uuid;
 
-use super::{BrowseQuery, BrowseResult, FAILED, MISSING, Object, View};
+use super::{
+    BrowseQuery, BrowseResult, FAILED, MISSING, Object,
+    revisions::Ledger,
+    snapshots::{Contents, Root},
+};
 use crate::protocol::Fault;
+
+// A response pins one publication independently of subsequent cache eviction.
+#[derive(Clone)]
+pub(super) struct View {
+    pub(super) root: Arc<Root>,
+    pub(super) contents: Option<Arc<Contents>>,
+    pub(super) ledger: Arc<Ledger>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObjectId {
@@ -42,7 +54,7 @@ pub fn parse_id(value: &str) -> Result<ObjectId, Fault> {
     }
 }
 
-pub(super) fn compare_dates(
+fn compare_dates(
     a_date: Option<&str>,
     a_capture: Option<&DateTime<Utc>>,
     a_id: Uuid,
@@ -193,5 +205,109 @@ impl View {
             total_matches,
             update_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_and_date_ordering() {
+        let album = Uuid::from_u128(100_000);
+        let asset = Uuid::from_u128(0xabcdef);
+        let id = format!("album:{album}:asset:{asset}");
+
+        assert_eq!(
+            parse_id(
+                &id.to_uppercase()
+                    .replacen("ALBUM", "album", 1)
+                    .replacen("ASSET", "asset", 1)
+            ),
+            Ok(ObjectId::Item { album, asset })
+        );
+
+        assert_eq!(parse_id("0"), Ok(ObjectId::Root));
+
+        assert_eq!(
+            parse_id(&format!("album:{album}")),
+            Ok(ObjectId::Album(album))
+        );
+
+        for id in [
+            "",
+            "00",
+            "0:",
+            "asset:bad",
+            "album:bad",
+            "album:0:asset:0",
+            &format!("album:{album}:"),
+            &format!("{id}:extra"),
+            &format!("album:{album}:asset:"),
+        ] {
+            assert_eq!(parse_id(id), Err(Fault { code: 701 }));
+        }
+
+        let early = "2023-12-31T22:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        let late = "2024-01-01T00:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        let low = Uuid::from_u128(1);
+        let high = Uuid::from_u128(2);
+
+        for descending in [false, true] {
+            assert_eq!(
+                compare_dates(
+                    None,
+                    Some(&early),
+                    low,
+                    Some("2024-01-01"),
+                    None,
+                    high,
+                    descending
+                ),
+                Ordering::Greater
+            );
+
+            assert_eq!(
+                compare_dates(
+                    Some("2024-01-01"),
+                    None,
+                    low,
+                    Some("2024-01-01"),
+                    Some(&late),
+                    high,
+                    descending
+                ),
+                Ordering::Greater
+            );
+
+            assert_eq!(
+                compare_dates(None, None, low, None, None, high, descending),
+                Ordering::Less
+            );
+
+            let expected = if descending {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+
+            assert_eq!(
+                compare_dates(
+                    Some("2023-12-31"),
+                    Some(&late),
+                    high,
+                    Some("2024-01-01"),
+                    Some(&early),
+                    low,
+                    descending
+                ),
+                expected
+            );
+
+            assert_eq!(
+                compare_dates(None, Some(&early), high, None, Some(&late), low, descending),
+                expected
+            );
+        }
     }
 }

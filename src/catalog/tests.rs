@@ -8,7 +8,6 @@ use axum::{
 use http::{HeaderMap, HeaderValue, Method};
 use serde_json::{Value, json};
 use std::{
-    cmp::Ordering,
     fs,
     net::Ipv4Addr,
     os::unix::fs::{MetadataExt, PermissionsExt},
@@ -17,111 +16,10 @@ use std::{
 use tempfile::TempDir;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 
-use chrono::{DateTime, Utc};
-
 use crate::{
     immich::Client,
     protocol::{self, Filter, Service},
 };
-
-#[test]
-fn ids_and_date_ordering() {
-    let album = Uuid::from_u128(100_000);
-    let asset = Uuid::from_u128(0xabcdef);
-    let id = format!("album:{album}:asset:{asset}");
-
-    assert_eq!(
-        parse_id(
-            &id.to_uppercase()
-                .replacen("ALBUM", "album", 1)
-                .replacen("ASSET", "asset", 1)
-        ),
-        Ok(ObjectId::Item { album, asset })
-    );
-
-    assert_eq!(parse_id("0"), Ok(ObjectId::Root));
-
-    assert_eq!(
-        parse_id(&format!("album:{album}")),
-        Ok(ObjectId::Album(album))
-    );
-
-    for id in [
-        "",
-        "00",
-        "0:",
-        "asset:bad",
-        "album:bad",
-        "album:0:asset:0",
-        &format!("album:{album}:"),
-        &format!("{id}:extra"),
-        &format!("album:{album}:asset:"),
-    ] {
-        assert_eq!(parse_id(id), Err(Fault { code: 701 }));
-    }
-
-    let early = "2023-12-31T22:30:00Z".parse::<DateTime<Utc>>().unwrap();
-    let late = "2024-01-01T00:30:00Z".parse::<DateTime<Utc>>().unwrap();
-    let low = Uuid::from_u128(1);
-    let high = Uuid::from_u128(2);
-
-    for descending in [false, true] {
-        assert_eq!(
-            compare_dates(
-                None,
-                Some(&early),
-                low,
-                Some("2024-01-01"),
-                None,
-                high,
-                descending
-            ),
-            Ordering::Greater
-        );
-
-        assert_eq!(
-            compare_dates(
-                Some("2024-01-01"),
-                None,
-                low,
-                Some("2024-01-01"),
-                Some(&late),
-                high,
-                descending
-            ),
-            Ordering::Greater
-        );
-
-        assert_eq!(
-            compare_dates(None, None, low, None, None, high, descending),
-            Ordering::Less
-        );
-
-        let expected = if descending {
-            Ordering::Greater
-        } else {
-            Ordering::Less
-        };
-
-        assert_eq!(
-            compare_dates(
-                Some("2023-12-31"),
-                Some(&late),
-                high,
-                Some("2024-01-01"),
-                Some(&early),
-                low,
-                descending
-            ),
-            expected
-        );
-
-        assert_eq!(
-            compare_dates(None, Some(&early), high, None, Some(&late), low, descending),
-            expected
-        );
-    }
-}
 
 pub(super) struct Barrier {
     pub(super) entered: Notify,
