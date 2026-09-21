@@ -20,8 +20,11 @@ let
     log_level = cfg.logLevel;
   };
   addressMatch = builtins.match "[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:([0-9]{1,5})" cfg.listenAddress;
+  # Use an invalid port on a format mismatch so the assertion explains the failure.
   port = if addressMatch == null then 0 else lib.toIntBase10 (builtins.head addressMatch);
-  secretPath = toString (/. + cfg.immichApiKeyFile);
+  validPort = port >= 1024 && port <= 65535;
+  # Normalize repeated separators and .. before checking for a Nix store path.
+  normalizedSecretPath = toString (/. + cfg.immichApiKeyFile);
 in
 {
   options.services.immich-dlna-proxy = {
@@ -99,15 +102,17 @@ in
         assertion =
           lib.hasPrefix "/" cfg.immichApiKeyFile
           && !builtins.hasContext cfg.immichApiKeyFile
-          && secretPath != builtins.storeDir
-          && !lib.hasPrefix "${builtins.storeDir}/" secretPath;
+          && normalizedSecretPath != builtins.storeDir
+          && !lib.hasPrefix "${builtins.storeDir}/" normalizedSecretPath;
         message = "services.immich-dlna-proxy.immichApiKeyFile must be an absolute runtime path string outside the Nix store, not secret contents or a store reference.";
       }
       {
-        assertion = !cfg.openFirewall || (port >= 1024 && port <= 65535);
+        assertion = !cfg.openFirewall || validPort;
         message = "services.immich-dlna-proxy.listenAddress must use IPv4:PORT with a decimal port in 1024-65535 to open the firewall.";
       }
       {
+        # LoadCredential is written directly into the unit: reject line breaks
+        # and a trailing backslash, which systemd treats as a line continuation.
         assertion =
           !lib.hasInfix "\n" cfg.immichApiKeyFile
           && !lib.hasInfix "\r" cfg.immichApiKeyFile
@@ -136,6 +141,7 @@ in
         Restart = "on-failure";
         RestartSec = 3;
 
+        # Keep the hardening policy explicit, including DynamicUser's implied settings.
         NoNewPrivileges = true;
         CapabilityBoundingSet = "";
         AmbientCapabilities = "";
@@ -155,7 +161,7 @@ in
     };
 
     networking.firewall = lib.mkIf cfg.openFirewall {
-      allowedTCPPorts = lib.optional (port >= 1024 && port <= 65535) port;
+      allowedTCPPorts = lib.optional validPort port;
       allowedUDPPorts = [ 1900 ];
     };
   };
