@@ -9,11 +9,9 @@ use axum::{Router, body::Body, extract::Request, response::Response};
 use clap::Parser;
 use http::{HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
-    catalog::{BrowseQuery, BrowseResult, Catalog, Object, ObjectId, parse_id},
     config::{is_non_loopback_unicast, resolve_interface},
     eventing::Subscriptions,
-    media::MediaProxy,
-    protocol::Fault,
+    media::{DISPLAY, MediaProxy, ORIGINAL, PLAYBACK, PREVIEW},
     server::Server,
     ssdp::Discovery,
 };
@@ -89,79 +87,6 @@ async fn validate_fixtures(directory: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-struct FixtureCatalog(Vec<Object>);
-
-impl Catalog for FixtureCatalog {
-    fn system_update_id(&self) -> u32 {
-        0
-    }
-
-    async fn browse(&self, args: BrowseQuery) -> Result<BrowseResult, Fault> {
-        let id = match parse_id(&args.object_id)? {
-            ObjectId::Root => "0".to_owned(),
-            ObjectId::Album(album) => format!("album:{album}"),
-            ObjectId::Item { album, asset } => format!("album:{album}:asset:{asset}"),
-        };
-
-        let object = self
-            .0
-            .iter()
-            .find(|object| object.id == id)
-            .ok_or(Fault { code: 701 })?;
-
-        tracing::info!(object = %id, metadata = args.metadata, "fixture Browse selection");
-
-        if args.metadata {
-            return Ok(BrowseResult {
-                objects: vec![object.clone()],
-                total_matches: 1,
-                update_id: 0,
-            });
-        }
-
-        if object.class.starts_with("object.item") {
-            return Err(Fault { code: 710 });
-        }
-
-        let mut children: Vec<_> = self
-            .0
-            .iter()
-            .filter(|object| object.parent_id == id)
-            .collect();
-
-        children.sort_by(|a, b| {
-            let dates = a.date.cmp(&b.date);
-            let dates = if args.sort == Some(true) {
-                dates.reverse()
-            } else {
-                dates
-            };
-
-            dates.then_with(|| a.id.cmp(&b.id))
-        });
-
-        let total_matches = children.len() as u32;
-        let count = if args.requested_count == 0 {
-            usize::MAX
-        } else {
-            args.requested_count as usize
-        };
-
-        let objects = children
-            .into_iter()
-            .skip(args.starting_index as usize)
-            .take(count)
-            .cloned()
-            .collect();
-
-        Ok(BrowseResult {
-            objects,
-            total_matches,
-            update_id: 0,
-        })
-    }
-}
-
 fn file_range(value: &str, length: u64) -> Result<(u64, u64), StatusCode> {
     let invalid = StatusCode::BAD_REQUEST;
     let unsatisfiable = StatusCode::RANGE_NOT_SATISFIABLE;
@@ -210,6 +135,32 @@ fn file_range(value: &str, length: u64) -> Result<(u64, u64), StatusCode> {
     Ok((start, end.min(length - 1)))
 }
 
+fn media_file(
+    asset: &str,
+    endpoint: &str,
+    query: Option<&str>,
+) -> Option<(&'static str, &'static str)> {
+    use catalog::{GENERATED_JPEG_ID, ORIGINAL_JPEG_ID, VIDEO_ID};
+
+    let representation = match (endpoint, query) {
+        ("original", None | Some("")) => ORIGINAL,
+        ("video/playback", None | Some("")) => PLAYBACK,
+        ("thumbnail", Some("size=fullsize&edited=true" | "edited=true&size=fullsize")) => DISPLAY,
+        ("thumbnail", Some("size=preview&edited=true" | "edited=true&size=preview")) => PREVIEW,
+        _ => return None,
+    };
+
+    match (asset, representation) {
+        (ORIGINAL_JPEG_ID, ORIGINAL) => Some(("original.jpg", "image/jpeg")),
+        (ORIGINAL_JPEG_ID, PREVIEW) => Some(("original-preview.jpg", "image/jpeg")),
+        (GENERATED_JPEG_ID, DISPLAY) => Some(("generated-display.jpg", "image/jpeg")),
+        (GENERATED_JPEG_ID, PREVIEW) => Some(("generated-preview.jpg", "image/jpeg")),
+        (VIDEO_ID, ORIGINAL) => Some(("video-original.mp4", "video/mp4")),
+        (VIDEO_ID, PLAYBACK) => Some(("video-playback.mp4", "video/mp4")),
+        _ => None,
+    }
+}
+
 async fn upstream_request(directory: PathBuf, request: Request) -> Response {
     let (parts, _) = request.into_parts();
 
@@ -239,7 +190,7 @@ async fn upstream_request(directory: PathBuf, request: Request) -> Response {
         return empty(StatusCode::NOT_FOUND);
     };
 
-    let Some((filename, mime)) = catalog::media_file(asset, endpoint, parts.uri.query()) else {
+    let Some((filename, mime)) = media_file(asset, endpoint, parts.uri.query()) else {
         return empty(StatusCode::NOT_FOUND);
     };
 
@@ -340,7 +291,7 @@ pub(super) struct Bound {
     pub(super) http: TcpListener,
     upstream: TcpListener,
     directory: PathBuf,
-    server: Server<FixtureCatalog>,
+    server: Server<catalog::FixtureCatalog>,
     subscriptions: Subscriptions,
 }
 
@@ -367,7 +318,7 @@ impl Bound {
         let server = Server::new(
             "DLNA Fixture Baseline".into(),
             SERVER_UUID,
-            FixtureCatalog(catalog::objects(address)),
+            catalog::FixtureCatalog(catalog::objects(address)),
             media,
             subscriptions.clone(),
         );

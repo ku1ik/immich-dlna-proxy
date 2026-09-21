@@ -1,14 +1,88 @@
 use std::net::SocketAddrV4;
 
 use immich_dlna_proxy::{
-    catalog::{Object, Resource},
+    catalog::{BrowseQuery, BrowseResult, Catalog, Object, ObjectId, Resource, parse_id},
     media::{DISPLAY, ORIGINAL, PLAYBACK, PREVIEW, asset_url},
+    protocol::Fault,
 };
 
 pub const ALBUM_ID: &str = "album:10000000-0000-4000-8000-000000000001";
 pub const ORIGINAL_JPEG_ID: &str = "20000000-0000-4000-8000-000000000001";
 pub const GENERATED_JPEG_ID: &str = "20000000-0000-4000-8000-000000000002";
 pub const VIDEO_ID: &str = "20000000-0000-4000-8000-000000000003";
+
+pub(super) struct FixtureCatalog(pub(super) Vec<Object>);
+
+impl Catalog for FixtureCatalog {
+    fn system_update_id(&self) -> u32 {
+        0
+    }
+
+    async fn browse(&self, args: BrowseQuery) -> Result<BrowseResult, Fault> {
+        let id = match parse_id(&args.object_id)? {
+            ObjectId::Root => "0".to_owned(),
+            ObjectId::Album(album) => format!("album:{album}"),
+            ObjectId::Item { album, asset } => format!("album:{album}:asset:{asset}"),
+        };
+
+        let object = self
+            .0
+            .iter()
+            .find(|object| object.id == id)
+            .ok_or(Fault { code: 701 })?;
+
+        tracing::info!(object = %id, metadata = args.metadata, "fixture Browse selection");
+
+        if args.metadata {
+            return Ok(BrowseResult {
+                objects: vec![object.clone()],
+                total_matches: 1,
+                update_id: 0,
+            });
+        }
+
+        if object.class.starts_with("object.item") {
+            return Err(Fault { code: 710 });
+        }
+
+        let mut children: Vec<_> = self
+            .0
+            .iter()
+            .filter(|object| object.parent_id == id)
+            .collect();
+
+        children.sort_by(|a, b| {
+            let dates = a.date.cmp(&b.date);
+            let dates = if args.sort == Some(true) {
+                dates.reverse()
+            } else {
+                dates
+            };
+
+            dates.then_with(|| a.id.cmp(&b.id))
+        });
+
+        let total_matches = children.len() as u32;
+        let count = if args.requested_count == 0 {
+            usize::MAX
+        } else {
+            args.requested_count as usize
+        };
+
+        let objects = children
+            .into_iter()
+            .skip(args.starting_index as usize)
+            .take(count)
+            .cloned()
+            .collect();
+
+        Ok(BrowseResult {
+            objects,
+            total_matches,
+            update_id: 0,
+        })
+    }
+}
 
 pub fn objects(address: SocketAddrV4) -> Vec<Object> {
     let media = |asset: &str, representation: &str| {
@@ -32,7 +106,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             title: "Mixed JPEG and H264 AAC".into(),
             class: "object.container.album".into(),
             date: Some("2024-01-01".into()),
-            art: Some(media(ORIGINAL_JPEG_ID, "preview")),
+            art: Some(media(ORIGINAL_JPEG_ID, PREVIEW)),
             child_count: None,
             resources: Vec::new(),
         },
@@ -81,7 +155,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             title: title.into(),
             class: class.into(),
             date: Some(date.into()),
-            art: (mime == "image/jpeg").then(|| media(asset, "preview")),
+            art: (mime == "image/jpeg").then(|| media(asset, PREVIEW)),
             child_count: None,
             resources,
         });
@@ -104,28 +178,4 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
     });
 
     objects
-}
-
-pub fn media_file(
-    asset: &str,
-    endpoint: &str,
-    query: Option<&str>,
-) -> Option<(&'static str, &'static str)> {
-    let representation = match (endpoint, query) {
-        ("original", None | Some("")) => ORIGINAL,
-        ("video/playback", None | Some("")) => PLAYBACK,
-        ("thumbnail", Some("size=fullsize&edited=true" | "edited=true&size=fullsize")) => DISPLAY,
-        ("thumbnail", Some("size=preview&edited=true" | "edited=true&size=preview")) => PREVIEW,
-        _ => return None,
-    };
-
-    match (asset, representation) {
-        (ORIGINAL_JPEG_ID, ORIGINAL) => Some(("original.jpg", "image/jpeg")),
-        (ORIGINAL_JPEG_ID, PREVIEW) => Some(("original-preview.jpg", "image/jpeg")),
-        (GENERATED_JPEG_ID, DISPLAY) => Some(("generated-display.jpg", "image/jpeg")),
-        (GENERATED_JPEG_ID, PREVIEW) => Some(("generated-preview.jpg", "image/jpeg")),
-        (VIDEO_ID, ORIGINAL) => Some(("video-original.mp4", "video/mp4")),
-        (VIDEO_ID, PLAYBACK) => Some(("video-playback.mp4", "video/mp4")),
-        _ => None,
-    }
 }
