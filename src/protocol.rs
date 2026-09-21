@@ -7,11 +7,10 @@ use quick_xml::{
 };
 
 pub(crate) const SOAP_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
-const XML_DEPTH: usize = 32;
 
 pub(crate) const MEDIA_SERVER: &str = "urn:schemas-upnp-org:device:MediaServer:1";
 pub const CONTENT_DIRECTORY: &str = "urn:schemas-upnp-org:service:ContentDirectory:1";
-pub const CONNECTION_MANAGER: &str = "urn:schemas-upnp-org:service:ConnectionManager:1";
+pub(crate) const CONNECTION_MANAGER: &str = "urn:schemas-upnp-org:service:ConnectionManager:1";
 const SOAP: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 const ENVELOPE_START: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>";
 const ENVELOPE_END: &str = "</s:Body></s:Envelope>";
@@ -279,10 +278,6 @@ pub(crate) fn parse_action(
     loop {
         match reader.read_event().map_err(|_| invalid)? {
             Event::Start(element) => {
-                if stack.len() >= XML_DEPTH {
-                    return Err(Fault { code: 501 });
-                }
-
                 let qualified = element.name();
                 let spelling = std::str::from_utf8(qualified.as_ref()).map_err(|_| invalid)?;
 
@@ -662,24 +657,8 @@ impl Filter {
         Ok(filter)
     }
 
-    pub fn date(&self) -> bool {
-        self.date
-    }
-
-    pub fn art(&self) -> bool {
-        self.art
-    }
-
     pub fn res(&self) -> bool {
         self.res
-    }
-
-    pub fn duration(&self) -> bool {
-        self.duration
-    }
-
-    pub fn child_count(&self) -> bool {
-        self.child_count
     }
 }
 
@@ -727,7 +706,7 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
         xml.raw("\" restricted=\"1\"")?;
 
         if container
-            && filter.child_count()
+            && filter.child_count
             && let Some(count) = object.child_count
         {
             xml.raw(" childCount=\"")?;
@@ -739,13 +718,13 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
         xml.element("dc:title", &object.title)?;
         xml.element("upnp:class", &object.class)?;
 
-        if filter.date()
+        if filter.date
             && let Some(date) = &object.date
         {
             xml.element("dc:date", date)?;
         }
 
-        if filter.art()
+        if filter.art
             && let Some(art) = &object.art
         {
             xml.element("upnp:albumArtURI", art)?;
@@ -761,7 +740,7 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
                     ":*\""
                 })?;
 
-                if filter.duration()
+                if filter.duration
                     && let Some(duration) = &resource.duration
                 {
                     xml.raw(" duration=\"")?;
@@ -1259,19 +1238,18 @@ mod tests {
     }
 
     #[test]
-    fn soap_rejects_deep_argument_trees() {
-        let nested = format!(
-            "{}x{}",
-            "<nested>".repeat(XML_DEPTH + 1),
-            "</nested>".repeat(XML_DEPTH + 1)
-        );
+    fn soap_rejects_nested_argument_elements() {
+        for nested in [
+            "<nested>x</nested>".into(),
+            format!("{}x{}", "<nested>".repeat(33), "</nested>".repeat(33)),
+        ] {
+            let args = BROWSE_ARGS.replace(
+                "<ObjectID>0</ObjectID>",
+                &format!("<ObjectID>{nested}</ObjectID>"),
+            );
 
-        let args = BROWSE_ARGS.replace(
-            "<ObjectID>0</ObjectID>",
-            &format!("<ObjectID>{nested}</ObjectID>"),
-        );
-
-        assert!(browse(&args).is_err());
+            assert!(browse(&args).is_err());
+        }
     }
 
     #[test]
@@ -1487,12 +1465,12 @@ mod tests {
     fn filters_select_only_requested_available_properties() {
         assert_eq!(Filter::parse(" \t ").unwrap(), Filter::default());
         let all = Filter::parse("*").unwrap();
-        assert!(all.date() && all.art() && all.res() && all.duration() && all.child_count());
+        assert!(all.date && all.art && all.res() && all.duration && all.child_count);
 
         for selector in ["res", "res@protocolInfo", "res@size", "res@resolution"] {
             let filter = Filter::parse(selector).unwrap();
             assert!(filter.res());
-            assert!(!filter.duration());
+            assert!(!filter.duration);
         }
 
         let filter =

@@ -25,7 +25,7 @@ use crate::{
     protocol::{self, Action, Fault, Service},
 };
 
-pub const HEADER_BYTES: usize = 16 * 1024;
+pub(crate) const HEADER_BYTES: usize = 16 * 1024;
 const SOAP_BODY_BYTES: usize = 64 * 1024;
 const BROWSES: usize = 8;
 const BODY_TIMEOUT: Duration = Duration::from_secs(10);

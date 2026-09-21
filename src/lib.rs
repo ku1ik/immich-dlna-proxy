@@ -21,7 +21,7 @@ pub(crate) fn outbound_client_builder() -> reqwest::ClientBuilder {
         .connect_timeout(std::time::Duration::from_secs(5))
 }
 
-pub fn server_header() -> &'static str {
+pub(crate) fn server_header() -> &'static str {
     static HEADER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .unwrap_or_else(|_| "unknown".into());
