@@ -2,19 +2,11 @@ use anyhow::Context;
 use tokio::net::TcpListener;
 
 use crate::{
-    catalog::{Library, Store},
-    config::Config,
-    eventing::Subscriptions,
-    media::MediaProxy,
-    server::Server,
-    ssdp::Discovery,
+    catalog::ImmichCatalog, config::Config, eventing::Subscriptions, media::MediaProxy,
+    server::Server, ssdp::Discovery,
 };
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
-    let (store, mut ledger) = Store::open(&config.state_directory, config.server_uuid)?;
-    ledger.restart();
-    ledger = store.persist(ledger).await;
-
     let media = MediaProxy::new(config.api_base.clone(), config.api_key.clone())?;
     let events = Subscriptions::new()?;
     let address = config.listen_address;
@@ -25,12 +17,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .await
         .context("cannot bind configured HTTP listener")?;
     let discovery = Discovery::bind(config.interface_index, uuid, address)?;
-    let library = Library::new(config, store, ledger, events.clone())?;
-    let server = Server::new(name, uuid, library.clone(), media, events.clone());
+    let catalog = ImmichCatalog::open(config, events.clone()).await?;
+    let server = Server::new(name, uuid, catalog.clone(), media, events.clone());
     tracing::info!(%address, %uuid, "service started");
 
     let (name, result) = tokio::select! {
-        result = library.run() => ("catalog", result),
+        result = catalog.run() => ("catalog", result),
 
         result = events.run() => ("eventing", result),
 

@@ -337,7 +337,7 @@ impl Fake {
             .count()
     }
 
-    fn subscribe(&self, library: &Library) {
+    fn subscribe(&self, library: &ImmichCatalog) {
         let mut headers = HeaderMap::new();
         headers.insert("nt", HeaderValue::from_static("upnp:event"));
 
@@ -379,7 +379,7 @@ impl Drop for Fake {
 }
 
 struct Fixture {
-    library: Library,
+    library: ImmichCatalog,
     fake: Fake,
     directory: TempDir,
 }
@@ -394,11 +394,9 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let config = fake.config(directory.path());
-        let (store, mut ledger) = Store::open(directory.path(), config.server_uuid).unwrap();
-        ledger.restart();
-        store.persist(ledger.clone()).await;
-
-        let library = Library::new(config, store, ledger, Subscriptions::new().unwrap()).unwrap();
+        let library = ImmichCatalog::open(config, Subscriptions::new().unwrap())
+            .await
+            .unwrap();
 
         Self {
             library,
@@ -468,7 +466,7 @@ fn children(id: u128) -> BrowseQuery {
     action(&format!("album:{}", Uuid::from_u128(id)), false, 0, 0, None)
 }
 
-fn browse(library: &Library, query: BrowseQuery) -> JoinHandle<Result<BrowseResult, Fault>> {
+fn browse(library: &ImmichCatalog, query: BrowseQuery) -> JoinHandle<Result<BrowseResult, Fault>> {
     let library = library.clone();
 
     tokio::spawn(async move { library.browse(query).await })
@@ -662,15 +660,12 @@ async fn real_http_catalog_events_durability_and_media_share_one_server() {
         _ => unreachable!("literal IPv4 bind"),
     };
 
-    let (store, mut ledger) = Store::open(directory.path(), config.server_uuid).unwrap();
-    ledger.restart();
-    store.persist(ledger.clone()).await;
     let media = MediaProxy::new(config.api_base.clone(), config.api_key.clone()).unwrap();
     let events = Subscriptions::new().unwrap();
     let name = config.friendly_name.clone();
     let uuid = config.server_uuid;
 
-    let library = Library::new(config, store, ledger, events.clone()).unwrap();
+    let library = ImmichCatalog::open(config, events.clone()).await.unwrap();
 
     let mut fixture = Fixture {
         library,
@@ -1640,7 +1635,7 @@ async fn metadata_contents_and_restart_preserve_independent_durable_counters() {
     let store = fixture.library.inner.store.clone();
     store.persist(restarted.clone()).await;
 
-    fixture.library = Library::new(
+    fixture.library = ImmichCatalog::from_parts(
         fixture.fake.config(fixture.directory.path()),
         store,
         restarted.clone(),
@@ -2043,11 +2038,9 @@ async fn publication_failure_worker() {
     let mut fake = Fake::new().await;
     fake.upstream.lock().unwrap().albums = vec![album(1, "Album")];
     let config = fake.config(std::path::Path::new(&directory));
-    let (store, mut ledger) = Store::open(&config.state_directory, config.server_uuid).unwrap();
-    ledger.restart();
-    store.persist(ledger.clone()).await;
-
-    let library = Library::new(config, store, ledger, Subscriptions::new().unwrap()).unwrap();
+    let library = ImmichCatalog::open(config, Subscriptions::new().unwrap())
+        .await
+        .unwrap();
 
     let supervised = library.clone();
     let mut supervisor = tokio::spawn(async move { supervised.run().await });
@@ -2185,7 +2178,7 @@ async fn publication_failure(mode: &str) {
     let mut fake = Fake::new().await;
     fake.upstream.lock().unwrap().albums = vec![album(1, "Changed")];
 
-    let library = Library::new(
+    let library = ImmichCatalog::from_parts(
         fake.config(directory.path()),
         store,
         restored.clone(),

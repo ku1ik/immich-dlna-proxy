@@ -32,7 +32,7 @@ mod snapshots;
 
 pub use browse::{ObjectId, parse_id};
 use revisions::AlbumRevision;
-pub(crate) use revisions::{Ledger, Store};
+use revisions::{Ledger, Store};
 use snapshots::{Contents, Root, Source};
 
 #[cfg(test)]
@@ -110,7 +110,7 @@ const _: () = {
 };
 
 #[derive(Clone)]
-pub(crate) struct Library {
+pub(crate) struct ImmichCatalog {
     inner: Arc<Inner>,
 }
 
@@ -307,7 +307,7 @@ enum Candidate {
 
 // Created before spawning, so even cancellation before the first poll cleans up.
 struct Flight {
-    library: Library,
+    catalog: ImmichCatalog,
     scope: Scope,
     sender: watch::Sender<Option<RefreshResult>>,
     permit: Option<OwnedSemaphorePermit>,
@@ -317,7 +317,7 @@ struct Flight {
 impl Drop for Flight {
     fn drop(&mut self) {
         let mut state = self
-            .library
+            .catalog
             .inner
             .state
             .lock()
@@ -328,7 +328,7 @@ impl Drop for Flight {
         let result = std::mem::replace(&mut self.result, Err(FAILED));
         self.sender.send_replace(Some(result));
         drop(state);
-        self.library.inner.wake.notify_one();
+        self.catalog.inner.wake.notify_one();
     }
 }
 
@@ -343,7 +343,7 @@ impl Drop for Publication {
     }
 }
 
-struct Running(Library);
+struct Running(ImmichCatalog);
 
 impl Drop for Running {
     fn drop(&mut self) {
@@ -351,9 +351,17 @@ impl Drop for Running {
     }
 }
 
-impl Library {
-    /// The caller must restart and persist the ledger before construction/admission.
-    pub(crate) fn new(
+impl ImmichCatalog {
+    /// Lock, load, and durably invalidate revision state before admitting requests.
+    pub(crate) async fn open(config: Config, events: Subscriptions) -> Result<Self> {
+        let (store, mut ledger) = Store::open(&config.state_directory, config.server_uuid)?;
+        ledger.restart();
+        let ledger = store.persist(ledger).await;
+
+        Self::from_parts(config, store, ledger, events)
+    }
+
+    fn from_parts(
         config: Config,
         store: Store,
         ledger: Ledger,
@@ -497,7 +505,7 @@ impl Library {
                 state.flights.insert(scope, receiver.clone());
 
                 let mut flight = Flight {
-                    library: self.clone(),
+                    catalog: self.clone(),
                     scope,
                     sender,
                     permit: Some(permit),
@@ -508,7 +516,7 @@ impl Library {
 
                 supervisor.tasks.spawn(async move {
                     flight.result = flight
-                        .library
+                        .catalog
                         .refresh(scope, token, deadline)
                         .await
                         .inspect(|view| {
@@ -679,7 +687,7 @@ impl Library {
     }
 }
 
-impl Catalog for Library {
+impl Catalog for ImmichCatalog {
     fn system_update_id(&self) -> u32 {
         self.inner.state.lock().unwrap().ledger.system_update_id
     }
