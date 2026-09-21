@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddrV4, sync::Arc, time::Duration};
 
 use axum::{body::Body, response::Response};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
@@ -15,6 +15,16 @@ const OPERATIONS: usize = 16;
 const REDIRECTS: usize = 3;
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub const ASSET_ROUTE_PREFIX: &str = "/media/assets/";
+pub const ORIGINAL: &str = "original";
+pub const DISPLAY: &str = "display";
+pub const PREVIEW: &str = "preview";
+pub const PLAYBACK: &str = "playback";
+
+pub fn asset_url(address: SocketAddrV4, asset: Uuid, representation: &str) -> String {
+    format!("http://{address}{ASSET_ROUTE_PREFIX}{asset}/{representation}")
+}
 
 #[derive(Clone)]
 pub struct MediaProxy {
@@ -109,25 +119,25 @@ impl MediaProxy {
         };
 
         let route = match representation {
-            "original" => MediaRoute {
+            ORIGINAL => MediaRoute {
                 endpoint: "original",
                 expected_mime: None,
                 edited: false,
             },
 
-            "display" => MediaRoute {
+            DISPLAY => MediaRoute {
                 endpoint: "thumbnail?size=fullsize&edited=true",
                 expected_mime: Some("image/jpeg"),
                 edited: true,
             },
 
-            "preview" => MediaRoute {
+            PREVIEW => MediaRoute {
                 endpoint: "thumbnail?size=preview&edited=true",
                 expected_mime: Some("image/jpeg"),
                 edited: true,
             },
 
-            "playback" => MediaRoute {
+            PLAYBACK => MediaRoute {
                 endpoint: "video/playback",
                 expected_mime: Some("video/mp4"),
                 edited: false,

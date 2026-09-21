@@ -143,7 +143,7 @@ impl<C: Catalog> Server<C> {
         }
 
         let media_route = path
-            .strip_prefix("/media/assets/")
+            .strip_prefix(crate::media::ASSET_ROUTE_PREFIX)
             .and_then(|path| path.split_once('/'));
 
         if path != "/device.xml" && service_route.is_none() && media_route.is_none() {

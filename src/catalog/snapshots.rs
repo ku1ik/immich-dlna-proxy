@@ -13,6 +13,7 @@ use uuid::Uuid;
 use super::{MAX_ALBUMS, Object, Resource, SNAPSHOT_BYTES};
 use crate::{
     immich::{Asset, Client},
+    media::{DISPLAY, ORIGINAL, PLAYBACK, PREVIEW, asset_url},
     protocol::xml_char,
 };
 
@@ -120,7 +121,7 @@ impl Source {
                     date: created_at.map(|date| date.format("%Y-%m-%d").to_string()),
                     art: dto
                         .album_thumbnail_asset_id
-                        .map(|id| self.media_url(id, "preview")),
+                        .map(|id| asset_url(self.http_address, id, PREVIEW)),
                     child_count: None,
                     resources: Vec::new(),
                 },
@@ -274,7 +275,7 @@ impl Source {
                 let old_size = encoded_size(item, SNAPSHOT_BYTES)?;
 
                 item.object.resources.push(Resource {
-                    uri: self.media_url(id, "playback"),
+                    uri: asset_url(self.http_address, id, PLAYBACK),
                     mime: "video/mp4".into(),
                     duration: None,
                     byte_seek: true,
@@ -307,13 +308,6 @@ impl Source {
         })
     }
 
-    fn media_url(&self, id: Uuid, representation: &str) -> String {
-        format!(
-            "http://{}/media/assets/{id}/{representation}",
-            self.http_address
-        )
-    }
-
     fn project(&self, album: Uuid, dto: Asset, bad_dates: &mut usize) -> Result<Option<Item>> {
         if !matches!(dto.kind.as_str(), "IMAGE" | "VIDEO")
             || !matches!(dto.visibility.as_str(), "timeline" | "archive")
@@ -331,7 +325,7 @@ impl Source {
 
         let (representation, mime) = if video {
             (
-                "original",
+                ORIGINAL,
                 mime.unwrap_or_else(|| "application/octet-stream".into()),
             )
         } else if !dto.is_edited
@@ -339,9 +333,9 @@ impl Source {
                 .as_deref()
                 .is_some_and(|mime| matches!(mime, "image/jpeg" | "image/png" | "image/gif"))
         {
-            ("original", mime.expect("checked original image MIME"))
+            (ORIGINAL, mime.expect("checked original image MIME"))
         } else {
-            ("display", "image/jpeg".into())
+            (DISPLAY, "image/jpeg".into())
         };
 
         let duration = dto
@@ -359,7 +353,7 @@ impl Source {
             });
 
         let mut resources = vec![Resource {
-            uri: self.media_url(dto.id, representation),
+            uri: asset_url(self.http_address, dto.id, representation),
             mime,
             duration,
             byte_seek: video,
@@ -367,7 +361,7 @@ impl Source {
 
         if !video {
             resources.push(Resource {
-                uri: self.media_url(dto.id, "preview"),
+                uri: asset_url(self.http_address, dto.id, PREVIEW),
                 mime: "image/jpeg".into(),
                 duration: None,
                 byte_seek: false,
@@ -397,7 +391,7 @@ impl Source {
                 }
                 .into(),
                 date,
-                art: Some(self.media_url(dto.id, "preview")),
+                art: Some(asset_url(self.http_address, dto.id, PREVIEW)),
                 child_count: None,
                 resources,
             },
