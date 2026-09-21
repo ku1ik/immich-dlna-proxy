@@ -402,6 +402,50 @@ async fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
     }
 }
 
+#[test]
+fn projected_item_encoding_is_stable_across_refactors() {
+    let asset = Uuid::from_u128(1);
+    let album = Uuid::from_u128(2);
+
+    let item = Item {
+        id: asset,
+        object: Object {
+            id: format!("album:{album}:asset:{asset}"),
+            parent_id: format!("album:{album}"),
+            title: "Photo".into(),
+            class: "object.item.imageItem.photo".into(),
+            date: Some("2024-01-02".into()),
+            art: Some(format!(
+                "http://192.0.2.1:8200/media/assets/{asset}/preview"
+            )),
+            child_count: None,
+            resources: vec![Resource {
+                uri: format!("http://192.0.2.1:8200/media/assets/{asset}/original"),
+                mime: "image/jpeg".into(),
+                duration: None,
+                byte_seek: false,
+            }],
+        },
+        capture: Some("2024-01-02T03:04:05Z".parse().unwrap()),
+        is_edited: false,
+        checksum: Some("checksum".into()),
+        updated_at: Some("updated".into()),
+        thumbhash: Some("thumbhash".into()),
+    };
+
+    let json = serde_json::to_string(&item).unwrap();
+
+    assert_eq!(
+        json,
+        r#"{"id":"00000000-0000-0000-0000-000000000001","object":{"id":"album:00000000-0000-0000-0000-000000000002:asset:00000000-0000-0000-0000-000000000001","parent_id":"album:00000000-0000-0000-0000-000000000002","title":"Photo","class":"object.item.imageItem.photo","date":"2024-01-02","art":"http://192.0.2.1:8200/media/assets/00000000-0000-0000-0000-000000000001/preview","child_count":null,"resources":[{"uri":"http://192.0.2.1:8200/media/assets/00000000-0000-0000-0000-000000000001/original","mime":"image/jpeg","duration":null,"byte_seek":false}]},"capture":"2024-01-02T03:04:05Z","is_edited":false,"checksum":"checksum","updated_at":"updated","thumbhash":"thumbhash"}"#
+    );
+
+    assert_eq!(
+        format!("{:x}", Sha256::digest(json.as_bytes())),
+        "d27096d54b96b8520a8ddbbededf29439eb59cb9e1020dbccc02d3c72b0422e0"
+    );
+}
+
 #[tokio::test]
 async fn traversal_progress_and_combined_page_budget() {
     for repeated in [false, true] {
