@@ -204,7 +204,7 @@ impl Source {
                     }
 
                     let id = dto.id;
-                    let item = self.project(album, dto, &mut bad_dates)?;
+                    let item = project_item(self.http_address, album, dto, &mut bad_dates)?;
 
                     match item {
                         Some(item) => {
@@ -291,101 +291,106 @@ impl Source {
             bytes,
         })
     }
+}
 
-    fn project(&self, album: Uuid, dto: Asset, bad_dates: &mut usize) -> Result<Option<Item>> {
-        if !matches!(dto.kind.as_str(), "IMAGE" | "VIDEO")
-            || !matches!(dto.visibility.as_str(), "timeline" | "archive")
-            || dto.is_trashed
-        {
-            return Ok(None);
-        }
-
-        let name = dto
-            .original_file_name
-            .ok_or_else(|| anyhow!("eligible Immich asset is missing originalFileName"))?;
-
-        let video = dto.kind == "VIDEO";
-        let mime = dto.original_mime_type.as_deref().and_then(media_type);
-
-        let (representation, mime) = if video {
-            (
-                ORIGINAL,
-                mime.unwrap_or_else(|| "application/octet-stream".into()),
-            )
-        } else if !dto.is_edited
-            && mime
-                .as_deref()
-                .is_some_and(|mime| matches!(mime, "image/jpeg" | "image/png" | "image/gif"))
-        {
-            (ORIGINAL, mime.expect("checked original image MIME"))
-        } else {
-            (DISPLAY, "image/jpeg".into())
-        };
-
-        let duration = dto
-            .duration
-            .filter(|ms| *ms >= 0)
-            .filter(|_| video)
-            .map(|ms| {
-                format!(
-                    "{}:{:02}:{:02}.{:03}",
-                    ms / 3_600_000,
-                    ms / 60_000 % 60,
-                    ms / 1000 % 60,
-                    ms % 1000
-                )
-            });
-
-        let mut resources = vec![Resource {
-            uri: asset_url(self.http_address, dto.id, representation),
-            mime,
-            duration,
-            byte_seek: video,
-        }];
-
-        if !video {
-            resources.push(Resource {
-                uri: asset_url(self.http_address, dto.id, PREVIEW),
-                mime: "image/jpeg".into(),
-                duration: None,
-                byte_seek: false,
-            });
-        }
-
-        let capture = parse_date(dto.file_created_at.as_deref(), bad_dates);
-
-        let date = dto
-            .local_date_time
-            .as_deref()
-            .and_then(|date| DateTime::parse_from_rfc3339(date).ok())
-            .map(|date| date.format("%Y-%m-%d").to_string());
-
-        *bad_dates += usize::from(date.is_none());
-
-        Ok(Some(Item {
-            id: dto.id,
-            object: Object {
-                id: format!("album:{album}:asset:{}", dto.id),
-                parent_id: format!("album:{album}"),
-                title: title(&name, dto.id),
-                class: if video {
-                    "object.item.videoItem"
-                } else {
-                    "object.item.imageItem.photo"
-                }
-                .into(),
-                date,
-                art: Some(asset_url(self.http_address, dto.id, PREVIEW)),
-                child_count: None,
-                resources,
-            },
-            capture,
-            is_edited: dto.is_edited,
-            checksum: dto.checksum,
-            updated_at: dto.updated_at,
-            thumbhash: dto.thumbhash,
-        }))
+fn project_item(
+    http_address: SocketAddrV4,
+    album: Uuid,
+    dto: Asset,
+    bad_dates: &mut usize,
+) -> Result<Option<Item>> {
+    if !matches!(dto.kind.as_str(), "IMAGE" | "VIDEO")
+        || !matches!(dto.visibility.as_str(), "timeline" | "archive")
+        || dto.is_trashed
+    {
+        return Ok(None);
     }
+
+    let name = dto
+        .original_file_name
+        .ok_or_else(|| anyhow!("eligible Immich asset is missing originalFileName"))?;
+
+    let video = dto.kind == "VIDEO";
+    let mime = dto.original_mime_type.as_deref().and_then(media_type);
+
+    let (representation, mime) = if video {
+        (
+            ORIGINAL,
+            mime.unwrap_or_else(|| "application/octet-stream".into()),
+        )
+    } else if !dto.is_edited
+        && mime
+            .as_deref()
+            .is_some_and(|mime| matches!(mime, "image/jpeg" | "image/png" | "image/gif"))
+    {
+        (ORIGINAL, mime.expect("checked original image MIME"))
+    } else {
+        (DISPLAY, "image/jpeg".into())
+    };
+
+    let duration = dto
+        .duration
+        .filter(|ms| *ms >= 0)
+        .filter(|_| video)
+        .map(|ms| {
+            format!(
+                "{}:{:02}:{:02}.{:03}",
+                ms / 3_600_000,
+                ms / 60_000 % 60,
+                ms / 1000 % 60,
+                ms % 1000
+            )
+        });
+
+    let mut resources = vec![Resource {
+        uri: asset_url(http_address, dto.id, representation),
+        mime,
+        duration,
+        byte_seek: video,
+    }];
+
+    if !video {
+        resources.push(Resource {
+            uri: asset_url(http_address, dto.id, PREVIEW),
+            mime: "image/jpeg".into(),
+            duration: None,
+            byte_seek: false,
+        });
+    }
+
+    let capture = parse_date(dto.file_created_at.as_deref(), bad_dates);
+
+    let date = dto
+        .local_date_time
+        .as_deref()
+        .and_then(|date| DateTime::parse_from_rfc3339(date).ok())
+        .map(|date| date.format("%Y-%m-%d").to_string());
+
+    *bad_dates += usize::from(date.is_none());
+
+    Ok(Some(Item {
+        id: dto.id,
+        object: Object {
+            id: format!("album:{album}:asset:{}", dto.id),
+            parent_id: format!("album:{album}"),
+            title: title(&name, dto.id),
+            class: if video {
+                "object.item.videoItem"
+            } else {
+                "object.item.imageItem.photo"
+            }
+            .into(),
+            date,
+            art: Some(asset_url(http_address, dto.id, PREVIEW)),
+            child_count: None,
+            resources,
+        },
+        capture,
+        is_edited: dto.is_edited,
+        checksum: dto.checksum,
+        updated_at: dto.updated_at,
+        thumbhash: dto.thumbhash,
+    }))
 }
 
 fn parse_date(value: Option<&str>, bad_dates: &mut usize) -> Option<DateTime<Utc>> {

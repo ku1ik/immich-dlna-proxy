@@ -29,17 +29,19 @@ impl SnapshotFixture {
     }
 }
 
-fn project(source: &Source, value: Value) -> Item {
-    source
-        .project(ALBUM, serde_json::from_value(value).unwrap(), &mut 0)
-        .unwrap()
-        .unwrap()
+fn project(value: Value) -> Item {
+    project_item(
+        "192.0.2.1:8200".parse().unwrap(),
+        ALBUM,
+        serde_json::from_value(value).unwrap(),
+        &mut 0,
+    )
+    .unwrap()
+    .unwrap()
 }
 
-#[tokio::test]
-async fn resources_dates_and_optional_hints() {
-    let fake = SnapshotFixture::new(vec![]).await;
-
+#[test]
+fn resources_dates_and_optional_hints() {
     for (mime, edited, representation, expected) in [
         (
             Some("IMAGE/JPEG; quality=90"),
@@ -60,7 +62,7 @@ async fn resources_dates_and_optional_hints() {
         dto["originalMimeType"] = json!(mime);
         dto["isEdited"] = json!(edited);
         dto["originalFileName"] = json!("A\u{0001}&B");
-        let item = project(&fake.source, dto);
+        let item = project(dto);
         assert_eq!(item.object.title, "A\u{fffd}&B");
         assert_eq!(item.object.date.as_deref(), Some("2024-01-01"));
 
@@ -93,7 +95,7 @@ async fn resources_dates_and_optional_hints() {
         dto["originalMimeType"] = Value::Null;
         dto["duration"] = json!(duration);
         dto["localDateTime"] = json!("2024-01-01T23:00:00-12:00");
-        let item = project(&fake.source, dto);
+        let item = project(dto);
         assert_eq!(item.object.date.as_deref(), Some("2024-01-01"));
         assert_eq!(item.object.resources[0].duration.as_deref(), expected);
         assert_eq!(item.object.resources[0].mime, "application/octet-stream");
@@ -109,7 +111,7 @@ async fn resources_dates_and_optional_hints() {
     dto["updatedAt"] = json!("opaque hint");
     dto["thumbhash"] = json!("two");
     dto["exifInfo"] = json!(["ignored unsupported structure"]);
-    let item = project(&fake.source, dto);
+    let item = project(dto);
     assert_eq!(item.object.title, Uuid::from_u128(1).to_string());
     assert!(item.capture.is_none() && item.object.date.is_none());
     assert_eq!(item.checksum.as_deref(), Some("one"));
@@ -120,15 +122,13 @@ async fn resources_dates_and_optional_hints() {
         let mut dto = asset(1, "IMAGE");
         dto["fileCreatedAt"] = invalid.clone();
         dto["localDateTime"] = invalid.clone();
-        let item = project(&fake.source, dto);
+        let item = project(dto);
         assert!(item.capture.is_none() && item.object.date.is_none());
         let mut dto = album(ALBUM);
         dto["createdAt"] = invalid;
         let album: crate::immich::Album = serde_json::from_value(dto).unwrap();
         assert!(parse_date(album.created_at.as_deref(), &mut 0).is_none());
     }
-
-    assert!(fake.api.requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -385,7 +385,7 @@ async fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
             _ => json!("changed"),
         };
 
-        let changed = project(&fake.source, changed);
+        let changed = project(changed);
         let mut digest = Projection::new(SNAPSHOT_BYTES);
         digest.json(&changed).unwrap();
         assert_ne!(original, digest.finish().0, "{field}");
