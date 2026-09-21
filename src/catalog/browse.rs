@@ -109,7 +109,9 @@ impl View {
                 ObjectId::Item { asset, .. } => contents
                     .as_ref()
                     .ok_or(FAILED)?
-                    .object(&asset)
+                    .items
+                    .get(&asset)
+                    .map(|item| &item.object)
                     .ok_or(MISSING)?
                     .clone(),
             };
@@ -147,25 +149,25 @@ impl View {
             }
 
             ObjectId::Album(_) => {
-                let mut rows: Vec<_> = contents.as_ref().ok_or(FAILED)?.items().collect();
+                let mut rows: Vec<_> = contents.as_ref().ok_or(FAILED)?.items.values().collect();
 
                 rows.sort_unstable_by(|a, b| {
                     compare_dates(
-                        query.sort.and(a.1.date.as_deref()),
-                        a.2,
-                        a.0,
-                        query.sort.and(b.1.date.as_deref()),
-                        b.2,
-                        b.0,
+                        query.sort.and(a.object.date.as_deref()),
+                        a.capture.as_ref(),
+                        a.id,
+                        query.sort.and(b.object.date.as_deref()),
+                        b.capture.as_ref(),
+                        b.id,
                         query.sort.unwrap_or(false),
                     )
                 });
 
-                rows.into_iter().map(|(_, object, _)| object).collect()
+                rows.into_iter().map(|item| &item.object).collect()
             }
 
             ObjectId::Item { asset, .. } => {
-                if !contents.as_ref().ok_or(FAILED)?.contains(&asset) {
+                if !contents.as_ref().ok_or(FAILED)?.items.contains_key(&asset) {
                     return Err(MISSING);
                 }
 

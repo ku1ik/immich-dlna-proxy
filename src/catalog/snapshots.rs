@@ -38,10 +38,10 @@ pub(super) struct Album {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct Item {
-    id: Uuid,
-    object: Object,
-    capture: Option<DateTime<Utc>>,
+pub(super) struct Item {
+    pub(super) id: Uuid,
+    pub(super) object: Object,
+    pub(super) capture: Option<DateTime<Utc>>,
     is_edited: bool,
     checksum: Option<String>,
     updated_at: Option<String>,
@@ -58,25 +58,9 @@ pub(super) struct Root {
 
 #[derive(Debug)]
 pub(super) struct Contents {
-    items: BTreeMap<Uuid, Item>,
+    pub(super) items: BTreeMap<Uuid, Item>,
     pub(super) digest: String,
     pub(super) bytes: usize,
-}
-
-impl Contents {
-    pub(super) fn object(&self, id: &Uuid) -> Option<&Object> {
-        self.items.get(id).map(|item| &item.object)
-    }
-
-    pub(super) fn contains(&self, id: &Uuid) -> bool {
-        self.items.contains_key(id)
-    }
-
-    pub(super) fn items(&self) -> impl Iterator<Item = (Uuid, &Object, Option<&DateTime<Utc>>)> {
-        self.items
-            .values()
-            .map(|item| (item.id, &item.object, item.capture.as_ref()))
-    }
 }
 
 impl Source {
