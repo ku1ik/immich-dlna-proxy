@@ -433,52 +433,7 @@ impl MediaProxy {
             return Ok(result);
         }
 
-        let stream = futures_util::stream::try_unfold(
-            (upstream, permit, body_length),
-            move |(mut upstream, permit, mut remaining)| async move {
-                let deadline = Instant::now() + READ_IDLE_TIMEOUT;
-
-                let next = timeout_at(deadline, async {
-                    loop {
-                        if Instant::now() >= deadline {
-                            return Err(Failure::Timeout);
-                        }
-
-                        match upstream.chunk().await.map_err(transport_failure)? {
-                            Some(chunk) if chunk.is_empty() => continue,
-                            chunk => break Ok(chunk),
-                        }
-                    }
-                })
-                .await
-                .map_err(|_| Failure::Timeout)
-                .and_then(|result| result);
-
-                let result =
-                    next.and_then(|chunk| match chunk {
-                        Some(chunk) => {
-                            if let Some(left) = remaining.as_mut() {
-                                *left = left.checked_sub(chunk.len() as u64).ok_or(
-                                    Failure::Upstream("media body exceeds declared content length"),
-                                )?;
-                            }
-
-                            Ok(Some((chunk, (upstream, permit, remaining))))
-                        }
-
-                        None if remaining.is_none_or(|left| left == 0) => Ok(None),
-                        None => Err(Failure::Upstream("truncated media body")),
-                    });
-
-                if let Err(failure) = &result {
-                    tracing::warn!(%asset, %failure, "media stream terminated");
-                }
-
-                result
-            },
-        );
-
-        *result.body_mut() = Body::from_stream(stream);
+        *result.body_mut() = media_body(upstream, permit, body_length, asset);
 
         Ok(result)
     }
@@ -525,6 +480,62 @@ impl MediaProxy {
             _ => false,
         }
     }
+}
+
+fn media_body(
+    upstream: reqwest::Response,
+    permit: OwnedSemaphorePermit,
+    body_length: Option<u64>,
+    asset: Uuid,
+) -> Body {
+    let stream = futures_util::stream::try_unfold(
+        (upstream, permit, body_length),
+        move |(mut upstream, permit, mut remaining)| async move {
+            let result =
+                async {
+                    let deadline = Instant::now() + READ_IDLE_TIMEOUT;
+
+                    let chunk = timeout_at(deadline, async {
+                        loop {
+                            if Instant::now() >= deadline {
+                                return Err(Failure::Timeout);
+                            }
+
+                            match upstream.chunk().await.map_err(transport_failure)? {
+                                Some(chunk) if chunk.is_empty() => continue,
+                                chunk => break Ok(chunk),
+                            }
+                        }
+                    })
+                    .await
+                    .map_err(|_| Failure::Timeout)??;
+
+                    match chunk {
+                        Some(chunk) => {
+                            if let Some(left) = remaining.as_mut() {
+                                *left = left.checked_sub(chunk.len() as u64).ok_or(
+                                    Failure::Upstream("media body exceeds declared content length"),
+                                )?;
+                            }
+
+                            Ok(Some((chunk, (upstream, permit, remaining))))
+                        }
+
+                        None if remaining.is_none_or(|left| left == 0) => Ok(None),
+                        None => Err(Failure::Upstream("truncated media body")),
+                    }
+                }
+                .await;
+
+            if let Err(failure) = &result {
+                tracing::warn!(%asset, %failure, "media stream terminated");
+            }
+
+            result
+        },
+    );
+
+    Body::from_stream(stream)
 }
 
 fn response(status: StatusCode) -> Response {
