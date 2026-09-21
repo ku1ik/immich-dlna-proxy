@@ -3,7 +3,10 @@ use axum::response::Response;
 use http::Method;
 use serde_json::{Value, json};
 
-use crate::immich::tests::{Fake as Api, album, asset, page, reply, version};
+use crate::immich::{
+    self,
+    tests::{Fake as Api, album, asset, page, reply, version},
+};
 
 const ALBUM: Uuid = Uuid::from_u128(100_000);
 

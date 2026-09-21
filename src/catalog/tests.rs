@@ -8,14 +8,21 @@ use axum::{
 use http::{HeaderMap, HeaderValue, Method};
 use serde_json::{Value, json};
 use std::{
+    cmp::Ordering,
     fs,
     net::Ipv4Addr,
     os::unix::fs::{MetadataExt, PermissionsExt},
+    path::Path,
 };
 use tempfile::TempDir;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 
-use crate::protocol::{self, Filter, Service};
+use chrono::{DateTime, Utc};
+
+use crate::{
+    immich::Client,
+    protocol::{self, Filter, Service},
+};
 
 #[test]
 fn ids_and_date_ordering() {
