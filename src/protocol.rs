@@ -295,7 +295,7 @@ pub(crate) fn parse_action(
                     .push(&BytesStart::new("scope"))
                     .map_err(|_| invalid)?;
 
-                let mut attributes = Vec::new();
+                let mut ordinary = None;
 
                 for attribute in element.attributes() {
                     let attribute = attribute.map_err(|_| invalid)?;
@@ -328,22 +328,20 @@ pub(crate) fn parse_action(
                         namespaces
                             .add(prefix, Namespace(value.as_bytes()))
                             .map_err(|_| invalid)?;
-                    } else {
-                        attributes.push((attribute.key, value));
+                    } else if ordinary.replace((attribute.key, value)).is_some() {
+                        return Err(invalid);
                     }
                 }
 
                 let (resolved, local) = namespaces.resolve_element(qualified);
                 let namespace = resolved_namespace(resolved)?;
                 let local = std::str::from_utf8(local.as_ref()).map_err(|_| invalid)?;
-                let mut names = BTreeSet::new();
 
-                for (key, value) in attributes {
+                if let Some((key, value)) = ordinary {
                     let (resolved, local) = namespaces.resolve_attribute(key);
                     let ns = resolved_namespace(resolved)?;
 
-                    if !names.insert((ns, local.as_ref().to_vec()))
-                        || ns != SOAP
+                    if ns != SOAP
                         || local.as_ref() != b"encodingStyle"
                         || value != "http://schemas.xmlsoap.org/soap/encoding/"
                         || stack.len() > 2
