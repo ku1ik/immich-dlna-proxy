@@ -22,8 +22,6 @@ pub struct MediaProxy {
     api_base: Url,
     api_key: HeaderValue,
     operations: Arc<Semaphore>,
-    header_timeout: Duration,
-    read_timeout: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -96,8 +94,6 @@ impl MediaProxy {
             api_base,
             api_key,
             operations: Arc::new(Semaphore::new(OPERATIONS)),
-            header_timeout: RESPONSE_HEADER_TIMEOUT,
-            read_timeout: READ_IDLE_TIMEOUT,
         })
     }
 
@@ -243,7 +239,7 @@ impl MediaProxy {
         let mut visited = vec![url.clone()];
 
         // One header budget covers the whole redirect chain, not each hop separately.
-        let deadline = Instant::now() + self.header_timeout;
+        let deadline = Instant::now() + RESPONSE_HEADER_TIMEOUT;
 
         let (upstream, length) = loop {
             if Instant::now() >= deadline {
@@ -444,12 +440,10 @@ impl MediaProxy {
             return Ok(result);
         }
 
-        let idle = self.read_timeout;
-
         let stream = futures_util::stream::try_unfold(
             (upstream, permit, body_length),
             move |(mut upstream, permit, mut remaining)| async move {
-                let deadline = Instant::now() + idle;
+                let deadline = Instant::now() + READ_IDLE_TIMEOUT;
 
                 let next = timeout_at(deadline, async {
                     loop {
@@ -1629,7 +1623,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn completion_truncation_and_read_timeout_release_body_permits() {
         for reply in [
             Reply::new(JPEG),
@@ -1642,8 +1636,7 @@ mod tests {
         ] {
             let succeeds = reply.wire == JPEG;
             let server = FakeServer::new(vec![reply]).await;
-            let mut proxy = server.proxy();
-            proxy.read_timeout = Duration::from_millis(100);
+            let proxy = server.proxy();
 
             let result = proxy
                 .serve(ASSET, "original", Method::GET, HeaderMap::new())
@@ -1929,7 +1922,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn header_deadline_and_request_cancellation_release_admission() {
         let reply = Reply {
             header_delay: Duration::from_secs(60),
@@ -1937,8 +1930,7 @@ mod tests {
         };
 
         let mut server = FakeServer::new(vec![reply]).await;
-        let mut proxy = server.proxy();
-        proxy.header_timeout = Duration::from_millis(100);
+        let proxy = server.proxy();
 
         let result = proxy
             .serve(ASSET, "original", Method::GET, HeaderMap::new())
@@ -2012,13 +2004,13 @@ mod tests {
         assert!(server.requests.try_recv().is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn healthy_streams_have_progress_timeout_not_total_deadline() {
         let reply = Reply {
             chunks: vec![
-                (Duration::from_millis(60), "1\r\nb\r\n".into()),
-                (Duration::from_millis(60), "1\r\nc\r\n".into()),
-                (Duration::from_millis(60), "0\r\n\r\n".into()),
+                (Duration::from_secs(59), "1\r\nb\r\n".into()),
+                (Duration::from_secs(59), "1\r\nc\r\n".into()),
+                (Duration::from_secs(59), "0\r\n\r\n".into()),
             ],
             ..Reply::new(
                 "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\na\r\n",
@@ -2026,9 +2018,7 @@ mod tests {
         };
 
         let server = FakeServer::new(vec![reply]).await;
-        let mut proxy = server.proxy();
-        proxy.header_timeout = Duration::from_millis(100);
-        proxy.read_timeout = Duration::from_millis(150);
+        let proxy = server.proxy();
 
         let result = proxy
             .serve(ASSET, "preview", Method::GET, HeaderMap::new())
