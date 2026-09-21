@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::immich::{
     self,
-    tests::{Fake as Api, album, asset, page, reply, version},
+    test_support::{Fake as Api, album, asset, page, reply, version},
 };
 
 const ALBUM: Uuid = Uuid::from_u128(100_000);
@@ -20,7 +20,7 @@ impl SnapshotFixture {
         let api = Api::new(replies).await;
 
         let source = Source::new(
-            api.client.clone(),
+            api.new_client(),
             "192.0.2.1:8200".parse().unwrap(),
             "Photos".into(),
         );

@@ -1,9 +1,11 @@
 //! Typed access to the Immich album and asset metadata API.
 
 #[cfg(test)]
-pub(crate) mod tests;
+pub(crate) mod test_support;
+#[cfg(test)]
+mod tests;
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, ensure};
 use http::{HeaderValue, header};
@@ -18,12 +20,11 @@ pub(crate) const SEARCH_PAGE_SIZE: usize = 1_000;
 const JSON_BYTES: usize = 16 * 1024 * 1024;
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Clone)]
 pub(crate) struct Client {
     client: reqwest::Client,
     api_base: Url,
     api_key: HeaderValue,
-    version_checked: Arc<OnceCell<()>>,
+    version_checked: OnceCell<()>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,7 +138,7 @@ impl Client {
             client,
             api_base,
             api_key,
-            version_checked: Arc::new(OnceCell::new()),
+            version_checked: OnceCell::new(),
         })
     }
 

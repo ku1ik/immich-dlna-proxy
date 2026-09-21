@@ -1720,7 +1720,7 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
             assert_eq!(query["page"], 1);
             tokio::time::advance(Duration::from_secs(6)).await;
 
-            respond(first, json!({"assets": {"items": [crate::immich::tests::asset(1, "IMAGE")], "nextPage": "2"}})).await;
+            respond(first, json!({"assets": {"items": [crate::immich::test_support::asset(1, "IMAGE")], "nextPage": "2"}})).await;
 
             let query;
             (socket, query) = request(&listener, "/api/search/metadata").await;

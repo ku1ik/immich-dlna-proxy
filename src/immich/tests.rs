@@ -1,115 +1,11 @@
+use super::test_support::*;
 use super::*;
-use axum::{
-    Router,
-    body::{Body, to_bytes},
-    http::{HeaderMap, Method, Request, StatusCode},
-    response::Response,
-};
+use axum::{body::Body, http::Method, http::StatusCode, response::Response};
 use serde_json::{Value, json};
-use std::{collections::VecDeque, sync::Mutex, time::Duration};
-use tokio::{net::TcpListener, task::JoinHandle, time::Instant};
+use std::time::Duration;
+use tokio::{net::TcpListener, time::Instant};
 
 const ALBUM: Uuid = Uuid::from_u128(100_000);
-
-pub(crate) struct Received {
-    pub method: Method,
-    pub uri: String,
-    pub headers: HeaderMap,
-    pub body: Value,
-}
-
-pub(crate) struct Fake {
-    pub client: Client,
-    pub requests: Arc<Mutex<Vec<Received>>>,
-    task: JoinHandle<()>,
-}
-
-impl Fake {
-    pub async fn new(replies: Vec<Response>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let captured = requests.clone();
-        let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
-
-        let router =
-            Router::new().fallback(move |request: Request<Body>| {
-                let captured = captured.clone();
-                let replies = replies.clone();
-
-                async move {
-                    let (parts, body) = request.into_parts();
-                    let body = to_bytes(body, 8192).await.unwrap();
-
-                    captured.lock().unwrap().push(Received {
-                        method: parts.method,
-                        uri: parts.uri.to_string(),
-                        headers: parts.headers,
-                        body: if body.is_empty() {
-                            Value::Null
-                        } else {
-                            serde_json::from_slice(&body).unwrap()
-                        },
-                    });
-
-                    replies.lock().unwrap().pop_front().unwrap_or_else(|| {
-                        Response::builder().status(500).body(Body::empty()).unwrap()
-                    })
-                }
-            });
-
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-
-        let client = Client::new(
-            Url::parse(&format!("http://{address}/prefix/api/")).unwrap(),
-            HeaderValue::from_static("private-test-key"),
-        )
-        .unwrap();
-
-        Self {
-            client,
-            requests,
-            task,
-        }
-    }
-}
-
-impl Drop for Fake {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-pub(crate) fn reply(value: Value) -> Response {
-    Response::builder()
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(value.to_string()))
-        .unwrap()
-}
-
-pub(crate) fn version() -> Response {
-    reply(json!({"major": 3, "minor": 1, "patch": 0, "prerelease": null}))
-}
-
-pub(crate) fn album(id: Uuid) -> Value {
-    json!({"id": id, "albumName": "Album", "createdAt": "2024-01-01T00:30:00+02:00", "albumThumbnailAssetId": Uuid::from_u128(777)})
-}
-
-pub(crate) fn asset(id: u128, kind: &str) -> Value {
-    json!({
-        "id": Uuid::from_u128(id), "type": kind, "visibility": "timeline",
-        "isTrashed": false, "isEdited": false, "originalFileName": "photo.jpg",
-        "originalMimeType": "image/jpeg", "duration": null,
-        "fileCreatedAt": "2024-01-01T00:30:00+02:00",
-        "localDateTime": "2024-01-01T00:30:00Z"
-    })
-}
-
-pub(crate) fn page(items: Vec<Value>, next: Option<&str>) -> Response {
-    reply(json!({"assets": {"items": items, "nextPage": next, "total": 0, "count": 0}}))
-}
 
 #[tokio::test]
 async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
@@ -294,7 +190,7 @@ async fn search_validates_page_numbers_and_continuation_tokens() {
 }
 
 #[tokio::test]
-async fn versions_retry_only_failed_checks_and_share_success_across_clones() {
+async fn versions_retry_only_failed_checks_and_cache_success() {
     for value in [
         json!({"major": 3, "minor": 0, "patch": 99, "prerelease": null}),
         json!({"major": 3, "minor": 1, "patch": 0, "prerelease": 1}),
@@ -311,11 +207,7 @@ async fn versions_retry_only_failed_checks_and_share_success_across_clones() {
 
         fake.client.ensure_supported_version().await.unwrap();
 
-        fake.client
-            .clone()
-            .ensure_supported_version()
-            .await
-            .unwrap();
+        fake.client.ensure_supported_version().await.unwrap();
 
         assert_eq!(fake.requests.lock().unwrap().len(), 2);
 
