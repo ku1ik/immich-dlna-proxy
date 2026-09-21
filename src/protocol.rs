@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use quick_xml::{
     Reader,
@@ -567,20 +567,18 @@ impl Xml {
 
 pub(crate) fn action_response(
     service: Service,
-    action: &str,
-    args: &[(&str, &str)],
+    action: &'static str,
+    args: &[(&'static str, &str)],
 ) -> Result<String, Fault> {
     action_response_bounded(service, action, args, SOAP_RESPONSE_BYTES)
 }
 
 fn action_response_bounded(
     service: Service,
-    action: &str,
-    args: &[(&str, &str)],
+    action: &'static str,
+    args: &[(&'static str, &str)],
     limit: usize,
 ) -> Result<String, Fault> {
-    service.inputs(action)?;
-    let mut names = BTreeSet::new();
     let mut xml = Xml::new(limit, false);
     xml.raw(ENVELOPE_START)?;
     xml.raw("<u:")?;
@@ -590,10 +588,6 @@ fn action_response_bounded(
     xml.raw("\">")?;
 
     for &(name, value) in args {
-        if !ncname(name) || !names.insert(name) {
-            return Err(Fault { code: 402 });
-        }
-
         xml.element(name, value)?;
     }
 
@@ -877,6 +871,8 @@ const CONNECTION_MANAGER_SCPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use quick_xml::NsReader;
 
     use super::*;
@@ -1626,25 +1622,6 @@ mod tests {
         assert!(response.contains(&format!(
             "<u:BrowseResponse xmlns:u=\"{CONTENT_DIRECTORY}\">"
         )));
-
-        assert_eq!(
-            action_response(Service::ContentDirectory, "Browse", &[("bad:name", "x")]),
-            Err(Fault { code: 402 })
-        );
-
-        assert_eq!(
-            action_response(
-                Service::ContentDirectory,
-                "Browse",
-                &[("Result", "x"), ("Result", "y")]
-            ),
-            Err(Fault { code: 402 })
-        );
-
-        assert_eq!(
-            action_response(Service::ContentDirectory, "Bad><xml", &[]),
-            Err(Fault { code: 401 })
-        );
     }
 
     #[test]
