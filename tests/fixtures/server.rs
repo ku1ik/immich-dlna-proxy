@@ -9,11 +9,11 @@ use axum::{Router, body::Body, extract::Request, response::Response};
 use clap::Parser;
 use http::{HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
-    catalog::{BrowseResult, Catalog, ObjectId, parse_id},
+    catalog::{BrowseQuery, BrowseResult, Catalog, Object, ObjectId, parse_id},
     config::{is_non_loopback_unicast, resolve_interface},
     eventing::Subscriptions,
     media::MediaProxy,
-    protocol::{BrowseArguments, Fault, Object},
+    protocol::Fault,
     server::Server,
     ssdp::Discovery,
 };
@@ -96,7 +96,7 @@ impl Catalog for FixtureCatalog {
         0
     }
 
-    async fn browse(&self, args: BrowseArguments) -> Result<BrowseResult, Fault> {
+    async fn browse(&self, args: BrowseQuery) -> Result<BrowseResult, Fault> {
         let id = match parse_id(&args.object_id)? {
             ObjectId::Root => "0".to_owned(),
             ObjectId::Album(album) => format!("album:{album}"),
@@ -109,7 +109,7 @@ impl Catalog for FixtureCatalog {
             .find(|object| object.id == id)
             .ok_or(Fault { code: 701 })?;
 
-        tracing::info!(object = %id, metadata = args.metadata, resources_selected = args.filter.res(), "fixture Browse selection");
+        tracing::info!(object = %id, metadata = args.metadata, "fixture Browse selection");
 
         if args.metadata {
             return Ok(BrowseResult {

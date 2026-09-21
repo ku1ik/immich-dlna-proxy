@@ -1,6 +1,6 @@
 use std::net::SocketAddrV4;
 
-use immich_dlna_proxy::protocol::{Object, Resource};
+use immich_dlna_proxy::catalog::{Object, Resource};
 
 pub const ALBUM_ID: &str = "album:10000000-0000-4000-8000-000000000001";
 pub const ORIGINAL_JPEG_ID: &str = "20000000-0000-4000-8000-000000000001";

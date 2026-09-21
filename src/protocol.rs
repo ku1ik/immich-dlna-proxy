@@ -6,6 +6,8 @@ use quick_xml::{
     name::{Namespace, NamespaceResolver, PrefixDeclaration, ResolveResult},
 };
 
+use crate::catalog::{BrowseQuery, Object};
+
 pub(crate) const SOAP_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 pub(crate) const MEDIA_SERVER: &str = "urn:schemas-upnp-org:device:MediaServer:1";
@@ -86,7 +88,7 @@ pub fn device_description(friendly_name: &str, uuid: uuid::Uuid) -> String {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Action {
-    Browse(BrowseArguments),
+    Browse { query: BrowseQuery, filter: Filter },
     GetSearchCapabilities,
     GetSortCapabilities,
     GetSystemUpdateId,
@@ -98,7 +100,7 @@ pub(crate) enum Action {
 impl Action {
     pub(crate) fn name(&self) -> &'static str {
         match self {
-            Self::Browse(_) => "Browse",
+            Self::Browse { .. } => "Browse",
             Self::GetSearchCapabilities => "GetSearchCapabilities",
             Self::GetSortCapabilities => "GetSortCapabilities",
             Self::GetSystemUpdateId => "GetSystemUpdateID",
@@ -107,17 +109,6 @@ impl Action {
             Self::GetCurrentConnectionInfo(_) => "GetCurrentConnectionInfo",
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BrowseArguments {
-    pub object_id: String,
-    pub metadata: bool,
-    pub starting_index: u32,
-    pub requested_count: u32,
-    /// None uses catalog order; Some(true) sorts dates descending.
-    pub sort: Option<bool>,
-    pub filter: Filter,
 }
 
 fn action_arguments(
@@ -185,14 +176,16 @@ fn action_arguments(
 
     let filter = Filter::parse(&arguments["Filter"])?;
 
-    Ok(Action::Browse(BrowseArguments {
-        object_id: arguments.remove("ObjectID").ok_or(invalid)?,
-        metadata,
-        starting_index,
-        requested_count,
-        sort,
+    Ok(Action::Browse {
+        query: BrowseQuery {
+            object_id: arguments.remove("ObjectID").ok_or(invalid)?,
+            metadata,
+            starting_index,
+            requested_count,
+            sort,
+        },
         filter,
-    }))
+    })
 }
 
 pub(crate) fn xml_char(c: char) -> bool {
@@ -662,28 +655,6 @@ impl Filter {
     }
 }
 
-/// Projected metadata; callers own ID validation, resource selection and ordering.
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-pub struct Object {
-    pub id: String,
-    pub parent_id: String,
-    pub title: String,
-    pub class: String,
-    pub date: Option<String>,
-    pub art: Option<String>,
-    pub child_count: Option<usize>,
-    pub resources: Vec<Resource>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
-pub struct Resource {
-    pub uri: String,
-    pub mime: String,
-    pub duration: Option<String>,
-    /// Explicitly established byte-seek support, not inferred from the MIME.
-    pub byte_seek: bool,
-}
-
 pub fn didl(objects: &[Object], filter: &Filter) -> Result<String, Fault> {
     didl_bounded(objects, filter, SOAP_RESPONSE_BYTES)
 }
@@ -855,6 +826,7 @@ mod tests {
     use quick_xml::NsReader;
 
     use super::*;
+    use crate::catalog::Resource;
 
     fn request(action: &str, arguments: &str) -> String {
         format!(
@@ -1140,12 +1112,12 @@ mod tests {
             "<ObjectID> Łódź 東京 &#x10400;&#32;&amp;&lt;&gt;&quot;&apos;<![CDATA[<&]]><!--split--> z </ObjectID>",
         );
 
-        let Action::Browse(arguments) = browse(&args).unwrap() else {
+        let Action::Browse { query, .. } = browse(&args).unwrap() else {
             panic!("expected Browse");
         };
 
-        assert_eq!(arguments.object_id, " Łódź 東京 𐐀 &<>\"'<& z ");
-        assert_eq!(arguments.sort, None);
+        assert_eq!(query.object_id, " Łódź 東京 𐐀 &<>\"'<& z ");
+        assert_eq!(query.sort, None);
     }
 
     #[test]
@@ -1254,16 +1226,16 @@ mod tests {
 
     #[test]
     fn soap_browse_validates_shape_and_fault_precedence() {
-        let Action::Browse(arguments) = browse(BROWSE_ARGS).unwrap() else {
+        let Action::Browse { query, filter } = browse(BROWSE_ARGS).unwrap() else {
             panic!("expected Browse");
         };
 
-        assert_eq!(arguments.object_id, "0");
-        assert!(!arguments.metadata);
-        assert_eq!(arguments.starting_index, 0);
-        assert_eq!(arguments.requested_count, 0);
-        assert_eq!(arguments.sort, None);
-        assert_eq!(arguments.filter, Filter::parse("*").unwrap());
+        assert_eq!(query.object_id, "0");
+        assert!(!query.metadata);
+        assert_eq!(query.starting_index, 0);
+        assert_eq!(query.requested_count, 0);
+        assert_eq!(query.sort, None);
+        assert_eq!(filter, Filter::parse("*").unwrap());
 
         for argument in [
             "<ObjectID>0</ObjectID>",
@@ -1297,13 +1269,13 @@ mod tests {
             .replace("<StartingIndex>0", "<StartingIndex>4294967295")
             .replace("<RequestedCount>0", "<RequestedCount>4294967295");
 
-        let Action::Browse(arguments) = browse(&args).unwrap() else {
+        let Action::Browse { query, .. } = browse(&args).unwrap() else {
             panic!("expected Browse");
         };
 
-        assert_eq!(arguments.object_id, "not-an-id");
-        assert_eq!(arguments.starting_index, u32::MAX);
-        assert_eq!(arguments.requested_count, u32::MAX);
+        assert_eq!(query.object_id, "not-an-id");
+        assert_eq!(query.starting_index, u32::MAX);
+        assert_eq!(query.requested_count, u32::MAX);
     }
 
     #[test]
@@ -1346,11 +1318,11 @@ mod tests {
                 &format!("<SortCriteria>{sort}</SortCriteria>"),
             );
 
-            let Action::Browse(arguments) = browse(&args).unwrap() else {
+            let Action::Browse { query, .. } = browse(&args).unwrap() else {
                 panic!("expected Browse");
             };
 
-            assert_eq!(arguments.sort, expected);
+            assert_eq!(query.sort, expected);
         }
 
         for sort in [

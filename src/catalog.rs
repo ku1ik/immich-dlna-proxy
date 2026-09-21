@@ -36,7 +36,7 @@ use crate::{
     config::Config,
     eventing::Subscriptions,
     immich::{self, Asset, Client},
-    protocol::{BrowseArguments, Fault, Object, Resource, xml_char},
+    protocol::{Fault, xml_char},
 };
 
 const FRESHNESS: Duration = Duration::from_secs(60);
@@ -60,14 +60,46 @@ pub trait Catalog: Send + Sync + 'static {
     fn system_update_id(&self) -> u32;
     fn browse(
         &self,
-        arguments: BrowseArguments,
+        query: BrowseQuery,
     ) -> impl Future<Output = Result<BrowseResult, Fault>> + Send;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowseQuery {
+    pub object_id: String,
+    pub metadata: bool,
+    pub starting_index: u32,
+    pub requested_count: u32,
+    /// None uses catalog order; Some(true) sorts dates descending.
+    pub sort: Option<bool>,
 }
 
 pub struct BrowseResult {
     pub objects: Vec<Object>,
     pub total_matches: u32,
     pub update_id: u32,
+}
+
+/// Complete projected metadata; callers own filtering and wire serialization.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Object {
+    pub id: String,
+    pub parent_id: String,
+    pub title: String,
+    pub class: String,
+    pub date: Option<String>,
+    pub art: Option<String>,
+    pub child_count: Option<usize>,
+    pub resources: Vec<Resource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct Resource {
+    pub uri: String,
+    pub mime: String,
+    pub duration: Option<String>,
+    /// Explicitly established byte-seek support, not inferred from the MIME.
+    pub byte_seek: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1726,7 +1758,7 @@ impl Catalog for Library {
         self.inner.state.lock().unwrap().ledger.system_update_id
     }
 
-    async fn browse(&self, query: BrowseArguments) -> Result<BrowseResult, Fault> {
+    async fn browse(&self, query: BrowseQuery) -> Result<BrowseResult, Fault> {
         let id = parse_id(&query.object_id)?;
         let mut view = self.fresh(Scope::Root).await?;
 
@@ -1748,7 +1780,7 @@ impl View {
     fn browse(
         &self,
         id: ObjectId,
-        query: BrowseArguments,
+        query: BrowseQuery,
         collator: &CollatorBorrowed<'_>,
     ) -> Result<BrowseResult, Fault> {
         let Self {

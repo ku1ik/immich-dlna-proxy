@@ -11,7 +11,10 @@ mod tests {
     };
 
     use http::{StatusCode, header};
-    use immich_dlna_proxy::protocol::{self, Filter, Object, Service};
+    use immich_dlna_proxy::{
+        catalog::Object,
+        protocol::{self, Filter, Service},
+    };
 
     use super::fixture_server::{
         Bound, FILES, SERVER_UUID,

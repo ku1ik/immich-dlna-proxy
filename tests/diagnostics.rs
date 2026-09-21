@@ -8,10 +8,10 @@ use std::{
 use axum::{Router, body::Body, extract::Request, response::Response};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
-    catalog::{BrowseResult, Catalog},
+    catalog::{BrowseQuery, BrowseResult, Catalog, Object},
     eventing::Subscriptions,
     media::MediaProxy,
-    protocol::{self, BrowseArguments, Fault, Object},
+    protocol::{self, Fault},
     server::Server,
 };
 use tokio::{
@@ -46,10 +46,9 @@ impl Catalog for TestCatalog {
         42
     }
 
-    async fn browse(&self, arguments: BrowseArguments) -> Result<BrowseResult, Fault> {
+    async fn browse(&self, arguments: BrowseQuery) -> Result<BrowseResult, Fault> {
         assert_eq!(arguments.object_id, "0");
         assert!(!arguments.metadata);
-        assert_eq!(arguments.filter, protocol::Filter::parse("res").unwrap());
         assert_eq!(arguments.starting_index, 3);
         assert_eq!(arguments.requested_count, 2);
         assert_eq!(arguments.sort, Some(true));

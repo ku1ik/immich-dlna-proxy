@@ -263,7 +263,7 @@ impl<C: Catalog> Server<C> {
         }
 
         // Keep admission outside timed execution, including fault construction and handoff.
-        let _permit = if matches!(action, Action::Browse(_)) {
+        let _permit = if matches!(action, Action::Browse { .. }) {
             let Ok(permit) = self.browses.try_acquire() else {
                 return empty(StatusCode::SERVICE_UNAVAILABLE);
             };
@@ -275,21 +275,20 @@ impl<C: Catalog> Server<C> {
 
         let result = timeout_at(deadline, async {
             let args = match action {
-                Action::Browse(args) => {
-                    let filter = args.filter;
-                    let object = crate::catalog::parse_id(&args.object_id).ok();
+                Action::Browse { query, filter } => {
+                    let object = crate::catalog::parse_id(&query.object_id).ok();
 
                     tracing::debug!(
                         %peer, ?object,
-                        metadata = args.metadata,
-                        starting_index = args.starting_index,
-                        requested_count = args.requested_count,
-                        sort = ?args.sort,
+                        metadata = query.metadata,
+                        starting_index = query.starting_index,
+                        requested_count = query.requested_count,
+                        sort = ?query.sort,
                         resources_selected = filter.res(),
                         "Browse request"
                     );
 
-                    let result = self.catalog.browse(args).await?;
+                    let result = self.catalog.browse(query).await?;
                     let didl = protocol::didl(&result.objects, &filter)?;
                     let envelope = protocol::action_response(
                         service,
@@ -437,14 +436,17 @@ mod tests {
     };
 
     use super::*;
-    use crate::{catalog::BrowseResult, eventing::SUBSCRIPTIONS, protocol::BrowseArguments};
+    use crate::{
+        catalog::{BrowseQuery, BrowseResult, Object},
+        eventing::SUBSCRIPTIONS,
+    };
 
     const CDS: &str = "/upnp/content-directory/control";
     const EVENTS: &str = "/upnp/content-directory/events";
 
     #[derive(Default)]
     struct TestCatalog {
-        actions: Mutex<Vec<BrowseArguments>>,
+        actions: Mutex<Vec<BrowseQuery>>,
         entered: Notify,
         release: Option<Semaphore>,
         block: Option<Duration>,
@@ -455,7 +457,7 @@ mod tests {
             42
         }
 
-        async fn browse(&self, arguments: BrowseArguments) -> Result<BrowseResult, Fault> {
+        async fn browse(&self, arguments: BrowseQuery) -> Result<BrowseResult, Fault> {
             self.actions.lock().unwrap().push(arguments);
             self.entered.notify_one();
 
@@ -468,7 +470,7 @@ mod tests {
             }
 
             Ok(BrowseResult {
-                objects: vec![protocol::Object {
+                objects: vec![Object {
                     id: "0".into(),
                     parent_id: "-1".into(),
                     title: "A&B".into(),

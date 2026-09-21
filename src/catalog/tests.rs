@@ -447,22 +447,21 @@ fn item(id: u128, capture: Option<&str>, date: Option<&str>) -> Value {
     })
 }
 
-fn action(id: &str, metadata: bool, start: u32, count: u32, sort: Option<bool>) -> BrowseArguments {
-    BrowseArguments {
+fn action(id: &str, metadata: bool, start: u32, count: u32, sort: Option<bool>) -> BrowseQuery {
+    BrowseQuery {
         object_id: id.into(),
         metadata,
         starting_index: start,
         requested_count: count,
         sort,
-        filter: Filter::parse("*").unwrap(),
     }
 }
 
-fn children(id: u128) -> BrowseArguments {
+fn children(id: u128) -> BrowseQuery {
     action(&format!("album:{}", Uuid::from_u128(id)), false, 0, 0, None)
 }
 
-fn browse(library: &Library, query: BrowseArguments) -> JoinHandle<Result<BrowseResult, Fault>> {
+fn browse(library: &Library, query: BrowseQuery) -> JoinHandle<Result<BrowseResult, Fault>> {
     let library = library.clone();
 
     tokio::spawn(async move { library.browse(query).await })
@@ -1320,7 +1319,6 @@ async fn relationship_count_sort_filter_and_snapshot_counter_capture() {
     ] {
         let mut request = children(1);
         request.sort = Some(sort);
-        request.filter = Filter::parse("").unwrap();
         let rows = fixture.library.browse(request).await.unwrap();
         assert_eq!(rows.total_matches, 3);
 
