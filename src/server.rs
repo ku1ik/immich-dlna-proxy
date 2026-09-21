@@ -39,6 +39,13 @@ pub struct Server<C> {
     browses: Semaphore,
 }
 
+#[derive(Clone, Copy)]
+enum ServiceRoute {
+    Scpd(Service),
+    Control(Service),
+    Events(Service),
+}
+
 impl<C: Catalog> Server<C> {
     pub fn new(
         friendly_name: String,
@@ -119,16 +126,34 @@ impl<C: Catalog> Server<C> {
         }
 
         let service_route = match path {
-            "/upnp/content-directory/scpd.xml" => Some((Service::ContentDirectory, "scpd")),
-            "/upnp/connection-manager/scpd.xml" => Some((Service::ConnectionManager, "scpd")),
-            "/upnp/content-directory/control" => Some((Service::ContentDirectory, "control")),
-            "/upnp/connection-manager/control" => Some((Service::ConnectionManager, "control")),
-            "/upnp/content-directory/events" => Some((Service::ContentDirectory, "events")),
-            "/upnp/connection-manager/events" => Some((Service::ConnectionManager, "events")),
+            "/upnp/content-directory/scpd.xml" => {
+                Some(ServiceRoute::Scpd(Service::ContentDirectory))
+            }
+
+            "/upnp/connection-manager/scpd.xml" => {
+                Some(ServiceRoute::Scpd(Service::ConnectionManager))
+            }
+
+            "/upnp/content-directory/control" => {
+                Some(ServiceRoute::Control(Service::ContentDirectory))
+            }
+
+            "/upnp/connection-manager/control" => {
+                Some(ServiceRoute::Control(Service::ConnectionManager))
+            }
+
+            "/upnp/content-directory/events" => {
+                Some(ServiceRoute::Events(Service::ContentDirectory))
+            }
+
+            "/upnp/connection-manager/events" => {
+                Some(ServiceRoute::Events(Service::ConnectionManager))
+            }
+
             _ => None,
         };
 
-        if let Some((service, "control")) = service_route {
+        if let Some(ServiceRoute::Control(service)) = service_route {
             if parts.method != Method::POST {
                 return method_not_allowed("POST");
             }
@@ -154,7 +179,7 @@ impl<C: Catalog> Server<C> {
             return empty(StatusCode::BAD_REQUEST);
         }
 
-        if let Some((service, "events")) = service_route {
+        if let Some(ServiceRoute::Events(service)) = service_route {
             return self
                 .subscriptions
                 .request(service, peer, &parts.method, &parts.headers);
@@ -174,7 +199,8 @@ impl<C: Catalog> Server<C> {
         }
 
         let document = match service_route {
-            Some((service, "scpd")) => protocol::scpd(service),
+            Some(ServiceRoute::Scpd(service)) => protocol::scpd(service),
+            Some(ServiceRoute::Control(_) | ServiceRoute::Events(_)) => unreachable!(),
             _ => &self.device,
         };
 
