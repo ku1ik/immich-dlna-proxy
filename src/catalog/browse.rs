@@ -343,11 +343,11 @@ mod tests {
         let id = format!("album:{album}:asset:{asset}");
 
         assert_eq!(
-            parse_id(
-                &id.to_uppercase()
-                    .replacen("ALBUM", "album", 1)
-                    .replacen("ASSET", "asset", 1)
-            ),
+            parse_id(&format!(
+                "album:{}:asset:{}",
+                album.to_string().to_uppercase(),
+                asset.to_string().to_uppercase()
+            )),
             Ok(ObjectId::Item { album, asset })
         );
 

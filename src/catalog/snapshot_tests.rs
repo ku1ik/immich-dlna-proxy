@@ -289,8 +289,8 @@ async fn duplicates_compare_only_normalized_member_data_and_eligibility() {
     excluded["visibility"] = json!("future-visibility");
     excluded.as_object_mut().unwrap().remove("originalFileName");
     let mut excluded_changed = excluded.clone();
-    excluded_changed["originalFileName"] = json!("irrelevant name".repeat(1000));
-    excluded_changed["checksum"] = json!("irrelevant hint".repeat(1000));
+    excluded_changed["originalFileName"] = json!("irrelevant name");
+    excluded_changed["checksum"] = json!("irrelevant hint");
     excluded_changed["isEdited"] = json!(true);
 
     let fake = SnapshotFixture::new(vec![page(

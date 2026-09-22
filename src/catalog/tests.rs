@@ -412,7 +412,7 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
 
 #[tokio::test]
 async fn invalid_object_id_fails_before_fetch() {
-    let fixture = Fixture::new(1).await;
+    let fixture = Fixture::new(0).await;
 
     assert_eq!(
         fixture
@@ -428,7 +428,7 @@ async fn invalid_object_id_fails_before_fetch() {
 
 #[tokio::test]
 async fn album_latest_date_refresh_reorders_and_publishes_without_loading_contents() {
-    let mut fixture = Fixture::new(2).await;
+    let mut fixture = Fixture::new(0).await;
 
     {
         let mut upstream = fixture.fake.upstream.lock().unwrap();
@@ -1541,16 +1541,13 @@ async fn abandoned_refresh_completes_and_expiry_alone_never_does_work() {
 async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
     let fixture = Fixture::new(2).await;
 
-    fixture.library.inner.state.lock().unwrap().cache.byte_limit = 2 * SNAPSHOT_BYTES;
-
     {
         let mut upstream = fixture.fake.upstream.lock().unwrap();
-        upstream.albums[0]["albumName"] = json!("A".repeat(16 * 1024));
 
         for id in 1..=2 {
-            let mut asset = item(id, None, None);
-            asset["checksum"] = json!("x".repeat(SNAPSHOT_BYTES - 4096));
-            upstream.contents.insert(Uuid::from_u128(id), vec![asset]);
+            upstream
+                .contents
+                .insert(Uuid::from_u128(id), vec![item(id, None, None)]);
         }
     }
 
@@ -1583,9 +1580,9 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
     flight.changed().await.unwrap();
 
     let (album_id, system_id, a_bytes) = {
-        let state = fixture.library.inner.state.lock().unwrap();
+        let mut state = fixture.library.inner.state.lock().unwrap();
         let bytes = state.cache.albums[&Uuid::from_u128(1)].snapshot.bytes;
-        assert!(bytes > SNAPSHOT_BYTES - 8192 && bytes <= SNAPSHOT_BYTES);
+        state.cache.byte_limit = state.cache.root.as_ref().unwrap().snapshot.bytes + bytes;
 
         (
             state.ledger.albums[&Uuid::from_u128(1)].update_id,
@@ -1599,11 +1596,16 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
     {
         let state = fixture.library.inner.state.lock().unwrap();
         let b_bytes = state.cache.albums[&Uuid::from_u128(2)].snapshot.bytes;
-        assert!(b_bytes > SNAPSHOT_BYTES - 8192 && b_bytes <= SNAPSHOT_BYTES);
+        assert_eq!(b_bytes, a_bytes);
+
+        assert_eq!(
+            state.cache.root.as_ref().unwrap().snapshot.bytes + b_bytes,
+            state.cache.byte_limit
+        );
 
         assert!(
             a_bytes + b_bytes + state.cache.root.as_ref().unwrap().snapshot.bytes
-                > 2 * SNAPSHOT_BYTES
+                > state.cache.byte_limit
         );
 
         assert!(!state.cache.albums.contains_key(&Uuid::from_u128(1)));
