@@ -22,7 +22,7 @@ const SEARCH_PAGES: usize = 50;
 const SEARCH_RECORDS: usize = 50_000;
 
 pub(super) struct Source {
-    pub(super) client: Client,
+    client: Client,
     http_address: SocketAddrV4,
     friendly_name: String,
 }

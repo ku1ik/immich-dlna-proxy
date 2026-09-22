@@ -9,17 +9,14 @@ use http::{HeaderMap, HeaderValue, Method};
 use serde_json::{Value, json};
 use std::{
     fs,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, SocketAddr},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::Path,
 };
 use tempfile::TempDir;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 
-use crate::{
-    immich::Client,
-    protocol::{self, Filter, Service},
-};
+use crate::protocol::{self, Filter, Service};
 
 pub(super) struct Barrier {
     pub(super) entered: Notify,
@@ -211,20 +208,6 @@ impl Fake {
         }
     }
 
-    fn config(&self, directory: &std::path::Path) -> Config {
-        Config {
-            api_base: format!("http://{}/api/", self.address).parse().unwrap(),
-            api_key: HeaderValue::from_static("fake-key"),
-            listen_address: "192.0.2.1:8200".parse().unwrap(),
-            friendly_name: "Photos & videos".into(),
-            collator: crate::config::collator("pl").unwrap(),
-            server_uuid: Uuid::from_u128(999),
-            state_directory: directory.to_owned(),
-            log_level: tracing::Level::INFO,
-            interface_index: 1,
-        }
-    }
-
     fn calls(&self, path: &str) -> usize {
         self.upstream
             .lock()
@@ -276,6 +259,29 @@ impl Drop for Fake {
     }
 }
 
+fn config(address: SocketAddr, directory: &Path) -> Config {
+    Config {
+        api_base: format!("http://{address}/api/").parse().unwrap(),
+        api_key: HeaderValue::from_static("fake-key"),
+        listen_address: "192.0.2.1:8200".parse().unwrap(),
+        friendly_name: "Photos & videos".into(),
+        collator: crate::config::collator("pl").unwrap(),
+        server_uuid: Uuid::from_u128(999),
+        state_directory: directory.to_owned(),
+        log_level: tracing::Level::INFO,
+        interface_index: 1,
+    }
+}
+
+fn disk(directory: &Path) -> (u64, Ledger) {
+    let path = directory.join("revisions.json");
+
+    (
+        fs::metadata(&path).unwrap().ino(),
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap(),
+    )
+}
+
 struct Fixture {
     library: ImmichCatalog,
     fake: Fake,
@@ -291,7 +297,7 @@ impl Fixture {
 
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let config = fake.config(directory.path());
+        let config = config(fake.address, directory.path());
         let library = ImmichCatalog::open(config, Subscriptions::new().unwrap())
             .await
             .unwrap();
@@ -320,12 +326,7 @@ impl Fixture {
     }
 
     fn disk(&self) -> (u64, Ledger) {
-        let path = self.directory.path().join("revisions.json");
-
-        (
-            fs::metadata(&path).unwrap().ino(),
-            serde_json::from_slice(&fs::read(path).unwrap()).unwrap(),
-        )
+        disk(self.directory.path())
     }
 
     async fn abort(&self, task: JoinHandle<Result<()>>) {
@@ -551,7 +552,7 @@ async fn real_http_catalog_events_durability_and_media_share_one_server() {
 
     let directory = tempfile::tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let mut config = fake.config(directory.path());
+    let mut config = config(fake.address, directory.path());
 
     config.listen_address = match address {
         std::net::SocketAddr::V4(address) => address,
@@ -1534,7 +1535,7 @@ async fn metadata_contents_and_restart_preserve_independent_durable_counters() {
     store.persist(restarted.clone()).await;
 
     fixture.library = ImmichCatalog::from_parts(
-        fixture.fake.config(fixture.directory.path()),
+        config(fixture.fake.address, fixture.directory.path()),
         store,
         restarted.clone(),
         Subscriptions::new().unwrap(),
@@ -1675,17 +1676,14 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
 
     // Stall version checking, album listing, or a later search page.
     for (stage, body_pending) in [(0, true), (1, false), (1, true), (2, false), (2, true)] {
-        let mut fixture = Fixture::new(1).await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let inner = Arc::get_mut(&mut fixture.library.inner).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let config = config(listener.local_addr().unwrap(), directory.path());
 
-        inner.source.client = Client::new(
-            format!("http://{}/api/", listener.local_addr().unwrap())
-                .parse()
-                .unwrap(),
-            HeaderValue::from_static("fake-key"),
-        )
-        .unwrap();
+        let library = ImmichCatalog::open(config, Subscriptions::new().unwrap())
+            .await
+            .unwrap();
 
         tokio::time::pause();
 
@@ -1696,8 +1694,9 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
             }
         });
 
-        let task = fixture.run();
-        let caller = browse(&fixture.library, children(1));
+        let supervised = library.clone();
+        let task = tokio::spawn(async move { supervised.run().await });
+        let caller = browse(&library, children(1));
         let (mut socket, _) = request(&listener, "/api/server/version").await;
 
         if stage > 0 {
@@ -1735,7 +1734,7 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
         }
 
         assert!(!caller.is_finished());
-        let before = fixture.disk();
+        let before = disk(directory.path());
 
         // Earlier requests consumed six seconds; a new page gets no new window.
         tokio::time::advance(Duration::from_secs(if stage == 0 { 21 } else { 15 })).await;
@@ -1743,19 +1742,10 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
         clock_guard.abort();
         assert!(clock_guard.await.unwrap_err().is_cancelled());
         fault(caller, 501).await;
-        assert_eq!(fixture.disk(), before);
-        assert_eq!(fixture.library.inner.permits.available_permits(), REFRESHES);
+        assert_eq!(disk(directory.path()), before);
+        assert_eq!(library.inner.permits.available_permits(), REFRESHES);
 
-        assert!(
-            fixture
-                .library
-                .inner
-                .state
-                .lock()
-                .unwrap()
-                .flights
-                .is_empty()
-        );
+        assert!(library.inner.state.lock().unwrap().flights.is_empty());
 
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), socket.read(&mut [0; 1]))
@@ -1765,7 +1755,10 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
             0
         );
 
-        fixture.abort(task).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(library.inner.state.lock().unwrap().flights.is_empty());
+        assert_eq!(library.inner.permits.available_permits(), REFRESHES);
         tokio::time::resume();
     }
 }
@@ -1935,7 +1928,7 @@ async fn publication_failure_worker() {
     let mode = std::env::var("CATALOG_TEST_MODE").unwrap();
     let mut fake = Fake::new().await;
     fake.upstream.lock().unwrap().albums = vec![album(1, "Album")];
-    let config = fake.config(std::path::Path::new(&directory));
+    let config = config(fake.address, Path::new(&directory));
     let library = ImmichCatalog::open(config, Subscriptions::new().unwrap())
         .await
         .unwrap();
@@ -2077,7 +2070,7 @@ async fn publication_failure(mode: &str) {
     fake.upstream.lock().unwrap().albums = vec![album(1, "Changed")];
 
     let library = ImmichCatalog::from_parts(
-        fake.config(directory.path()),
+        config(fake.address, directory.path()),
         store,
         restored.clone(),
         Subscriptions::new().unwrap(),
