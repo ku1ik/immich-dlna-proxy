@@ -1,6 +1,7 @@
 use std::{net::SocketAddrV4, sync::Arc, time::Duration};
 
 use axum::{body::Body, response::Response};
+use futures_util::TryStreamExt;
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
@@ -491,51 +492,46 @@ fn media_body(
     let stream = futures_util::stream::try_unfold(
         (upstream, permit, body_length),
         move |(mut upstream, permit, mut remaining)| async move {
-            let result =
-                async {
-                    let deadline = Instant::now() + READ_IDLE_TIMEOUT;
+            let deadline = Instant::now() + READ_IDLE_TIMEOUT;
 
-                    let chunk = timeout_at(deadline, async {
-                        loop {
-                            if Instant::now() >= deadline {
-                                return Err(Failure::Timeout);
-                            }
+            let chunk = timeout_at(deadline, async {
+                loop {
+                    if Instant::now() >= deadline {
+                        return Err(Failure::Timeout);
+                    }
 
-                            match upstream.chunk().await.map_err(transport_failure)? {
-                                Some(chunk) if chunk.is_empty() => continue,
-                                chunk => break Ok(chunk),
-                            }
-                        }
-                    })
-                    .await
-                    .map_err(|_| Failure::Timeout)??;
+                    match upstream.chunk().await.map_err(transport_failure)? {
+                        Some(chunk) if chunk.is_empty() => continue,
 
-                    match chunk {
-                        Some(chunk) => {
-                            if let Some(left) = remaining.as_mut() {
-                                *left = left.checked_sub(chunk.len() as u64).ok_or(
-                                    Failure::Upstream("media body exceeds declared content length"),
-                                )?;
-                            }
-
-                            Ok(Some((chunk, (upstream, permit, remaining))))
-                        }
-
-                        None if remaining.is_none_or(|left| left == 0) => Ok(None),
-                        None => Err(Failure::Upstream("truncated media body")),
+                        chunk => break Ok(chunk),
                     }
                 }
-                .await;
+            })
+            .await
+            .map_err(|_| Failure::Timeout)??;
 
-            if let Err(failure) = &result {
-                tracing::warn!(%asset, %failure, "media stream terminated");
+            match chunk {
+                Some(chunk) => {
+                    if let Some(left) = remaining.as_mut() {
+                        *left = left
+                            .checked_sub(chunk.len() as u64)
+                            .ok_or(Failure::Upstream(
+                                "media body exceeds declared content length",
+                            ))?;
+                    }
+
+                    Ok(Some((chunk, (upstream, permit, remaining))))
+                }
+
+                None if remaining.is_none_or(|left| left == 0) => Ok(None),
+                None => Err(Failure::Upstream("truncated media body")),
             }
-
-            result
         },
     );
 
-    Body::from_stream(stream)
+    Body::from_stream(stream.inspect_err(move |failure| {
+        tracing::warn!(%asset, %failure, "media stream terminated");
+    }))
 }
 
 fn response(status: StatusCode) -> Response {
