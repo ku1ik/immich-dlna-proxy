@@ -24,7 +24,8 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
     ])
     .await;
 
-    let albums = fake.client.albums().await.unwrap();
+    let client = fake.new_client();
+    let albums = client.albums().await.unwrap();
     assert_eq!(albums[0].album_name, "A\u{0001}&B");
 
     assert_eq!(
@@ -32,7 +33,7 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
         Some("2024-01-01T00:30:00+02:00")
     );
 
-    let result = fake.client.search_album(ALBUM, 1, false).await.unwrap();
+    let result = client.search_album(ALBUM, 1, false).await.unwrap();
 
     assert_eq!(result.next_page, Some(2));
     assert_eq!(result.items.len(), 2);
@@ -48,7 +49,7 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
 
     assert_eq!(fake.requests.lock().unwrap().len(), 2);
 
-    let result = fake.client.search_album(ALBUM, 2, true).await.unwrap();
+    let result = client.search_album(ALBUM, 2, true).await.unwrap();
 
     assert_eq!(result.next_page, None);
     assert_eq!(result.items[0].id, Uuid::from_u128(2));
@@ -80,7 +81,7 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
         assert_eq!(request.headers[header::ACCEPT_ENCODING], "identity");
     }
 
-    assert!(fake.client.api_key.is_sensitive());
+    assert!(client.api_key.is_sensitive());
 }
 
 #[tokio::test]
@@ -90,7 +91,8 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
         json!({"id": ALBUM, "albumName": "valid", "albumThumbnailAssetId": "invalid"}),
     ] {
         let fake = Fake::new(vec![reply(json!([dto]))]).await;
-        assert!(fake.client.albums().await.is_err());
+        let client = fake.new_client();
+        assert!(client.albums().await.is_err());
     }
 
     for field in ["id", "type", "visibility", "isTrashed", "isEdited"] {
@@ -104,9 +106,10 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
             }
 
             let fake = Fake::new(vec![page(vec![dto], None)]).await;
+            let client = fake.new_client();
 
             assert!(
-                fake.client.search_album(ALBUM, 1, false).await.is_err(),
+                client.search_album(ALBUM, 1, false).await.is_err(),
                 "{field}"
             );
         }
@@ -123,9 +126,10 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
         let mut dto = asset(1, "IMAGE");
         dto[field] = json!({"wrong": "structure"});
         let fake = Fake::new(vec![page(vec![dto], None)]).await;
+        let client = fake.new_client();
 
         assert!(
-            fake.client.search_album(ALBUM, 1, false).await.is_err(),
+            client.search_album(ALBUM, 1, false).await.is_err(),
             "{field}"
         );
     }
@@ -138,8 +142,9 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
         json!({"albums": []}),
     ] {
         let fake = Fake::new(vec![reply(response)]).await;
+        let client = fake.new_client();
 
-        assert!(fake.client.search_album(ALBUM, 1, false).await.is_err());
+        assert!(client.search_album(ALBUM, 1, false).await.is_err());
     }
 
     let mut dto = asset(1, "IMAGE");
@@ -159,8 +164,9 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
 
     dto["stack"] = json!({"unexpected": [1, 2, 3]});
     let fake = Fake::new(vec![page(vec![dto], None)]).await;
+    let client = fake.new_client();
 
-    let result = fake.client.search_album(ALBUM, 1, false).await.unwrap();
+    let result = client.search_album(ALBUM, 1, false).await.unwrap();
 
     assert_eq!(result.items.len(), 1);
     assert!(result.items[0].file_created_at.is_none());
@@ -172,9 +178,10 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
 async fn search_validates_page_numbers_and_continuation_tokens() {
     for next in ["", "1", "3", "02", "+2", "2 ", "18446744073709551616"] {
         let fake = Fake::new(vec![page(vec![], Some(next))]).await;
+        let client = fake.new_client();
 
         assert!(
-            fake.client.search_album(ALBUM, 1, false).await.is_err(),
+            client.search_album(ALBUM, 1, false).await.is_err(),
             "{next}"
         );
 
@@ -182,17 +189,13 @@ async fn search_validates_page_numbers_and_continuation_tokens() {
     }
 
     let fake = Fake::new(vec![page(vec![], Some("0"))]).await;
+    let client = fake.new_client();
 
-    assert!(fake.client.search_album(ALBUM, 0, false).await.is_err());
+    assert!(client.search_album(ALBUM, 0, false).await.is_err());
 
     assert!(fake.requests.lock().unwrap().is_empty());
 
-    assert!(
-        fake.client
-            .search_album(ALBUM, usize::MAX, false)
-            .await
-            .is_err()
-    );
+    assert!(client.search_album(ALBUM, usize::MAX, false).await.is_err());
 
     assert_eq!(fake.requests.lock().unwrap().len(), 1);
 }
@@ -208,14 +211,15 @@ async fn versions_retry_only_failed_checks_and_cache_success() {
         json!({"major": 3, "minor": 1}),
     ] {
         let fake = Fake::new(vec![reply(value), version()]).await;
+        let client = fake.new_client();
 
-        assert!(fake.client.ensure_supported_version().await.is_err());
+        assert!(client.ensure_supported_version().await.is_err());
 
         assert_eq!(fake.requests.lock().unwrap().len(), 1);
 
-        fake.client.ensure_supported_version().await.unwrap();
+        client.ensure_supported_version().await.unwrap();
 
-        fake.client.ensure_supported_version().await.unwrap();
+        client.ensure_supported_version().await.unwrap();
 
         assert_eq!(fake.requests.lock().unwrap().len(), 2);
 
@@ -235,15 +239,16 @@ async fn versions_retry_only_failed_checks_and_cache_success() {
     ])
     .await;
 
-    fake.client.ensure_supported_version().await.unwrap();
+    let client = fake.new_client();
+    client.ensure_supported_version().await.unwrap();
 
-    let error = format!("{:#}", fake.client.albums().await.unwrap_err());
+    let error = format!("{:#}", client.albums().await.unwrap_err());
     assert!(error.contains("403"));
     assert!(!error.contains("private") && !error.contains("http://"));
 
-    fake.client.ensure_supported_version().await.unwrap();
+    client.ensure_supported_version().await.unwrap();
 
-    fake.client.albums().await.unwrap();
+    client.albums().await.unwrap();
     assert_eq!(fake.requests.lock().unwrap().len(), 3);
 }
 
@@ -255,18 +260,20 @@ async fn redirects_are_rejected_at_every_endpoint() {
         let fake = Fake::new(vec![
             Response::builder()
                 .status(StatusCode::FOUND)
-                .header(header::LOCATION, target.client.api_base.as_str())
+                .header(header::LOCATION, target.api_base.as_str())
                 .body(Body::empty())
                 .unwrap(),
         ])
         .await;
 
+        let client = fake.new_client();
+
         let result = match endpoint {
-            0 => fake.client.ensure_supported_version().await,
+            0 => client.ensure_supported_version().await,
 
-            1 => fake.client.albums().await.map(|_| ()),
+            1 => client.albums().await.map(|_| ()),
 
-            _ => fake.client.search_album(ALBUM, 1, false).await.map(|_| ()),
+            _ => client.search_album(ALBUM, 1, false).await.map(|_| ()),
         };
 
         assert!(result.is_err());
@@ -288,7 +295,8 @@ async fn json_bound_is_enforced_before_parsing_with_and_without_content_length()
         };
 
         let fake = Fake::new(vec![Response::new(body)]).await;
-        let error = fake.client.albums().await.unwrap_err().to_string();
+        let client = fake.new_client();
+        let error = client.albums().await.unwrap_err().to_string();
 
         assert!(
             error.contains("JSON response exceeds byte limit"),
@@ -312,7 +320,8 @@ async fn transport_failures_are_sanitized_and_do_not_retry() {
         ])
         .await;
 
-        let error = format!("{:#}", fake.client.albums().await.unwrap_err());
+        let client = fake.new_client();
+        let error = format!("{:#}", client.albums().await.unwrap_err());
         assert!(error.contains(&status.to_string()));
         assert!(!error.contains("private") && !error.contains("http://"));
         assert_eq!(fake.requests.lock().unwrap().len(), 1);
@@ -326,9 +335,10 @@ async fn transport_failures_are_sanitized_and_do_not_retry() {
     ])
     .await;
 
-    let error = format!("{:#}", fake.client.albums().await.unwrap_err());
+    let client = fake.new_client();
+    let error = format!("{:#}", client.albums().await.unwrap_err());
     assert!(!error.contains("private") && !error.contains("http://"));
-    fake.client.albums().await.unwrap();
+    client.albums().await.unwrap();
     assert_eq!(fake.requests.lock().unwrap().len(), 2);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -185,7 +185,7 @@ impl Client {
             .map_err(|_| anyhow!("invalid Immich JSON structure; requires Immich 3.1.0 or newer"))
     }
 
-    /// Cache a successful minimum-version check across client clones.
+    /// Cache a successful minimum-version check for this client instance.
     pub(crate) async fn ensure_supported_version(&self) -> Result<()> {
         self.version_checked
             .get_or_try_init(|| async {

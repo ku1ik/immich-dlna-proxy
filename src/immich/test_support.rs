@@ -22,9 +22,8 @@ pub(crate) struct Received {
 }
 
 pub(crate) struct Fake {
-    pub(crate) client: Client,
     pub(crate) requests: Arc<Mutex<Vec<Received>>>,
-    api_base: Url,
+    pub(super) api_base: Url,
     task: JoinHandle<()>,
 }
 
@@ -67,10 +66,7 @@ impl Fake {
             axum::serve(listener, router).await.unwrap();
         });
 
-        let client = client(api_base.clone());
-
         Self {
-            client,
             requests,
             api_base,
             task,
@@ -78,7 +74,11 @@ impl Fake {
     }
 
     pub(crate) fn new_client(&self) -> Client {
-        client(self.api_base.clone())
+        Client::new(
+            self.api_base.clone(),
+            HeaderValue::from_static("private-test-key"),
+        )
+        .unwrap()
     }
 }
 
@@ -86,10 +86,6 @@ impl Drop for Fake {
     fn drop(&mut self) {
         self.task.abort();
     }
-}
-
-fn client(api_base: Url) -> Client {
-    Client::new(api_base, HeaderValue::from_static("private-test-key")).unwrap()
 }
 
 pub(crate) fn reply(value: Value) -> Response {
