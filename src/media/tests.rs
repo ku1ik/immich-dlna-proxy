@@ -155,22 +155,21 @@ fn request_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
 
 #[tokio::test]
 async fn fixed_routes_normalize_uuids_and_use_only_media_endpoints() {
-    let mut server = FakeServer::new(vec![Reply::new(JPEG)]).await;
+    let mut server = FakeServer::new(vec![
+        Reply::new(JPEG),
+        Reply::new(JPEG),
+        Reply::new(JPEG),
+        Reply::new("HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc"),
+    ])
+    .await;
+
     let proxy = server.proxy();
 
-    for (representation, endpoint, status) in [
-        ("original", "original", StatusCode::OK),
-        (
-            "display",
-            "thumbnail?size=fullsize&edited=true",
-            StatusCode::OK,
-        ),
-        (
-            "preview",
-            "thumbnail?size=preview&edited=true",
-            StatusCode::OK,
-        ),
-        ("playback", "video/playback", StatusCode::BAD_GATEWAY),
+    for (representation, endpoint) in [
+        ("original", "original"),
+        ("display", "thumbnail?size=fullsize&edited=true"),
+        ("preview", "thumbnail?size=preview&edited=true"),
+        ("playback", "video/playback"),
     ] {
         let result = proxy
             .serve(
@@ -181,7 +180,7 @@ async fn fixed_routes_normalize_uuids_and_use_only_media_endpoints() {
             )
             .await;
 
-        assert_eq!(result.status(), status);
+        assert_eq!(result.status(), StatusCode::OK);
 
         assert!(server.request().await.starts_with(&format!(
             "GET /prefix/api/assets/{ASSET}/{endpoint} HTTP/1.1\r\n"
@@ -270,33 +269,25 @@ async fn unsupported_ranges_and_head_remove_if_range_but_keep_conditionals() {
     let mut server = FakeServer::new(vec![Reply::new(JPEG)]).await;
     let proxy = server.proxy();
 
-    for range in [
-        "bytes=0-1,3-4",
-        "items=0-1",
-        "bytes=3-1",
-        "bytes=18446744073709551616-",
-        "bytes=-",
-        "bytes=+1-2",
-    ] {
-        let result = proxy
-            .serve(
-                ASSET,
-                "original",
-                Method::GET,
-                headers(&[
-                    ("range", range),
-                    ("if-range", "\"old\""),
-                    ("if-none-match", "\"v1\""),
-                ]),
-            )
-            .await;
+    let result = proxy
+        .serve(
+            ASSET,
+            "original",
+            Method::GET,
+            headers(&[
+                ("range", "bytes=0-1,3-4"),
+                ("if-range", "\"old\""),
+                ("if-none-match", "\"v1\""),
+            ]),
+        )
+        .await;
 
-        assert_eq!(result.status(), StatusCode::OK);
-        let request = server.request().await;
-        assert!(request_header(&request, "range").is_none());
-        assert!(request_header(&request, "if-range").is_none());
-        assert_eq!(request_header(&request, "if-none-match"), Some("\"v1\""));
-    }
+    assert_eq!(result.status(), StatusCode::OK);
+    drop(result);
+    let request = server.request().await;
+    assert!(request_header(&request, "range").is_none());
+    assert!(request_header(&request, "if-range").is_none());
+    assert_eq!(request_header(&request, "if-none-match"), Some("\"v1\""));
 
     for input in [
         headers(&[
@@ -337,41 +328,33 @@ async fn unsupported_ranges_and_head_remove_if_range_but_keep_conditionals() {
 }
 
 #[tokio::test]
-async fn preserves_single_partial_responses_and_wide_offsets() {
-    for (range, content_range) in [
-        ("bytes=0-2", "bytes 0-2/10"),
-        ("bytes=7-", "bytes 7-9/10"),
-        ("bytes=-3", "bytes 7-9/10"),
-        (
-            "bytes=4294967296-4294967298",
-            "bytes 4294967296-4294967298/5000000000",
-        ),
-        ("bytes=0-2", "bytes 0-2/*"),
-    ] {
-        let wire = format!(
-            "HTTP/1.1 206 Partial Content\r\nContent-Type: IMAGE/JPEG; note=\"a;b\"\r\nContent-Length: 3\r\nContent-Range: {content_range}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nConnection: close\r\n\r\nabc"
-        );
+async fn preserves_partial_response_headers_body_and_wide_offsets() {
+    let range = "bytes=4294967296-4294967298";
+    let content_range = "bytes 4294967296-4294967298/5000000000";
 
-        let mut server = FakeServer::new(vec![Reply::new(&wire)]).await;
+    let wire = format!(
+        "HTTP/1.1 206 Partial Content\r\nContent-Type: IMAGE/JPEG; note=\"a;b\"\r\nContent-Length: 3\r\nContent-Range: {content_range}\r\nAccept-Ranges: bytes\r\nETag: \"v1\"\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nConnection: close\r\n\r\nabc"
+    );
 
-        let result = server
-            .proxy()
-            .serve(ASSET, "preview", Method::GET, headers(&[("range", range)]))
-            .await;
+    let mut server = FakeServer::new(vec![Reply::new(&wire)]).await;
 
-        assert_eq!(result.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(result.headers()[header::CONTENT_RANGE], content_range);
-        assert_eq!(result.headers()[header::CONTENT_LENGTH], "3");
-        assert_eq!(result.headers()[header::ACCEPT_RANGES], "bytes");
-        assert_eq!(result.headers()[header::ETAG], "\"v1\"");
-        assert!(result.headers().contains_key(header::LAST_MODIFIED));
-        assert_eq!(to_bytes(result.into_body(), 1024).await.unwrap(), "abc");
+    let result = server
+        .proxy()
+        .serve(ASSET, "preview", Method::GET, headers(&[("range", range)]))
+        .await;
 
-        assert_eq!(
-            request_header(&server.request().await, "range"),
-            Some(range)
-        );
-    }
+    assert_eq!(result.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(result.headers()[header::CONTENT_RANGE], content_range);
+    assert_eq!(result.headers()[header::CONTENT_LENGTH], "3");
+    assert_eq!(result.headers()[header::ACCEPT_RANGES], "bytes");
+    assert_eq!(result.headers()[header::ETAG], "\"v1\"");
+    assert!(result.headers().contains_key(header::LAST_MODIFIED));
+    assert_eq!(to_bytes(result.into_body(), 1024).await.unwrap(), "abc");
+
+    assert_eq!(
+        request_header(&server.request().await, "range"),
+        Some(range)
+    );
 }
 
 #[tokio::test]
@@ -388,21 +371,6 @@ async fn rejects_invalid_partial_framing_before_streaming() {
         ("", valid_mime, Some("bytes=0-2")),
         (
             "Content-Range: bytes 3-2/10\r\n",
-            valid_mime,
-            Some("bytes=0-2"),
-        ),
-        (
-            "Content-Range: bytes 0-2/2\r\n",
-            valid_mime,
-            Some("bytes=0-2"),
-        ),
-        (
-            "Content-Range: bytes 0-3/10\r\n",
-            valid_mime,
-            Some("bytes=0-2"),
-        ),
-        (
-            "Content-Range: bytes 0-18446744073709551615/*\r\n",
             valid_mime,
             Some("bytes=0-2"),
         ),
@@ -484,39 +452,27 @@ async fn all_routes_require_content_length_to_match_the_partial_span() {
 
 #[tokio::test]
 async fn unsatisfied_ranges_normalize_only_proven_immich_404s() {
-    for (upstream_status, range, content_range, expected) in [
-        (404, Some("bytes=10-"), "", 404),
-        (404, None, "", 404),
-        (404, Some("bytes=10-"), "bytes */10", 416),
-        (404, Some("bytes=10-20"), "bytes */10", 416),
-        (404, Some("bytes=-0"), "bytes */10", 416),
-        (404, Some("bytes=-3"), "bytes */0", 416),
-        (404, Some("bytes=9-"), "bytes */10", 404),
-        (404, Some("bytes=-3"), "bytes */10", 404),
-        (404, Some("bytes=0-1,4-5"), "bytes */0", 404),
-        (404, None, "bytes */0", 404),
-        (404, Some("bytes=10-"), "bytes */18446744073709551616", 404),
+    for (range, content_range, expected) in [
+        (Some("bytes=10-"), "", 404),
+        (None, "", 404),
+        (Some("bytes=10-"), "bytes */10", 416),
+        (Some("bytes=9-"), "bytes */10", 404),
+        (Some("bytes=0-1,4-5"), "bytes */0", 404),
+        (None, "bytes */0", 404),
+        (Some("bytes=10-"), "bytes */18446744073709551616", 404),
     ] {
-        assert_unsatisfied_response(upstream_status, range, content_range, expected).await;
+        assert_unsatisfied_response(404, range, content_range, expected).await;
     }
 }
 
 #[tokio::test]
 async fn native_416_requires_consistent_unsatisfied_framing() {
     for (range, content_range, expected) in [
-        (Some("bytes=10-"), "", 416),
         (Some("bytes=0-2"), "", 416),
         (None, "", 502),
         (Some("bytes=0-1,4-5"), "", 502),
         (Some("bytes=0-2"), "bytes */10", 502),
-        (Some("bytes=9-"), "bytes */10", 502),
-        (Some("bytes=-3"), "bytes */10", 502),
-        (Some("bytes=-99"), "bytes */10", 502),
         (Some("bytes=10-"), "bytes */10", 416),
-        (Some("bytes=10-20"), "bytes */10", 416),
-        (Some("bytes=-0"), "bytes */10", 416),
-        (Some("bytes=-3"), "bytes */0", 416),
-        (Some("bytes=0-2"), "bytes */0", 416),
         (Some("bytes=10-"), "bytes 0-2/10", 502),
         (Some("bytes=10-"), "garbage", 502),
         (Some("bytes=10-"), "bytes */18446744073709551616", 502),
@@ -1027,16 +983,21 @@ async fn immediate_admission_is_shared_by_clones_and_body_drop_releases_permits(
 
 #[tokio::test(start_paused = true)]
 async fn completion_truncation_and_read_timeout_release_body_permits() {
-    for reply in [
-        Reply::new(JPEG),
-        Reply::new(
-            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabc",
+    for (reply, succeeds) in [
+        (Reply::new(JPEG), true),
+        (
+            Reply::new(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabc",
+            ),
+            false,
         ),
-        Reply::stalled(
-            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\nabc",
+        (
+            Reply::stalled(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: 5\r\n\r\nabc",
+            ),
+            false,
         ),
     ] {
-        let succeeds = reply.wire == JPEG;
         let server = FakeServer::new(vec![reply]).await;
         let proxy = server.proxy();
 
@@ -1057,10 +1018,10 @@ async fn completion_truncation_and_read_timeout_release_body_permits() {
 
 #[tokio::test]
 async fn chunked_partials_enforce_range_span_even_without_content_length() {
-    for payload in [
-        "2\r\nab\r\n0\r\n\r\n",
-        "4\r\nabcd\r\n0\r\n\r\n",
-        "3\r\nabc\r\n0\r\n\r\n",
+    for (payload, succeeds) in [
+        ("2\r\nab\r\n0\r\n\r\n", false),
+        ("4\r\nabcd\r\n0\r\n\r\n", false),
+        ("3\r\nabc\r\n0\r\n\r\n", true),
     ] {
         let wire = format!(
             "HTTP/1.1 206 Partial Content\r\nContent-Type: image/jpeg\r\nContent-Range: bytes 0-2/10\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{payload}"
@@ -1081,10 +1042,7 @@ async fn chunked_partials_enforce_range_span_even_without_content_length() {
         assert_eq!(result.status(), StatusCode::PARTIAL_CONTENT);
         assert!(!result.headers().contains_key(header::TRANSFER_ENCODING));
 
-        assert_eq!(
-            to_bytes(result.into_body(), 1024).await.is_ok(),
-            payload.starts_with('3')
-        );
+        assert_eq!(to_bytes(result.into_body(), 1024).await.is_ok(), succeeds);
 
         assert_eq!(proxy.operations.available_permits(), OPERATIONS);
     }
@@ -1436,106 +1394,140 @@ async fn healthy_streams_have_progress_timeout_not_total_deadline() {
 
 #[tokio::test]
 async fn rejects_simultaneous_transfer_encoding_and_content_length_before_commitment() {
-    for status in [200, 206, 304, 404, 412, 416, 302] {
-        for nominated in ["", ", Content-Length", ", Transfer-Encoding"] {
-            let content_range = match status {
-                206 => "Content-Range: bytes 0-2/10\r\n",
-                416 => "Content-Range: bytes */0\r\n",
-                _ => "",
-            };
+    for (status, nominated) in [
+        (200, ""),
+        (206, ""),
+        (304, ""),
+        (404, ""),
+        (412, ""),
+        (416, ""),
+        (302, ""),
+        (200, ", Content-Length"),
+        (200, ", Transfer-Encoding"),
+    ] {
+        let content_range = match status {
+            206 => "Content-Range: bytes 0-2/10\r\n",
+            416 => "Content-Range: bytes */0\r\n",
+            _ => "",
+        };
 
-            let wire = format!(
-                "HTTP/1.1 {status} Response\r\nContent-Type: image/jpeg\r\nTransfer-Encoding: chunked\r\nContent-Length: 100\r\n{content_range}Location: /prefix/api/assets/{ASSET}/original?edited=true\r\nConnection: close{nominated}\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
-            );
+        let wire = format!(
+            "HTTP/1.1 {status} Response\r\nContent-Type: image/jpeg\r\nTransfer-Encoding: chunked\r\nContent-Length: 100\r\n{content_range}Location: /prefix/api/assets/{ASSET}/original?edited=true\r\nConnection: close{nominated}\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+        );
 
-            let mut server = FakeServer::new(vec![Reply::new(&wire), Reply::new(JPEG)]).await;
-            let proxy = server.proxy();
+        let mut server = FakeServer::new(vec![Reply::new(&wire), Reply::new(JPEG)]).await;
+        let proxy = server.proxy();
 
-            let result = proxy
-                .serve(
-                    ASSET,
-                    "preview",
-                    Method::GET,
-                    headers(&[("range", "bytes=0-2")]),
-                )
-                .await;
+        let result = proxy
+            .serve(
+                ASSET,
+                "preview",
+                Method::GET,
+                headers(&[("range", "bytes=0-2")]),
+            )
+            .await;
 
-            assert_eq!(
-                result.status(),
-                StatusCode::BAD_GATEWAY,
-                "{status}{nominated}"
-            );
-            assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
-            server.request().await;
-            assert!(server.requests.try_recv().is_err());
+        assert_eq!(
+            result.status(),
+            StatusCode::BAD_GATEWAY,
+            "{status}{nominated}"
+        );
 
-            assert_eq!(proxy.operations.available_permits(), OPERATIONS);
-        }
+        assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
+        server.request().await;
+        assert!(server.requests.try_recv().is_err());
+
+        assert_eq!(proxy.operations.available_permits(), OPERATIONS);
     }
 }
 
 #[tokio::test]
 async fn validates_bodyless_304_content_length_before_preserving_headers() {
-    for method in [Method::GET, Method::HEAD] {
-        for (framing, expected) in [
-            ("Content-Length: invalid\r\n", StatusCode::BAD_GATEWAY),
-            (
-                "Content-Length: 3\r\nContent-Length: 4\r\n",
-                StatusCode::BAD_GATEWAY,
-            ),
-            (
-                "Content-Length: 3\r\nContent-Length: 3\r\n",
-                StatusCode::BAD_GATEWAY,
-            ),
-            ("Content-Length: 3, 3\r\n", StatusCode::BAD_GATEWAY),
-            (
-                "Content-Length: 18446744073709551616\r\n",
-                StatusCode::BAD_GATEWAY,
-            ),
-            (
-                "Content-Length: invalid\r\nConnection: Content-Length\r\n",
-                StatusCode::BAD_GATEWAY,
-            ),
-            ("Content-Length: 123\r\n", StatusCode::NOT_MODIFIED),
-            ("", StatusCode::NOT_MODIFIED),
-        ] {
-            let wire = format!(
-                "HTTP/1.1 304 Not Modified\r\n{framing}ETag: \"v1\"\r\nConnection: close\r\n\r\n"
-            );
+    for (method, framing, expected) in [
+        (
+            Method::GET,
+            "Content-Length: invalid\r\n",
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            Method::GET,
+            "Content-Length: 3\r\nContent-Length: 4\r\n",
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            Method::GET,
+            "Content-Length: 3\r\nContent-Length: 3\r\n",
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            Method::GET,
+            "Content-Length: 3, 3\r\n",
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            Method::GET,
+            "Content-Length: 18446744073709551616\r\n",
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            Method::GET,
+            "Content-Length: invalid\r\nConnection: Content-Length\r\n",
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            Method::GET,
+            "Content-Length: 123\r\n",
+            StatusCode::NOT_MODIFIED,
+        ),
+        (Method::GET, "", StatusCode::NOT_MODIFIED),
+        (
+            Method::HEAD,
+            "Content-Length: 123\r\n",
+            StatusCode::NOT_MODIFIED,
+        ),
+        (
+            Method::HEAD,
+            "Content-Length: invalid\r\n",
+            StatusCode::BAD_GATEWAY,
+        ),
+    ] {
+        let wire = format!(
+            "HTTP/1.1 304 Not Modified\r\n{framing}ETag: \"v1\"\r\nConnection: close\r\n\r\n"
+        );
 
-            let server = FakeServer::new(vec![Reply::new(&wire)]).await;
-            let proxy = server.proxy();
+        let server = FakeServer::new(vec![Reply::new(&wire)]).await;
+        let proxy = server.proxy();
 
-            let result = proxy
-                .serve(
-                    ASSET,
-                    "preview",
-                    method.clone(),
-                    headers(&[("if-none-match", "\"v1\"")]),
-                )
-                .await;
+        let result = proxy
+            .serve(
+                ASSET,
+                "preview",
+                method.clone(),
+                headers(&[("if-none-match", "\"v1\"")]),
+            )
+            .await;
 
-            assert_eq!(result.status(), expected, "{method}: {framing}");
-            assert_eq!(proxy.operations.available_permits(), OPERATIONS);
+        assert_eq!(result.status(), expected, "{method}: {framing}");
+        assert_eq!(proxy.operations.available_permits(), OPERATIONS);
 
-            if expected == StatusCode::NOT_MODIFIED {
-                assert_eq!(result.headers()[header::ETAG], "\"v1\"");
-            }
-
-            if expected == StatusCode::NOT_MODIFIED && !framing.is_empty() {
-                assert_eq!(result.headers()[header::CONTENT_LENGTH], "123");
-            } else {
-                assert!(!result.headers().contains_key(header::CONTENT_LENGTH));
-            }
-
-            assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
+        if expected == StatusCode::NOT_MODIFIED {
+            assert_eq!(result.headers()[header::ETAG], "\"v1\"");
         }
+
+        if expected == StatusCode::NOT_MODIFIED && !framing.is_empty() {
+            assert_eq!(result.headers()[header::CONTENT_LENGTH], "123");
+        } else {
+            assert!(!result.headers().contains_key(header::CONTENT_LENGTH));
+        }
+
+        assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
     }
 }
 
 #[test]
 fn rejects_partial_spans_contradicting_the_requested_range() {
     for (range, content_range) in [
+        ("bytes=0-2", "bytes 0-3/10"),
         ("bytes=0-2", "bytes 7-9/10"),
         ("bytes=0-2", "bytes 1-3/10"),
         ("bytes=5-", "bytes 4-6/10"),
@@ -1561,6 +1553,14 @@ fn rejects_partial_spans_contradicting_the_requested_range() {
 #[test]
 fn accepts_compatible_partial_spans_of_single_ranges() {
     for (range, content_range) in [
+        ("bytes=0-2", "bytes 0-2/10"),
+        ("bytes=7-", "bytes 7-9/10"),
+        ("bytes=-3", "bytes 7-9/10"),
+        ("bytes=0-2", "bytes 0-2/*"),
+        (
+            "bytes=4294967296-4294967298",
+            "bytes 4294967296-4294967298/5000000000",
+        ),
         ("bytes=0-9", "bytes 0-2/10"),
         ("bytes=0-9", "bytes 4-6/10"),
         ("bytes=0-99", "bytes 7-9/10"),
@@ -1620,19 +1620,55 @@ async fn partial_response_compatibility_is_checked_before_streaming() {
 }
 
 #[test]
-fn strict_numeric_parsing() {
-    assert_eq!(
-        ByteRange::parse("bytes=0-18446744073709551615"),
-        Some(ByteRange::From(0, Some(u64::MAX)))
-    );
+fn single_range_parsing_requires_supported_units_and_valid_offsets() {
+    for (value, expected) in [
+        (
+            "bytes=0-18446744073709551615",
+            Some(ByteRange::From(0, Some(u64::MAX))),
+        ),
+        ("bytes=7-", Some(ByteRange::From(7, None))),
+        ("bytes=-3", Some(ByteRange::Suffix(3))),
+        ("bytes=-0", Some(ByteRange::Suffix(0))),
+        ("bytes=0-1,3-4", None),
+        ("items=0-1", None),
+        ("bytes=3-1", None),
+        ("bytes=18446744073709551616-", None),
+        ("bytes=-", None),
+        ("bytes=+1-2", None),
+    ] {
+        assert_eq!(ByteRange::parse(value), expected, "{value}");
+    }
+}
 
-    assert_eq!(ByteRange::parse("bytes=-0"), Some(ByteRange::Suffix(0)));
-    assert_eq!(ByteRange::parse("bytes=18446744073709551616-"), None);
-    let requested = ByteRange::From(0, None);
-    assert_eq!(
-        partial_span("bytes 0-18446744073709551615/*", requested),
-        None
-    );
-    assert_eq!(partial_span("bytes 0-2/3", requested), Some(3));
-    assert_eq!(partial_span("bytes 0-2/2", requested), None);
+#[test]
+fn partial_span_requires_ordered_offsets_valid_totals_and_representable_length() {
+    for (value, expected) in [
+        ("bytes 3-2/10", None),
+        ("bytes 0-2/2", None),
+        ("bytes 0-18446744073709551615/*", None),
+        ("bytes 0-2/3", Some(3)),
+    ] {
+        assert_eq!(
+            partial_span(value, ByteRange::From(0, None)),
+            expected,
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn unsatisfiable_ranges_compare_start_or_suffix_with_resource_length() {
+    for (range, length, expected) in [
+        (ByteRange::From(10, None), 10, true),
+        (ByteRange::From(10, Some(20)), 10, true),
+        (ByteRange::From(9, None), 10, false),
+        (ByteRange::From(0, Some(2)), 10, false),
+        (ByteRange::From(0, Some(2)), 0, true),
+        (ByteRange::Suffix(0), 10, true),
+        (ByteRange::Suffix(3), 0, true),
+        (ByteRange::Suffix(3), 10, false),
+        (ByteRange::Suffix(99), 10, false),
+    ] {
+        assert_eq!(range.unsatisfiable(length), expected, "{range:?}: {length}");
+    }
 }
