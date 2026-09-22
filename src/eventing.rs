@@ -115,96 +115,7 @@ impl Subscriptions {
         method: &Method,
         headers: &HeaderMap,
     ) -> Response {
-        let result = (|| {
-            if !matches!(method.as_str(), "SUBSCRIBE" | "UNSUBSCRIBE") {
-                return Err(StatusCode::METHOD_NOT_ALLOWED);
-            }
-
-            let sid = single_header(headers, "sid")?;
-            let nt = single_header(headers, "nt")?;
-            let callback = single_header(headers, "callback")?;
-            let timeout = single_header(headers, "timeout")?;
-
-            if (sid.is_some() && (nt.is_some() || callback.is_some()))
-                || (method.as_str() == "UNSUBSCRIBE"
-                    && (sid.is_none() || nt.is_some() || callback.is_some()))
-            {
-                return Err(StatusCode::BAD_REQUEST);
-            }
-
-            let lease = lease(timeout)?;
-
-            if let Some(sid) = sid {
-                let sid = sid
-                    .strip_prefix("uuid:")
-                    .filter(|value| value.len() == 36)
-                    .and_then(|value| Uuid::parse_str(value).ok())
-                    .ok_or(StatusCode::PRECONDITION_FAILED)?;
-
-                let mut state = self.state.lock().unwrap();
-                let now = Instant::now();
-                state.expire(now);
-
-                let entry = state
-                    .entries
-                    .iter_mut()
-                    .find(|entry| {
-                        entry.sid == sid
-                            && entry.service == service
-                            && entry.peer == peer
-                            && entry.expires.is_some()
-                    })
-                    .ok_or(StatusCode::PRECONDITION_FAILED)?;
-
-                if method.as_str() == "UNSUBSCRIBE" {
-                    entry.expires = None;
-                } else {
-                    entry.lease = lease;
-                    entry.expires = Some(now + lease);
-                }
-
-                let granted = entry.lease;
-                state.expire(now);
-
-                return Ok((sid, granted));
-            }
-
-            if nt != Some("upnp:event") {
-                return Err(StatusCode::PRECONDITION_FAILED);
-            }
-
-            let callbacks = callbacks(callback.ok_or(StatusCode::PRECONDITION_FAILED)?, peer)
-                .ok_or(StatusCode::PRECONDITION_FAILED)?;
-
-            let mut state = self.state.lock().unwrap();
-            let now = Instant::now();
-            state.expire(now);
-
-            if state.entries.len() >= SUBSCRIPTIONS {
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
-            }
-
-            let sid = Uuid::new_v4();
-            let initial_update_id = Some(state.system_update_id);
-
-            // Registration and publication share this lock; older changes are not replayed.
-            state.entries.push(Subscription {
-                sid,
-                service,
-                peer,
-                callbacks,
-                lease,
-                expires: Some(now + lease),
-                initial_update_id,
-                pending: None,
-                delivering: false,
-                next_seq: 0,
-                next_attempt: now,
-            });
-
-            Ok((sid, lease))
-        })();
-
+        let result = self.apply_request(service, peer, method, headers);
         let mut response = Response::builder().header(header::CONTENT_LENGTH, "0");
 
         match result {
@@ -244,6 +155,102 @@ impl Subscriptions {
         );
 
         response
+    }
+
+    fn apply_request(
+        &self,
+        service: Service,
+        peer: Ipv4Addr,
+        method: &Method,
+        headers: &HeaderMap,
+    ) -> Result<(Uuid, Duration), StatusCode> {
+        if !matches!(method.as_str(), "SUBSCRIBE" | "UNSUBSCRIBE") {
+            return Err(StatusCode::METHOD_NOT_ALLOWED);
+        }
+
+        let sid = single_header(headers, "sid")?;
+        let nt = single_header(headers, "nt")?;
+        let callback = single_header(headers, "callback")?;
+        let timeout = single_header(headers, "timeout")?;
+
+        if (sid.is_some() && (nt.is_some() || callback.is_some()))
+            || (method.as_str() == "UNSUBSCRIBE"
+                && (sid.is_none() || nt.is_some() || callback.is_some()))
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        let lease = lease(timeout)?;
+
+        if let Some(sid) = sid {
+            let sid = sid
+                .strip_prefix("uuid:")
+                .filter(|value| value.len() == 36)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or(StatusCode::PRECONDITION_FAILED)?;
+
+            let mut state = self.state.lock().unwrap();
+            let now = Instant::now();
+            state.expire(now);
+
+            let entry = state
+                .entries
+                .iter_mut()
+                .find(|entry| {
+                    entry.sid == sid
+                        && entry.service == service
+                        && entry.peer == peer
+                        && entry.expires.is_some()
+                })
+                .ok_or(StatusCode::PRECONDITION_FAILED)?;
+
+            if method.as_str() == "UNSUBSCRIBE" {
+                entry.expires = None;
+            } else {
+                entry.lease = lease;
+                entry.expires = Some(now + lease);
+            }
+
+            let granted = entry.lease;
+            state.expire(now);
+
+            return Ok((sid, granted));
+        }
+
+        if nt != Some("upnp:event") {
+            return Err(StatusCode::PRECONDITION_FAILED);
+        }
+
+        let callbacks = callbacks(callback.ok_or(StatusCode::PRECONDITION_FAILED)?, peer)
+            .ok_or(StatusCode::PRECONDITION_FAILED)?;
+
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        state.expire(now);
+
+        if state.entries.len() >= SUBSCRIPTIONS {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        let sid = Uuid::new_v4();
+        let initial_update_id = Some(state.system_update_id);
+
+        // Registration and publication share this lock; older changes are not replayed.
+        state.entries.push(Subscription {
+            sid,
+            service,
+            peer,
+            callbacks,
+            lease,
+            expires: Some(now + lease),
+            initial_update_id,
+            pending: None,
+            delivering: false,
+            next_seq: 0,
+            next_attempt: now,
+        });
+
+        Ok((sid, lease))
     }
 
     /// Runs the single bounded delivery scheduler. No catalog polling occurs.
