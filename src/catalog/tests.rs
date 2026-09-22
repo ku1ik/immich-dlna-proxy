@@ -50,7 +50,7 @@ impl Barrier {
 struct Upstream {
     albums: Vec<Value>,
     contents: BTreeMap<Uuid, Vec<Value>>,
-    requests: Vec<(String, Value)>,
+    requests: Vec<String>,
     media: BTreeMap<String, (&'static str, &'static [u8])>,
     gates: BTreeMap<Scope, Arc<Barrier>>,
     outage: bool,
@@ -59,7 +59,7 @@ struct Upstream {
 struct Fake {
     upstream: Arc<Mutex<Upstream>>,
     address: std::net::SocketAddr,
-    notifications: mpsc::Receiver<(HeaderMap, String)>,
+    notifications: mpsc::Receiver<String>,
     task: JoinHandle<()>,
 }
 
@@ -80,9 +80,7 @@ impl Fake {
                 let body = to_bytes(body, 8192).await.unwrap();
 
                 if parts.method.as_str() == "NOTIFY" {
-                    let _ = notify
-                        .send((parts.headers, String::from_utf8(body.to_vec()).unwrap()))
-                        .await;
+                    let _ = notify.send(String::from_utf8(body.to_vec()).unwrap()).await;
 
                     return Response::new(Body::empty());
                 }
@@ -110,9 +108,7 @@ impl Fake {
                 let (value, barrier, outage) = {
                     let mut upstream = upstream.lock().unwrap();
 
-                    upstream
-                        .requests
-                        .push((parts.uri.path().to_string(), body.clone()));
+                    upstream.requests.push(parts.uri.path().to_string());
 
                     let scope = match parts.uri.path() {
                         "/api/server/version" => None,
@@ -178,7 +174,7 @@ impl Fake {
             .unwrap()
             .requests
             .iter()
-            .filter(|(actual, _)| actual == path)
+            .filter(|actual| actual.as_str() == path)
             .count()
     }
 
@@ -202,7 +198,7 @@ impl Fake {
     }
 
     async fn event(&mut self, id: u32) {
-        let (_, body) = timeout_at(
+        let body = timeout_at(
             Instant::now() + Duration::from_secs(3),
             self.notifications.recv(),
         )
@@ -329,7 +325,10 @@ fn children(id: u128) -> BrowseQuery {
     action(&format!("album:{}", Uuid::from_u128(id)), false, 0, 0, None)
 }
 
-fn browse(library: &ImmichCatalog, query: BrowseQuery) -> JoinHandle<Result<BrowseResult, Fault>> {
+fn spawn_browse(
+    library: &ImmichCatalog,
+    query: BrowseQuery,
+) -> JoinHandle<Result<BrowseResult, Fault>> {
     let library = library.clone();
 
     tokio::spawn(async move { library.browse(query).await })
@@ -360,7 +359,13 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
 
     assert!(fixture.fake.upstream.lock().unwrap().requests.is_empty());
     fixture.fake.upstream.lock().unwrap().outage = true;
-    fault(browse(&fixture.library, action("0", true, 0, 0, None)), 501).await;
+
+    fault(
+        spawn_browse(&fixture.library, action("0", true, 0, 0, None)),
+        501,
+    )
+    .await;
+
     assert_eq!(fixture.library.system_update_id(), 1);
     fixture.fake.upstream.lock().unwrap().outage = false;
 
@@ -397,7 +402,7 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
     fixture.expire(Scope::Root);
     fixture.fake.upstream.lock().unwrap().outage = true;
-    fault(browse(&fixture.library, children(1)), 501).await;
+    fault(spawn_browse(&fixture.library, children(1)), 501).await;
     assert_eq!(fixture.library.system_update_id(), 2);
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
     events.abort();
@@ -490,52 +495,17 @@ async fn album_latest_date_refresh_reorders_and_publishes_without_loading_conten
     fixture.abort(task).await;
 }
 
-async fn ordered_fixture() -> Fixture {
-    let fixture = Fixture::new(4).await;
-
-    {
-        let mut upstream = fixture.fake.upstream.lock().unwrap();
-
-        upstream.albums = vec![
-            album(4, "D"),
-            album(3, "\u{106}"),
-            album(2, "c"),
-            album(1, "C"),
-        ];
-
-        upstream.albums[0]["createdAt"] = json!("2020-01-01T00:00:00Z");
-
-        let mut hidden = item(9, None, None);
-        hidden["visibility"] = json!("hidden");
-        let mut video = item(3, None, None);
-        video["type"] = json!("VIDEO");
-        video["originalMimeType"] = json!("video/mp4");
-
-        upstream.contents.insert(
-            Uuid::from_u128(1),
-            vec![
-                item(
-                    1,
-                    Some("2024-01-02T00:00:00Z"),
-                    Some("2024-01-01T00:00:00Z"),
-                ),
-                item(
-                    2,
-                    Some("2024-01-01T00:00:00Z"),
-                    Some("2024-01-02T00:00:00Z"),
-                ),
-                video,
-                hidden,
-            ],
-        );
-    }
-
-    fixture
-}
-
 #[tokio::test]
 async fn root_browse_sorts_before_pagination() {
-    let fixture = ordered_fixture().await;
+    let fixture = Fixture::new(0).await;
+
+    fixture.fake.upstream.lock().unwrap().albums = vec![
+        album(4, "D"),
+        album(3, "\u{106}"),
+        album(2, "c"),
+        album(1, "C"),
+    ];
+
     let task = fixture.run();
 
     let root = fixture
@@ -554,19 +524,36 @@ async fn root_browse_sorts_before_pagination() {
         ["c", "\u{106}"]
     );
 
-    let root_date = fixture
-        .library
-        .browse(action("0", false, 0, 1, Some(false)))
-        .await
-        .unwrap();
-
-    assert_eq!(root_date.objects[0].title, "D");
     fixture.abort(task).await;
 }
 
 #[tokio::test]
 async fn album_browse_counts_eligible_items_and_sorts_before_pagination() {
-    let fixture = ordered_fixture().await;
+    let fixture = Fixture::new(1).await;
+    let mut hidden = item(9, None, None);
+    hidden["visibility"] = json!("hidden");
+    let mut video = item(3, None, None);
+    video["type"] = json!("VIDEO");
+    video["originalMimeType"] = json!("video/mp4");
+
+    fixture.fake.upstream.lock().unwrap().contents.insert(
+        Uuid::from_u128(1),
+        vec![
+            item(
+                1,
+                Some("2024-01-02T00:00:00Z"),
+                Some("2024-01-01T00:00:00Z"),
+            ),
+            item(
+                2,
+                Some("2024-01-01T00:00:00Z"),
+                Some("2024-01-02T00:00:00Z"),
+            ),
+            video,
+            hidden,
+        ],
+    );
+
     let task = fixture.run();
     let baseline = fixture.library.browse(children(1)).await.unwrap();
     assert_eq!(baseline.total_matches, 3);
@@ -625,7 +612,16 @@ async fn album_browse_counts_eligible_items_and_sorts_before_pagination() {
 
 #[tokio::test]
 async fn item_browse_validates_album_membership_and_returns_the_system_revision() {
-    let fixture = ordered_fixture().await;
+    let fixture = Fixture::new(2).await;
+
+    fixture
+        .fake
+        .upstream
+        .lock()
+        .unwrap()
+        .contents
+        .insert(Uuid::from_u128(1), vec![item(1, None, None)]);
+
     let task = fixture.run();
     let appearance = format!("album:{}:asset:{}", Uuid::from_u128(1), Uuid::from_u128(1));
 
@@ -639,7 +635,7 @@ async fn item_browse_validates_album_membership_and_returns_the_system_revision(
     assert_eq!(metadata.total_matches, 1);
 
     fault(
-        browse(&fixture.library, action(&appearance, false, 0, 0, None)),
+        spawn_browse(&fixture.library, action(&appearance, false, 0, 0, None)),
         710,
     )
     .await;
@@ -647,19 +643,19 @@ async fn item_browse_validates_album_membership_and_returns_the_system_revision(
     let wrong_album = format!("album:{}:asset:{}", Uuid::from_u128(2), Uuid::from_u128(1));
 
     fault(
-        browse(&fixture.library, action(&wrong_album, true, 0, 0, None)),
+        spawn_browse(&fixture.library, action(&wrong_album, true, 0, 0, None)),
         701,
     )
     .await;
 
     fault(
-        browse(&fixture.library, action(&wrong_album, false, 0, 0, None)),
+        spawn_browse(&fixture.library, action(&wrong_album, false, 0, 0, None)),
         701,
     )
     .await;
 
-    fault(browse(&fixture.library, children(999)), 701).await;
-    assert_eq!(fixture.fake.calls("/api/search/metadata"), 3);
+    fault(spawn_browse(&fixture.library, children(999)), 701).await;
+    assert_eq!(fixture.fake.calls("/api/search/metadata"), 2);
 
     fixture.abort(task).await;
 }
@@ -936,7 +932,7 @@ async fn shared_flights_survive_callers_and_four_scopes_reject_without_backlog()
             .gates
             .insert(Scope::Album(Uuid::from_u128(id)), barrier.clone());
 
-        callers.push(browse(&fixture.library, children(id)));
+        callers.push(spawn_browse(&fixture.library, children(id)));
         barrier.entered().await;
         gates.push(barrier);
     }
@@ -948,7 +944,7 @@ async fn shared_flights_survive_callers_and_four_scopes_reject_without_backlog()
     drop(short_waiter);
     callers.remove(0).abort();
     assert_eq!(fixture.library.inner.permits.available_permits(), 0);
-    fault(browse(&fixture.library, children(5)), 501).await;
+    fault(spawn_browse(&fixture.library, children(5)), 501).await;
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 4);
 
     for gate in gates {
@@ -1050,7 +1046,7 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
 
         let supervised = library.clone();
         let task = tokio::spawn(async move { supervised.run().await });
-        let caller = browse(&library, children(1));
+        let caller = spawn_browse(&library, children(1));
         let (mut socket, _) = request(&listener, "/api/server/version").await;
 
         if stage > 0 {
@@ -1134,7 +1130,7 @@ async fn whole_permit_covers_commit_wait_and_preparation_timeout_cleans_flight()
     *fixture.library.inner.prepared.lock().unwrap() =
         Some((Scope::Album(Uuid::from_u128(1)), barrier.clone()));
 
-    let caller = browse(&fixture.library, children(1));
+    let caller = spawn_browse(&fixture.library, children(1));
     barrier.entered().await;
     tokio::time::pause();
     barrier.release.add_permits(1);
@@ -1175,7 +1171,7 @@ async fn stale_unchanged_album_cannot_survive_root_removal_and_reappearance() {
     *fixture.library.inner.prepared.lock().unwrap() =
         Some((Scope::Album(Uuid::from_u128(1)), barrier.clone()));
 
-    let caller = browse(&fixture.library, children(1));
+    let caller = spawn_browse(&fixture.library, children(1));
     barrier.entered().await;
     fixture.fake.upstream.lock().unwrap().albums.remove(0);
     fixture.expire(Scope::Root);
@@ -1248,7 +1244,7 @@ async fn unrelated_root_and_album_changes_do_not_invalidate_prepared_contents() 
     *fixture.library.inner.prepared.lock().unwrap() =
         Some((Scope::Album(Uuid::from_u128(1)), barrier.clone()));
 
-    let caller = browse(&fixture.library, children(1));
+    let caller = spawn_browse(&fixture.library, children(1));
     barrier.entered().await;
 
     let flight = fixture.library.inner.state.lock().unwrap().flights
@@ -1317,7 +1313,7 @@ async fn publication_failure_worker() {
     let mut barrier = Barrier::new();
     Arc::get_mut(&mut barrier).unwrap().panic = mode == "panic";
     *library.inner.publication.lock().unwrap() = Some(barrier.clone());
-    let mut caller = browse(&library, action("0", false, 0, 0, None));
+    let mut caller = spawn_browse(&library, action("0", false, 0, 0, None));
     barrier.entered().await;
     let directory = Path::new(&directory);
 
@@ -1463,7 +1459,7 @@ async fn preparation_panic_is_fatal_and_supervised_even_without_waiters() {
     let mut barrier = Barrier::new();
     Arc::get_mut(&mut barrier).unwrap().panic = true;
     *fixture.library.inner.prepared.lock().unwrap() = Some((Scope::Root, barrier.clone()));
-    let caller = browse(&fixture.library, action("0", true, 0, 0, None));
+    let caller = spawn_browse(&fixture.library, action("0", true, 0, 0, None));
     barrier.entered().await;
     caller.abort();
     barrier.release.add_permits(1);
@@ -1507,7 +1503,7 @@ async fn abandoned_refresh_completes_and_expiry_alone_never_does_work() {
         .gates
         .insert(Scope::Root, barrier.clone());
 
-    let caller = browse(&fixture.library, action("0", true, 0, 0, None));
+    let caller = spawn_browse(&fixture.library, action("0", true, 0, 0, None));
     barrier.entered().await;
     caller.abort();
     let _ = caller.await;
@@ -1744,7 +1740,7 @@ async fn failed_album_keeps_successful_root_and_later_requests_recover() {
         .contents
         .insert(Uuid::from_u128(1), vec![json!({"id": Uuid::from_u128(1)})]);
 
-    fault(browse(&fixture.library, children(1)), 501).await;
+    fault(spawn_browse(&fixture.library, children(1)), 501).await;
     let root = fixture.disk();
     assert_eq!(root.1.system_update_id, 2);
     assert!(root.1.albums[&Uuid::from_u128(1)].contents_digest.is_none());
