@@ -174,6 +174,51 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
     assert_eq!(fake.requests.lock().unwrap().len(), 1);
 }
 
+#[test]
+fn optional_dates_preserve_strings_and_ignore_other_json_values() {
+    for (value, expected) in [
+        (None, None),
+        (Some(Value::Null), None),
+        (Some(json!(123)), None),
+        (Some(json!(false)), None),
+        (Some(json!({"date": []})), None),
+        (Some(json!([])), None),
+        (
+            Some(json!("2024-01-01T00:30:00+02:00")),
+            Some("2024-01-01T00:30:00+02:00"),
+        ),
+        (Some(json!("not a date")), Some("not a date")),
+    ] {
+        let mut raw_album = album(ALBUM);
+        let mut raw_asset = asset(1, "IMAGE");
+
+        for (dto, fields) in [
+            (&mut raw_album, ["createdAt", "endDate"]),
+            (&mut raw_asset, ["fileCreatedAt", "localDateTime"]),
+        ] {
+            for field in fields {
+                if let Some(value) = &value {
+                    dto[field] = value.clone();
+                } else {
+                    dto.as_object_mut().unwrap().remove(field);
+                }
+            }
+        }
+
+        let album: Album = serde_json::from_value(raw_album).unwrap();
+        let asset: Asset = serde_json::from_value(raw_asset).unwrap();
+
+        for (field, date) in [
+            ("createdAt", album.created_at),
+            ("endDate", album.end_date),
+            ("fileCreatedAt", asset.file_created_at),
+            ("localDateTime", asset.local_date_time),
+        ] {
+            assert_eq!(date.as_deref(), expected, "{field}: {value:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn search_validates_page_numbers_and_continuation_tokens() {
     for next in ["", "1", "3", "02", "+2", "2 ", "18446744073709551616"] {

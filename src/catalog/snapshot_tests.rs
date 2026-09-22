@@ -129,18 +129,6 @@ fn resources_dates_and_optional_hints() {
     assert_eq!(item.checksum.as_deref(), Some("one"));
     assert_eq!(item.updated_at.as_deref(), Some("opaque hint"));
     assert_eq!(item.thumbhash.as_deref(), Some("two"));
-
-    for invalid in [Value::Null, json!(123), json!(false), json!({"date": []})] {
-        let mut dto = asset(1, "IMAGE");
-        dto["fileCreatedAt"] = invalid.clone();
-        dto["localDateTime"] = invalid.clone();
-        let item = project(dto);
-        assert!(item.capture.is_none() && item.object.date.is_none());
-        let mut dto = album(ALBUM);
-        dto["createdAt"] = invalid;
-        let album: crate::immich::Album = serde_json::from_value(dto).unwrap();
-        assert!(parse_date(album.created_at.as_deref(), &mut 0).is_none());
-    }
 }
 
 #[tokio::test]
