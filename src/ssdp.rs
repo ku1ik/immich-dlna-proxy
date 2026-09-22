@@ -116,7 +116,12 @@ impl Discovery {
                     if response_deadline.is_some() =>
                 {
                     if let Some(response) = responses.pop_due(Instant::now()) {
-                        let message = self.message(response.target, Message::Response);
+                        let message = message(
+                            &self.targets,
+                            &self.location,
+                            response.target,
+                            Message::Response,
+                        );
 
                         if let Err(error) = self.send(message.as_bytes(), response.destination) {
                             tracing::debug!(%error, "SSDP search response dropped");
@@ -165,7 +170,7 @@ impl Discovery {
         let mut result = Ok(());
 
         for target in 0..self.targets.len() {
-            let message = self.message(target, Message::Alive);
+            let message = message(&self.targets, &self.location, target, Message::Alive);
 
             if let Err(error) = self.send(message.as_bytes(), destination) {
                 if error.kind() == io::ErrorKind::WouldBlock {
@@ -178,41 +183,46 @@ impl Discovery {
 
         result
     }
-
-    fn message(&self, target: usize, kind: Message) -> String {
-        let name = &self.targets[target];
-
-        let usn = if target == 1 {
-            self.targets[1].clone()
-        } else {
-            format!("{}::{name}", self.targets[1])
-        };
-
-        let mut message = match kind {
-            Message::Response => format!("HTTP/1.1 200 OK\r\nEXT:\r\nST: {name}\r\n"),
-
-            Message::Alive => format!(
-                "NOTIFY * HTTP/1.1\r\nHOST: {MULTICAST}\r\nNT: {name}\r\nNTS: ssdp:alive\r\n"
-            ),
-        };
-
-        message.push_str(&format!(
-            "CACHE-CONTROL: max-age={}\r\nLOCATION: {}\r\nSERVER: {}\r\n",
-            MAX_AGE,
-            self.location,
-            crate::server_header(),
-        ));
-
-        message.push_str(&format!("USN: {usn}\r\n\r\n"));
-
-        message
-    }
 }
 
 #[derive(Clone, Copy)]
 enum Message {
     Alive,
     Response,
+}
+
+fn message(
+    targets: &[String; TARGET_COUNT],
+    location: &str,
+    target: usize,
+    kind: Message,
+) -> String {
+    let name = &targets[target];
+
+    let usn = if target == 1 {
+        targets[1].clone()
+    } else {
+        format!("{}::{name}", targets[1])
+    };
+
+    let mut message = match kind {
+        Message::Response => format!("HTTP/1.1 200 OK\r\nEXT:\r\nST: {name}\r\n"),
+
+        Message::Alive => {
+            format!("NOTIFY * HTTP/1.1\r\nHOST: {MULTICAST}\r\nNT: {name}\r\nNTS: ssdp:alive\r\n")
+        }
+    };
+
+    message.push_str(&format!(
+        "CACHE-CONTROL: max-age={}\r\nLOCATION: {}\r\nSERVER: {}\r\n",
+        MAX_AGE,
+        location,
+        crate::server_header(),
+    ));
+
+    message.push_str(&format!("USN: {usn}\r\n\r\n"));
+
+    message
 }
 
 fn targets(uuid: Uuid) -> [String; TARGET_COUNT] {

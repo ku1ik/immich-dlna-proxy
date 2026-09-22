@@ -259,18 +259,19 @@ fn ingress_rejects_wrong_interface_destination_and_non_unicast_source() {
     assert!(!packet.accepted(address, 2));
 }
 
-#[tokio::test]
-async fn all_wire_messages_have_exact_target_usn_and_framing() {
-    let discovery = loopback();
+#[test]
+fn all_wire_messages_have_exact_target_usn_and_framing() {
+    let targets = targets(UUID);
+    let location = format!("http://{LOCAL}/device.xml");
 
     for target in 0..5 {
         for kind in [Message::Alive, Message::Response] {
-            let message = discovery.message(target, kind);
+            let message = message(&targets, &location, target, kind);
 
             let usn = if target == 1 {
-                discovery.targets[1].clone()
+                targets[1].clone()
             } else {
-                format!("{}::{}", discovery.targets[1], discovery.targets[target])
+                format!("{}::{}", targets[1], targets[target])
             };
 
             assert!(message.contains(&format!("USN: {usn}\r\n")));
@@ -282,11 +283,11 @@ async fn all_wire_messages_have_exact_target_usn_and_framing() {
 
             if matches!(kind, Message::Response) {
                 assert!(message.starts_with("HTTP/1.1 200 OK\r\nEXT:\r\n"));
-                assert!(message.contains(&format!("ST: {}\r\n", discovery.targets[target])));
+                assert!(message.contains(&format!("ST: {}\r\n", targets[target])));
             } else {
                 assert!(message.starts_with("NOTIFY * HTTP/1.1\r\n"));
                 assert!(message.contains(&format!("HOST: {MULTICAST}\r\n")));
-                assert!(message.contains(&format!("NT: {}\r\n", discovery.targets[target])));
+                assert!(message.contains(&format!("NT: {}\r\n", targets[target])));
                 assert!(message.contains("NTS: ssdp:alive\r\n"));
             }
 
