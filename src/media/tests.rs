@@ -838,6 +838,40 @@ fn redirect_policy_rejects_https_downgrades_userinfo_and_port_changes() {
     }
 }
 
+#[test]
+fn redirect_policy_requires_one_valid_size_only_for_thumbnails() {
+    let api_base = Url::parse("https://example.invalid/prefix/api/").unwrap();
+    let asset = Uuid::parse_str(ASSET).unwrap();
+
+    for (endpoint, allowed) in [
+        ("original", true),
+        ("original?size=preview", false),
+        ("video/playback", true),
+        ("video/playback?size=fullsize", false),
+        ("thumbnail?size=preview", true),
+        ("thumbnail?size=fullsize", true),
+        ("thumbnail?size=%70review", true),
+        ("thumbnail", false),
+        ("thumbnail?size=", false),
+        ("thumbnail?size=thumbnail", false),
+        ("thumbnail?size=PREVIEW", false),
+        ("thumbnail?size=preview&size=preview", false),
+        ("thumbnail?size=fullsize&size=preview", false),
+        ("thumbnail?size=preview&size=fullsize", false),
+        ("thumbnail?size=preview&%73ize=fullsize", false),
+    ] {
+        let target = api_base
+            .join(&format!("assets/{asset}/{endpoint}"))
+            .unwrap();
+
+        assert_eq!(
+            allowed_redirect(&api_base, false, &target, asset),
+            allowed,
+            "{endpoint}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn redirect_hop_limit_and_loops_are_enforced() {
     let targets = [

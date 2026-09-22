@@ -465,7 +465,7 @@ fn allowed_redirect(api_base: &Url, initial_edited: bool, target: &Url, asset: U
     };
 
     let mut edited = None;
-    let mut size = None;
+    let mut size_seen = false;
 
     for (key, value) in target.query_pairs() {
         match key.as_ref() {
@@ -473,8 +473,8 @@ fn allowed_redirect(api_base: &Url, initial_edited: bool, target: &Url, asset: U
                 edited = Some(value == "true");
             }
 
-            "size" if size.is_none() && matches!(value.as_ref(), "fullsize" | "preview") => {
-                size = Some(value);
+            "size" if !size_seen && matches!(value.as_ref(), "fullsize" | "preview") => {
+                size_seen = true;
             }
 
             _ => return false,
@@ -486,9 +486,9 @@ fn allowed_redirect(api_base: &Url, initial_edited: bool, target: &Url, asset: U
     }
 
     match endpoint {
-        "original" => size.is_none(),
-        "thumbnail" => size.is_some(),
-        "video/playback" => size.is_none() && edited.is_none() && !initial_edited,
+        "original" => !size_seen,
+        "thumbnail" => size_seen,
+        "video/playback" => !size_seen && edited.is_none() && !initial_edited,
         _ => false,
     }
 }
