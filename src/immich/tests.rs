@@ -84,15 +84,13 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
     assert!(client.api_key.is_sensitive());
 }
 
-#[tokio::test]
-async fn critical_structure_is_required_but_additive_fields_are_ignored() {
+#[test]
+fn critical_structure_is_required_but_additive_fields_are_ignored() {
     for dto in [
         json!({"id": ALBUM}),
         json!({"id": ALBUM, "albumName": "valid", "albumThumbnailAssetId": "invalid"}),
     ] {
-        let fake = Fake::new(vec![reply(json!([dto]))]).await;
-        let client = fake.new_client();
-        assert!(client.albums().await.is_err());
+        assert!(serde_json::from_value::<Album>(dto).is_err());
     }
 
     for field in ["id", "type", "visibility", "isTrashed", "isEdited"] {
@@ -105,13 +103,7 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
                 dto.as_object_mut().unwrap().remove(field);
             }
 
-            let fake = Fake::new(vec![page(vec![dto], None)]).await;
-            let client = fake.new_client();
-
-            assert!(
-                client.search_album(ALBUM, 1, false).await.is_err(),
-                "{field}"
-            );
+            assert!(serde_json::from_value::<Asset>(dto).is_err(), "{field}");
         }
     }
 
@@ -125,13 +117,7 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
     ] {
         let mut dto = asset(1, "IMAGE");
         dto[field] = json!({"wrong": "structure"});
-        let fake = Fake::new(vec![page(vec![dto], None)]).await;
-        let client = fake.new_client();
-
-        assert!(
-            client.search_album(ALBUM, 1, false).await.is_err(),
-            "{field}"
-        );
+        assert!(serde_json::from_value::<Asset>(dto).is_err(), "{field}");
     }
 
     for response in [
@@ -141,10 +127,7 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
         json!({"assets": []}),
         json!({"albums": []}),
     ] {
-        let fake = Fake::new(vec![reply(response)]).await;
-        let client = fake.new_client();
-
-        assert!(client.search_album(ALBUM, 1, false).await.is_err());
+        assert!(serde_json::from_value::<SearchResponse>(response).is_err());
     }
 
     let mut dto = asset(1, "IMAGE");
@@ -163,15 +146,34 @@ async fn critical_structure_is_required_but_additive_fields_are_ignored() {
     }
 
     dto["stack"] = json!({"unexpected": [1, 2, 3]});
-    let fake = Fake::new(vec![page(vec![dto], None)]).await;
+    let asset: Asset = serde_json::from_value(dto).unwrap();
+    assert!(asset.file_created_at.is_none());
+    assert!(asset.original_file_name.is_none());
+}
+
+#[tokio::test]
+async fn structurally_invalid_responses_return_sanitized_errors() {
+    let invalid = json!({"id": "private-test-key http://secret.example/private"});
+
+    let fake = Fake::new(vec![
+        reply(json!([invalid.clone()])),
+        page(vec![invalid], None),
+    ])
+    .await;
+
     let client = fake.new_client();
 
-    let result = client.search_album(ALBUM, 1, false).await.unwrap();
+    for error in [
+        client.albums().await.unwrap_err(),
+        client.search_album(ALBUM, 1, false).await.unwrap_err(),
+    ] {
+        assert_eq!(
+            format!("{error:#}"),
+            "invalid Immich JSON structure; requires Immich 3.1.0 or newer"
+        );
+    }
 
-    assert_eq!(result.items.len(), 1);
-    assert!(result.items[0].file_created_at.is_none());
-    assert!(result.items[0].original_file_name.is_none());
-    assert_eq!(fake.requests.lock().unwrap().len(), 1);
+    assert_eq!(fake.requests.lock().unwrap().len(), 2);
 }
 
 #[test]
