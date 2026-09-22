@@ -76,85 +76,18 @@ impl Source {
     pub(super) async fn root(&self) -> Result<Root> {
         self.client.ensure_supported_version().await?;
         let records = self.client.albums().await?;
-
-        let root_object = Object {
-            id: "0".into(),
-            parent_id: "-1".into(),
-            title: self.friendly_name.clone(),
-            class: "object.container".into(),
-            date: None,
-            art: None,
-            child_count: None,
-            resources: Vec::new(),
-        };
-
-        let mut albums = BTreeMap::new();
-        let mut bytes = 2 + encoded_size(&root_object, SNAPSHOT_BYTES - 2)?;
         let mut bad_dates = 0;
 
-        for dto in records {
-            let created_at = parse_date(dto.created_at.as_deref(), &mut bad_dates);
-
-            let mut album = Album {
-                id: dto.id,
-                object: Object {
-                    id: format!("album:{}", dto.id),
-                    parent_id: "0".into(),
-                    title: title(&dto.album_name, dto.id),
-                    class: "object.container.album".into(),
-                    date: created_at.map(|date| date.format("%Y-%m-%d").to_string()),
-                    art: dto
-                        .album_thumbnail_asset_id
-                        .map(|id| asset_url(self.http_address, id, PREVIEW)),
-                    child_count: None,
-                    resources: Vec::new(),
-                },
-                created_at,
-                end_date: parse_date(dto.end_date.as_deref(), &mut bad_dates),
-                digest: String::new(),
-            };
-
-            let mut projection = Projection::new(SNAPSHOT_BYTES);
-            projection.json(&album)?;
-            let (digest, size) = projection.finish();
-            album.digest = digest;
-
-            if let Some(previous) = albums.get(&album.id) {
-                ensure!(previous == &album, "conflicting duplicate Immich album");
-                continue;
-            }
-
-            ensure!(albums.len() < MAX_ALBUMS, "Immich root exceeds album limit");
-
-            bytes += 1 + size;
-
-            ensure!(
-                bytes <= SNAPSHOT_BYTES,
-                "Immich root exceeds projected byte limit"
-            );
-
-            albums.insert(album.id, album);
-        }
+        let root = project_root(
+            self.http_address,
+            &self.friendly_name,
+            records,
+            &mut bad_dates,
+        )?;
 
         log_dates(bad_dates);
-        let mut projection = Projection::new(SNAPSHOT_BYTES);
-        projection.write_all(b"[")?;
-        projection.json(&root_object)?;
 
-        for album in albums.values() {
-            projection.write_all(b",")?;
-            projection.json(album)?;
-        }
-
-        projection.write_all(b"]")?;
-        let (digest, bytes) = projection.finish();
-
-        Ok(Root {
-            object: root_object,
-            albums,
-            digest,
-            bytes,
-        })
+        Ok(root)
     }
 
     /// Requires the caller to establish readable root membership first. No version
@@ -291,6 +224,90 @@ impl Source {
             bytes,
         })
     }
+}
+
+fn project_root(
+    http_address: SocketAddrV4,
+    friendly_name: &str,
+    records: Vec<crate::immich::Album>,
+    bad_dates: &mut usize,
+) -> Result<Root> {
+    let root_object = Object {
+        id: "0".into(),
+        parent_id: "-1".into(),
+        title: friendly_name.to_owned(),
+        class: "object.container".into(),
+        date: None,
+        art: None,
+        child_count: None,
+        resources: Vec::new(),
+    };
+
+    let mut albums = BTreeMap::new();
+    let mut bytes = 2 + encoded_size(&root_object, SNAPSHOT_BYTES - 2)?;
+
+    for dto in records {
+        let created_at = parse_date(dto.created_at.as_deref(), bad_dates);
+
+        let mut album = Album {
+            id: dto.id,
+            object: Object {
+                id: format!("album:{}", dto.id),
+                parent_id: "0".into(),
+                title: title(&dto.album_name, dto.id),
+                class: "object.container.album".into(),
+                date: created_at.map(|date| date.format("%Y-%m-%d").to_string()),
+                art: dto
+                    .album_thumbnail_asset_id
+                    .map(|id| asset_url(http_address, id, PREVIEW)),
+                child_count: None,
+                resources: Vec::new(),
+            },
+            created_at,
+            end_date: parse_date(dto.end_date.as_deref(), bad_dates),
+            digest: String::new(),
+        };
+
+        let mut projection = Projection::new(SNAPSHOT_BYTES);
+        projection.json(&album)?;
+        let (digest, size) = projection.finish();
+        album.digest = digest;
+
+        if let Some(previous) = albums.get(&album.id) {
+            ensure!(previous == &album, "conflicting duplicate Immich album");
+            continue;
+        }
+
+        ensure!(albums.len() < MAX_ALBUMS, "Immich root exceeds album limit");
+
+        bytes += 1 + size;
+
+        ensure!(
+            bytes <= SNAPSHOT_BYTES,
+            "Immich root exceeds projected byte limit"
+        );
+
+        albums.insert(album.id, album);
+    }
+
+    let mut projection = Projection::new(SNAPSHOT_BYTES);
+    projection.write_all(b"[")?;
+    projection.json(&root_object)?;
+
+    for album in albums.values() {
+        projection.write_all(b",")?;
+        projection.json(album)?;
+    }
+
+    projection.write_all(b"]")?;
+    let (digest, bytes) = projection.finish();
+
+    Ok(Root {
+        object: root_object,
+        albums,
+        digest,
+        bytes,
+    })
 }
 
 fn project_item(

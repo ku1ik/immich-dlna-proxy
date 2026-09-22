@@ -40,6 +40,18 @@ fn project(value: Value) -> Item {
     .unwrap()
 }
 
+fn root(name: &str, albums: Vec<Value>) -> Result<Root> {
+    project_root(
+        "192.0.2.1:8200".parse().unwrap(),
+        name,
+        albums
+            .into_iter()
+            .map(|album| serde_json::from_value(album).unwrap())
+            .collect(),
+        &mut 0,
+    )
+}
+
 #[test]
 fn resources_dates_and_optional_hints() {
     for (mime, edited, representation, expected) in [
@@ -220,8 +232,8 @@ async fn complete_pagination_and_scoped_encoded_intersection_without_probes() {
     );
 }
 
-#[tokio::test]
-async fn eligible_assets_require_original_file_name() {
+#[test]
+fn eligible_assets_require_original_file_name() {
     for null in [false, true] {
         let mut dto = asset(1, "IMAGE");
 
@@ -231,10 +243,15 @@ async fn eligible_assets_require_original_file_name() {
             dto.as_object_mut().unwrap().remove("originalFileName");
         }
 
-        let fake = SnapshotFixture::new(vec![page(vec![dto], None)]).await;
+        let result = project_item(
+            "192.0.2.1:8200".parse().unwrap(),
+            ALBUM,
+            serde_json::from_value(dto).unwrap(),
+            &mut 0,
+        );
 
         assert_eq!(
-            fake.source.contents(ALBUM).await.unwrap_err().to_string(),
+            result.unwrap_err().to_string(),
             "eligible Immich asset is missing originalFileName"
         );
     }
@@ -301,40 +318,32 @@ async fn duplicates_compare_only_normalized_member_data_and_eligibility() {
     assert_eq!(fake.api.requests.lock().unwrap().len(), 1);
 }
 
-#[tokio::test]
-async fn root_duplicates_titles_covers_and_canonical_digests() {
+#[test]
+fn root_duplicates_titles_covers_and_canonical_digests() {
     let mut empty = album(ALBUM);
     empty["albumName"] = json!("");
     empty["albumThumbnailAssetId"] = Value::Null;
     let other = album(Uuid::from_u128(2));
 
-    let fake = SnapshotFixture::new(vec![
-        version(),
-        reply(json!([empty.clone(), other.clone(), empty.clone()])),
-        reply(json!([other, empty.clone()])),
-        reply(json!([empty.clone(), {"id": ALBUM, "albumName": "changed"}])),
-        reply(json!([{"id": ALBUM}])),
-        reply(json!([{"id": ALBUM, "albumName": "valid", "albumThumbnailAssetId": "invalid"}])),
-    ])
-    .await;
-
-    let first = fake.source.root().await.unwrap();
-    let second = fake.source.root().await.unwrap();
+    let first = root("Photos", vec![empty.clone(), other.clone(), empty.clone()]).unwrap();
+    let second = root("Photos", vec![other, empty.clone()]).unwrap();
     assert_eq!(first.digest, second.digest);
     assert_eq!(first.bytes, second.bytes);
     assert_eq!(first.albums[&ALBUM].object.title, ALBUM.to_string());
     assert!(first.albums[&ALBUM].object.art.is_none());
 
-    for _ in 0..3 {
-        assert!(fake.source.root().await.is_err());
-    }
+    assert!(
+        root(
+            "Photos",
+            vec![empty.clone(), json!({"id": ALBUM, "albumName": "changed"})]
+        )
+        .is_err()
+    );
 
-    let renamed = SnapshotFixture::new(vec![version(), reply(json!([empty.clone()]))]).await;
-    let baseline = renamed.source.root().await.unwrap();
-    let mut changed = SnapshotFixture::new(vec![version(), reply(json!([empty]))]).await;
-    changed.source.friendly_name = "Another title".into();
-    let changed = changed.source.root().await.unwrap();
+    let baseline = root("Photos", vec![empty.clone()]).unwrap();
+    let changed = root("Another title", vec![empty]).unwrap();
     assert_ne!(baseline.digest, changed.digest);
+
     assert_eq!(
         baseline.albums[&ALBUM].digest,
         changed.albums[&ALBUM].digest
@@ -342,7 +351,7 @@ async fn root_duplicates_titles_covers_and_canonical_digests() {
 }
 
 #[tokio::test]
-async fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
+async fn contents_hashes_canonical_order_and_exact_bytes() {
     let mut first = asset(2, "IMAGE");
     first["originalFileName"] = json!("Zażółć \"photo\"\\name\n.jpg");
     let second = asset(1, "IMAGE");
@@ -365,9 +374,15 @@ async fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
         format!("{:x}", Sha256::digest(&serialized))
     );
     assert_eq!(baseline.digest.len(), 64);
-    let item = baseline.items.values().next().unwrap();
+}
+
+#[test]
+fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
+    let mut dto = asset(1, "IMAGE");
+    dto["originalFileName"] = json!("Zażółć \"photo\"\\name\n.jpg");
+    let item = project(dto.clone());
     let mut original = Projection::new(SNAPSHOT_BYTES);
-    original.json(item).unwrap();
+    original.json(&item).unwrap();
     let original = original.finish().0;
 
     for field in [
@@ -377,7 +392,7 @@ async fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
         "fileCreatedAt",
         "isEdited",
     ] {
-        let mut changed = asset(1, "IMAGE");
+        let mut changed = dto.clone();
 
         changed[field] = match field {
             "fileCreatedAt" => json!("2024-01-01T00:30:01+02:00"),
@@ -397,7 +412,7 @@ async fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
     digest.json(&reversed).unwrap();
     assert_ne!(original, digest.finish().0);
 
-    for item in baseline.items.values() {
+    for item in [&item, &reversed] {
         let size = serde_json::to_vec(item).unwrap().len();
         assert_eq!(encoded_size(item, SNAPSHOT_BYTES).unwrap(), size);
         assert_eq!(encoded_size(item, size).unwrap(), size);
@@ -449,6 +464,40 @@ fn projected_item_encoding_is_stable_across_refactors() {
     );
 }
 
+#[test]
+fn projected_root_encoding_is_stable_across_refactors() {
+    let id = Uuid::from_u128(1);
+    let mut dto = album(id);
+    dto["albumName"] = json!("A&B");
+    dto["endDate"] = json!("2024-02-03T04:05:06Z");
+    let root = root("Photos", vec![dto]).unwrap();
+
+    let expected_album = r#"{"id":"00000000-0000-0000-0000-000000000001","object":{"id":"album:00000000-0000-0000-0000-000000000001","parent_id":"0","title":"A&B","class":"object.container.album","date":"2023-12-31","art":"http://192.0.2.1:8200/media/assets/00000000-0000-0000-0000-000000000309/preview","child_count":null,"resources":[]},"created_at":"2023-12-31T22:30:00Z","end_date":"2024-02-03T04:05:06Z"}"#;
+
+    let expected = [
+        r#"[{"id":"0","parent_id":"-1","title":"Photos","class":"object.container","date":null,"art":null,"child_count":null,"resources":[]},"#,
+        expected_album,
+        "]",
+    ].concat();
+
+    assert_eq!(root.bytes, expected.len());
+
+    assert_eq!(
+        root.digest,
+        format!("{:x}", Sha256::digest(expected.as_bytes()))
+    );
+
+    assert_eq!(
+        serde_json::to_string(&root.albums[&id]).unwrap(),
+        expected_album
+    );
+
+    assert_eq!(
+        root.albums[&id].digest,
+        format!("{:x}", Sha256::digest(expected_album.as_bytes()))
+    );
+}
+
 #[tokio::test]
 async fn traversal_progress_and_combined_page_budget() {
     for repeated in [false, true] {
@@ -491,7 +540,7 @@ async fn traversal_progress_and_combined_page_budget() {
 }
 
 #[tokio::test]
-async fn raw_record_item_album_and_projected_payload_limits() {
+async fn raw_record_item_and_projected_payload_limits() {
     let excluded = json!({"id": Uuid::from_u128(1), "type": "AUDIO", "visibility": "hidden", "isTrashed": false, "isEdited": false});
 
     // Raw records count even when identical and excluded; pages need not be full.
@@ -547,25 +596,6 @@ async fn raw_record_item_album_and_projected_payload_limits() {
 
     assert!(error.contains("item limit"), "{error}");
 
-    let fake = SnapshotFixture::new(vec![
-        version(),
-        reply(json!(
-            (0..=MAX_ALBUMS)
-                .map(|id| album(Uuid::from_u128(id as u128)))
-                .collect::<Vec<_>>()
-        )),
-    ])
-    .await;
-
-    assert!(
-        fake.source
-            .root()
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("album limit")
-    );
-
     let mut big = asset(1, "IMAGE");
     big["checksum"] = json!("x".repeat(SNAPSHOT_BYTES / 2));
     let mut bigger = big.clone();
@@ -581,5 +611,19 @@ async fn raw_record_item_album_and_projected_payload_limits() {
             .unwrap_err()
             .to_string()
             .contains("byte limit")
+    );
+}
+
+#[test]
+fn root_album_limit_is_enforced() {
+    let albums = (0..=MAX_ALBUMS)
+        .map(|id| album(Uuid::from_u128(id as u128)))
+        .collect();
+
+    assert!(
+        root("Photos", albums)
+            .unwrap_err()
+            .to_string()
+            .contains("album limit")
     );
 }

@@ -85,6 +85,14 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
 
 #[tokio::test]
 async fn critical_structure_is_required_but_additive_fields_are_ignored() {
+    for dto in [
+        json!({"id": ALBUM}),
+        json!({"id": ALBUM, "albumName": "valid", "albumThumbnailAssetId": "invalid"}),
+    ] {
+        let fake = Fake::new(vec![reply(json!([dto]))]).await;
+        assert!(fake.client.albums().await.is_err());
+    }
+
     for field in ["id", "type", "visibility", "isTrashed", "isEdited"] {
         for null in [false, true] {
             let mut dto = asset(1, "IMAGE");
