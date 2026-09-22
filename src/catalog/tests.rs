@@ -586,7 +586,12 @@ async fn album_browse_counts_eligible_items_and_sorts_before_pagination() {
         );
     }
 
-    for (start, count, returned) in [(1, 1, 1), (1, 0, 2), (3, 0, 0), (u32::MAX, 10, 0)] {
+    for (start, count, titles) in [
+        (1, 1, &["Photo 2"][..]),
+        (1, 0, &["Photo 2", "Photo 3"]),
+        (3, 0, &[]),
+        (u32::MAX, 10, &[]),
+    ] {
         let result = fixture
             .library
             .browse(action(
@@ -600,11 +605,16 @@ async fn album_browse_counts_eligible_items_and_sorts_before_pagination() {
             .unwrap();
 
         assert_eq!(result.total_matches, 3);
-        assert_eq!(result.objects.len(), returned);
 
-        if start == 1 && count == 1 {
-            assert_eq!(result.objects[0].title, "Photo 2");
-        }
+        assert_eq!(
+            result
+                .objects
+                .iter()
+                .map(|o| o.title.as_str())
+                .collect::<Vec<_>>(),
+            titles,
+            "start={start}, count={count}"
+        );
     }
 
     fixture.abort(task).await;
@@ -733,37 +743,24 @@ async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
     let fixture = Fixture::new(2).await;
 
     for id in 1..=2 {
-        let mut asset = item(id, None, None);
-        asset["checksum"] = json!("x".repeat(4096));
-
         fixture
             .fake
             .upstream
             .lock()
             .unwrap()
             .contents
-            .insert(Uuid::from_u128(id), vec![asset]);
+            .insert(Uuid::from_u128(id), vec![item(id, None, None)]);
     }
-
-    let root = fixture.library.inner.source.root().await.unwrap();
-
-    let contents = fixture
-        .library
-        .inner
-        .source
-        .contents(Uuid::from_u128(1))
-        .await
-        .unwrap();
-
-    fixture.library.inner.state.lock().unwrap().cache.byte_limit = root.bytes + 2 * contents.bytes;
 
     let task = fixture.run();
     fixture.library.browse(children(1)).await.unwrap();
     fixture.library.browse(children(2)).await.unwrap();
 
-    {
-        let state = fixture.library.inner.state.lock().unwrap();
-        assert!(state.cache.root.is_some());
+    let (root_bytes, contents_bytes) = {
+        let mut state = fixture.library.inner.state.lock().unwrap();
+        let root_bytes = state.cache.root.as_ref().unwrap().snapshot.bytes;
+        let contents_bytes = state.cache.albums[&Uuid::from_u128(1)].snapshot.bytes;
+        state.cache.byte_limit = root_bytes + 2 * contents_bytes;
         assert_eq!(state.cache.albums.len(), 2);
         assert_eq!(state.ledger.albums.len(), 2);
 
@@ -772,7 +769,7 @@ async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
                 .cache
                 .albums
                 .values()
-                .all(|a| a.snapshot.bytes == contents.bytes)
+                .all(|a| a.snapshot.bytes == contents_bytes)
         );
 
         assert!(
@@ -782,13 +779,12 @@ async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
                 .values()
                 .all(|album| album.contents_digest.is_some())
         );
-    }
+
+        (root_bytes, contents_bytes)
+    };
 
     let before = fixture.disk();
-
-    fixture.fake.upstream.lock().unwrap().albums[0]["albumName"] =
-        json!("A".repeat(contents.bytes / 2));
-
+    fixture.fake.upstream.lock().unwrap().albums[0]["albumName"] = json!("Albums");
     fixture.expire(Scope::Root);
 
     fixture
@@ -799,10 +795,10 @@ async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
 
     {
         let state = fixture.library.inner.state.lock().unwrap();
-        let root_bytes = state.cache.root.as_ref().unwrap().snapshot.bytes;
-        assert!(root_bytes > root.bytes);
-        assert!(root_bytes + contents.bytes <= state.cache.byte_limit);
-        assert!(root_bytes + 2 * contents.bytes > state.cache.byte_limit);
+        let grown_bytes = state.cache.root.as_ref().unwrap().snapshot.bytes;
+        assert_eq!(grown_bytes, root_bytes + 1);
+        assert!(grown_bytes + contents_bytes <= state.cache.byte_limit);
+        assert!(grown_bytes + 2 * contents_bytes > state.cache.byte_limit);
         assert_eq!(state.cache.albums.len(), 1);
         assert!(!state.cache.albums.contains_key(&Uuid::from_u128(1)));
         assert_eq!(state.ledger.albums.len(), 2);
