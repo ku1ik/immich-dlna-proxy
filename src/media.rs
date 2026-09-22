@@ -221,13 +221,6 @@ impl MediaProxy {
             copy_header(&headers, &mut forwarded, header::IF_RANGE);
         }
 
-        forwarded.insert(
-            header::ACCEPT_ENCODING,
-            HeaderValue::from_static("identity"),
-        );
-
-        forwarded.insert("x-api-key", self.api_key.clone());
-
         let (upstream, length) = self.fetch(asset, route, &method, forwarded).await?;
 
         let mut status = upstream.status();
@@ -373,8 +366,15 @@ impl MediaProxy {
         asset: Uuid,
         route: MediaRoute,
         method: &Method,
-        forwarded: HeaderMap,
+        mut forwarded: HeaderMap,
     ) -> Result<(reqwest::Response, Option<u64>), Failure> {
+        forwarded.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+
+        forwarded.insert("x-api-key", self.api_key.clone());
+
         let mut url = self
             .api_base
             .join(&format!("assets/{asset}/{}", route.endpoint))
