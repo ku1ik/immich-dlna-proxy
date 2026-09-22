@@ -872,6 +872,41 @@ fn redirect_policy_requires_one_valid_size_only_for_thumbnails() {
     }
 }
 
+#[test]
+fn redirect_policy_preserves_edit_selection() {
+    let api_base = Url::parse("https://example.invalid/prefix/api/").unwrap();
+    let asset = Uuid::parse_str(ASSET).unwrap();
+
+    for (endpoint, unedited, edited) in [
+        ("original", true, false),
+        ("original?edited=false", true, false),
+        ("original?edited=true", false, true),
+        ("thumbnail?size=preview", true, false),
+        ("thumbnail?size=preview&edited=false", true, false),
+        ("thumbnail?size=preview&edited=true", false, true),
+        ("video/playback", true, false),
+        ("video/playback?edited=false", false, false),
+        ("video/playback?edited=true", false, false),
+        ("original?edited=", false, false),
+        ("original?edited=TRUE", false, false),
+        ("original?edited=false&edited=false", false, false),
+        ("original?edited=true&edited=true", false, false),
+        ("original?edited=true&edited=false", false, false),
+    ] {
+        let target = api_base
+            .join(&format!("assets/{asset}/{endpoint}"))
+            .unwrap();
+
+        for (initial_edited, allowed) in [(false, unedited), (true, edited)] {
+            assert_eq!(
+                allowed_redirect(&api_base, initial_edited, &target, asset),
+                allowed,
+                "{endpoint}: initial_edited={initial_edited}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn redirect_hop_limit_and_loops_are_enforced() {
     let targets = [
@@ -1534,8 +1569,8 @@ async fn validates_bodyless_304_content_length_before_preserving_headers() {
     }
 }
 
-#[tokio::test]
-async fn rejects_partial_responses_contradicting_the_forwarded_range() {
+#[test]
+fn rejects_partial_spans_contradicting_the_requested_range() {
     for (range, content_range) in [
         ("bytes=0-2", "bytes 7-9/10"),
         ("bytes=0-2", "bytes 1-3/10"),
@@ -1551,28 +1586,16 @@ async fn rejects_partial_responses_contradicting_the_forwarded_range() {
             "bytes 4294967295-4294967297/5000000000",
         ),
     ] {
-        let wire = format!(
-            "HTTP/1.1 206 Partial Content\r\nContent-Type: image/jpeg\r\nContent-Length: 3\r\nContent-Range: {content_range}\r\nConnection: close\r\n\r\nabc"
-        );
-
-        let server = FakeServer::new(vec![Reply::new(&wire)]).await;
-
-        let result = server
-            .proxy()
-            .serve(ASSET, "preview", Method::GET, headers(&[("range", range)]))
-            .await;
-
         assert_eq!(
-            result.status(),
-            StatusCode::BAD_GATEWAY,
+            partial_span(content_range, ByteRange::parse(range).unwrap()),
+            None,
             "{range}: {content_range}"
         );
-        assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
     }
 }
 
-#[tokio::test]
-async fn preserves_compatible_partial_fulfillment_of_single_ranges() {
+#[test]
+fn accepts_compatible_partial_spans_of_single_ranges() {
     for (range, content_range) in [
         ("bytes=0-9", "bytes 0-2/10"),
         ("bytes=0-9", "bytes 4-6/10"),
@@ -1590,24 +1613,45 @@ async fn preserves_compatible_partial_fulfillment_of_single_ranges() {
             "bytes 4294967297-4294967299/5000000000",
         ),
     ] {
-        let wire = format!(
-            "HTTP/1.1 206 Partial Content\r\nContent-Type: image/jpeg\r\nContent-Length: 3\r\nContent-Range: {content_range}\r\nConnection: close\r\n\r\nabc"
+        assert_eq!(
+            partial_span(content_range, ByteRange::parse(range).unwrap()),
+            Some(3),
+            "{range}: {content_range}"
         );
+    }
+}
 
-        let server = FakeServer::new(vec![Reply::new(&wire)]).await;
+#[tokio::test]
+async fn partial_response_compatibility_is_checked_before_streaming() {
+    for (range, expected) in [
+        ("bytes=0-9", StatusCode::PARTIAL_CONTENT),
+        ("bytes=0-2", StatusCode::BAD_GATEWAY),
+    ] {
+        let wire = "HTTP/1.1 206 Partial Content\r\nContent-Type: image/jpeg\r\nContent-Length: 3\r\nContent-Range: bytes 4-6/10\r\nConnection: close\r\n\r\nabc";
+        let mut server = FakeServer::new(vec![Reply::new(wire)]).await;
+        let proxy = server.proxy();
 
-        let result = server
-            .proxy()
+        let result = proxy
             .serve(ASSET, "preview", Method::GET, headers(&[("range", range)]))
             .await;
 
+        assert_eq!(result.status(), expected, "{range}");
+
         assert_eq!(
-            result.status(),
-            StatusCode::PARTIAL_CONTENT,
-            "{range}: {content_range}"
+            request_header(&server.request().await, "range"),
+            Some(range)
         );
-        assert_eq!(result.headers()[header::CONTENT_RANGE], content_range);
-        assert_eq!(to_bytes(result.into_body(), 1024).await.unwrap(), "abc");
+
+        if expected == StatusCode::PARTIAL_CONTENT {
+            assert_eq!(result.headers()[header::CONTENT_RANGE], "bytes 4-6/10");
+            assert_eq!(result.headers()[header::CONTENT_LENGTH], "3");
+            assert_eq!(to_bytes(result.into_body(), 1024).await.unwrap(), "abc");
+        } else {
+            assert!(!result.headers().contains_key(header::CONTENT_RANGE));
+            assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
+        }
+
+        assert_eq!(proxy.operations.available_permits(), OPERATIONS);
     }
 }
 

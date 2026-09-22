@@ -488,7 +488,7 @@ fn allowed_redirect(api_base: &Url, initial_edited: bool, target: &Url, asset: U
     match endpoint {
         "original" => !size_seen,
         "thumbnail" => size_seen,
-        "video/playback" => !size_seen && edited.is_none() && !initial_edited,
+        "video/playback" => !size_seen && edited.is_none(),
         _ => false,
     }
 }
