@@ -818,19 +818,19 @@ async fn unsafe_redirects_never_make_a_second_request() {
         assert!(server.requests.try_recv().is_err());
         assert!(other.requests.try_recv().is_err());
     }
+}
 
-    let proxy = MediaProxy::new(
-        Url::parse("https://example.invalid/prefix/api/").unwrap(),
-        HeaderValue::from_static("test-secret"),
-    )
-    .unwrap();
+#[test]
+fn redirect_policy_rejects_https_downgrades_userinfo_and_port_changes() {
+    let api_base = Url::parse("https://example.invalid/prefix/api/").unwrap();
 
     for target in [
         format!("http://example.invalid/prefix/api/assets/{ASSET}/original"),
         format!("https://user:pass@example.invalid/prefix/api/assets/{ASSET}/original"),
         format!("https://example.invalid:444/prefix/api/assets/{ASSET}/original"),
     ] {
-        assert!(!proxy.allowed_redirect(
+        assert!(!allowed_redirect(
+            &api_base,
             false,
             &Url::parse(&target).unwrap(),
             Uuid::parse_str(ASSET).unwrap()

@@ -432,7 +432,7 @@ impl MediaProxy {
 
             if visited.len() > REDIRECTS
                 || visited.contains(&target)
-                || !self.allowed_redirect(route.edited, &target, asset)
+                || !allowed_redirect(&self.api_base, route.edited, &target, asset)
             {
                 return Err(Failure::Upstream("unsafe or excessive media redirect"));
             }
@@ -447,48 +447,49 @@ impl MediaProxy {
 
         Ok((upstream, length))
     }
+}
 
-    fn allowed_redirect(&self, initial_edited: bool, target: &Url, asset: Uuid) -> bool {
-        if target.origin() != self.api_base.origin()
-            || !target.username().is_empty()
-            || target.password().is_some()
-            || target.fragment().is_some()
-        {
-            return false;
-        }
+fn allowed_redirect(api_base: &Url, initial_edited: bool, target: &Url, asset: Uuid) -> bool {
+    if target.origin() != api_base.origin()
+        || !target.username().is_empty()
+        || target.password().is_some()
+        || target.fragment().is_some()
+    {
+        return false;
+    }
 
-        let prefix = format!("{}assets/{asset}/", self.api_base.path());
-        let Some(endpoint) = target.path().strip_prefix(&prefix) else {
-            return false;
-        };
+    let prefix = format!("{}assets/{asset}/", api_base.path());
 
-        let mut edited = None;
-        let mut size = None;
+    let Some(endpoint) = target.path().strip_prefix(&prefix) else {
+        return false;
+    };
 
-        for (key, value) in target.query_pairs() {
-            match key.as_ref() {
-                "edited" if edited.is_none() && matches!(value.as_ref(), "true" | "false") => {
-                    edited = Some(value == "true");
-                }
+    let mut edited = None;
+    let mut size = None;
 
-                "size" if size.is_none() && matches!(value.as_ref(), "fullsize" | "preview") => {
-                    size = Some(value);
-                }
-
-                _ => return false,
+    for (key, value) in target.query_pairs() {
+        match key.as_ref() {
+            "edited" if edited.is_none() && matches!(value.as_ref(), "true" | "false") => {
+                edited = Some(value == "true");
             }
-        }
 
-        if edited.unwrap_or(false) != initial_edited {
-            return false;
-        }
+            "size" if size.is_none() && matches!(value.as_ref(), "fullsize" | "preview") => {
+                size = Some(value);
+            }
 
-        match endpoint {
-            "original" => size.is_none(),
-            "thumbnail" => size.is_some(),
-            "video/playback" => size.is_none() && edited.is_none() && !initial_edited,
-            _ => false,
+            _ => return false,
         }
+    }
+
+    if edited.unwrap_or(false) != initial_edited {
+        return false;
+    }
+
+    match endpoint {
+        "original" => size.is_none(),
+        "thumbnail" => size.is_some(),
+        "video/playback" => size.is_none() && edited.is_none() && !initial_edited,
+        _ => false,
     }
 }
 
