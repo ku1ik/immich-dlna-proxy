@@ -199,17 +199,6 @@ impl MediaProxy {
         headers: HeaderMap,
         permit: OwnedSemaphorePermit,
     ) -> Result<Response, Failure> {
-        let MediaRoute {
-            endpoint,
-            expected_mime,
-            edited,
-        } = route;
-
-        let mut url = self
-            .api_base
-            .join(&format!("assets/{asset}/{endpoint}"))
-            .map_err(|_| Failure::Upstream("invalid media endpoint"))?;
-
         let mut forwarded = HeaderMap::new();
 
         for name in [
@@ -238,75 +227,13 @@ impl MediaProxy {
         );
 
         forwarded.insert("x-api-key", self.api_key.clone());
-        let mut visited = vec![url.clone()];
 
-        // One header budget covers the whole redirect chain, not each hop separately.
-        let deadline = Instant::now() + RESPONSE_HEADER_TIMEOUT;
-
-        let (upstream, length) = loop {
-            if Instant::now() >= deadline {
-                return Err(Failure::Timeout);
-            }
-
-            let upstream = timeout_at(deadline, async {
-                self.client
-                    .request(method.clone(), url.clone())
-                    .headers(forwarded.clone())
-                    .send()
-                    .await
-            })
-            .await
-            .map_err(|_| Failure::Timeout)?
-            .map_err(transport_failure)?;
-
-            // Validate raw framing even on redirects and bodyless/error responses.
-            if upstream.headers().contains_key(header::TRANSFER_ENCODING)
-                && upstream.headers().contains_key(header::CONTENT_LENGTH)
-            {
-                return Err(Failure::Upstream("conflicting media response framing"));
-            }
-
-            let length = if upstream.headers().contains_key(header::CONTENT_LENGTH) {
-                Some(
-                    single(upstream.headers(), header::CONTENT_LENGTH)
-                        .and_then(decimal)
-                        .ok_or(Failure::Upstream("invalid media content length"))?,
-                )
-            } else {
-                None
-            };
-
-            if !matches!(upstream.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
-                break (upstream, length);
-            }
-
-            let location = single(upstream.headers(), header::LOCATION)
-                .filter(|_| end_to_end(upstream.headers(), &header::LOCATION))
-                .ok_or(Failure::Upstream("missing or ambiguous media redirect"))?;
-
-            let target = url
-                .join(location)
-                .map_err(|_| Failure::Upstream("invalid media redirect"))?;
-
-            if visited.len() > REDIRECTS
-                || visited.contains(&target)
-                || !self.allowed_redirect(edited, &target, asset)
-            {
-                return Err(Failure::Upstream("unsafe or excessive media redirect"));
-            }
-
-            visited.push(target.clone());
-            url = target;
-        };
-
-        if Instant::now() >= deadline {
-            return Err(Failure::Timeout);
-        }
+        let (upstream, length) = self.fetch(asset, route, &method, forwarded).await?;
 
         let mut status = upstream.status();
         let mut safe = HeaderMap::new();
 
-        tracing::debug!(%asset, endpoint, status = status.as_u16(), "upstream media response");
+        tracing::debug!(%asset, endpoint = route.endpoint, status = status.as_u16(), "upstream media response");
 
         for name in [
             header::CONTENT_TYPE,
@@ -396,7 +323,9 @@ impl MediaProxy {
             .ok_or(Failure::Upstream("missing or invalid media MIME"))?;
 
         if mime.eq_ignore_ascii_case("multipart/byteranges")
-            || expected_mime.is_some_and(|expected| !mime.eq_ignore_ascii_case(expected))
+            || route
+                .expected_mime
+                .is_some_and(|expected| !mime.eq_ignore_ascii_case(expected))
         {
             return Err(Failure::Upstream("incompatible media MIME"));
         }
@@ -437,6 +366,86 @@ impl MediaProxy {
         *result.body_mut() = media_body(upstream, permit, body_length, asset);
 
         Ok(result)
+    }
+
+    async fn fetch(
+        &self,
+        asset: Uuid,
+        route: MediaRoute,
+        method: &Method,
+        forwarded: HeaderMap,
+    ) -> Result<(reqwest::Response, Option<u64>), Failure> {
+        let mut url = self
+            .api_base
+            .join(&format!("assets/{asset}/{}", route.endpoint))
+            .map_err(|_| Failure::Upstream("invalid media endpoint"))?;
+
+        let mut visited = vec![url.clone()];
+
+        // One header budget covers the whole redirect chain, not each hop separately.
+        let deadline = Instant::now() + RESPONSE_HEADER_TIMEOUT;
+
+        let (upstream, length) = loop {
+            if Instant::now() >= deadline {
+                return Err(Failure::Timeout);
+            }
+
+            let upstream = timeout_at(deadline, async {
+                self.client
+                    .request(method.clone(), url.clone())
+                    .headers(forwarded.clone())
+                    .send()
+                    .await
+            })
+            .await
+            .map_err(|_| Failure::Timeout)?
+            .map_err(transport_failure)?;
+
+            // Validate raw framing even on redirects and bodyless/error responses.
+            if upstream.headers().contains_key(header::TRANSFER_ENCODING)
+                && upstream.headers().contains_key(header::CONTENT_LENGTH)
+            {
+                return Err(Failure::Upstream("conflicting media response framing"));
+            }
+
+            let length = if upstream.headers().contains_key(header::CONTENT_LENGTH) {
+                Some(
+                    single(upstream.headers(), header::CONTENT_LENGTH)
+                        .and_then(decimal)
+                        .ok_or(Failure::Upstream("invalid media content length"))?,
+                )
+            } else {
+                None
+            };
+
+            if !matches!(upstream.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                break (upstream, length);
+            }
+
+            let location = single(upstream.headers(), header::LOCATION)
+                .filter(|_| end_to_end(upstream.headers(), &header::LOCATION))
+                .ok_or(Failure::Upstream("missing or ambiguous media redirect"))?;
+
+            let target = url
+                .join(location)
+                .map_err(|_| Failure::Upstream("invalid media redirect"))?;
+
+            if visited.len() > REDIRECTS
+                || visited.contains(&target)
+                || !self.allowed_redirect(route.edited, &target, asset)
+            {
+                return Err(Failure::Upstream("unsafe or excessive media redirect"));
+            }
+
+            visited.push(target.clone());
+            url = target;
+        };
+
+        if Instant::now() >= deadline {
+            return Err(Failure::Timeout);
+        }
+
+        Ok((upstream, length))
     }
 
     fn allowed_redirect(&self, initial_edited: bool, target: &Url, asset: Uuid) -> bool {
