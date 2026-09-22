@@ -87,6 +87,15 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
 #[test]
 fn critical_structure_is_required_but_additive_fields_are_ignored() {
     for dto in [
+        json!({"major": -1, "minor": 1, "patch": 0, "prerelease": null}),
+        json!({"major": 3, "minor": 1, "patch": 0.5, "prerelease": null}),
+        json!({"major": 3, "minor": 1, "patch": 0, "prerelease": "rc"}),
+        json!({"major": 3, "minor": 1}),
+    ] {
+        assert!(serde_json::from_value::<Version>(dto).is_err());
+    }
+
+    for dto in [
         json!({"id": ALBUM}),
         json!({"id": ALBUM, "albumName": "valid", "albumThumbnailAssetId": "invalid"}),
     ] {
@@ -252,9 +261,6 @@ async fn versions_retry_only_failed_checks_and_cache_success() {
     for value in [
         json!({"major": 3, "minor": 0, "patch": 99, "prerelease": null}),
         json!({"major": 3, "minor": 1, "patch": 0, "prerelease": 1}),
-        json!({"major": -1, "minor": 1, "patch": 0, "prerelease": null}),
-        json!({"major": 3, "minor": 1, "patch": 0.5, "prerelease": null}),
-        json!({"major": 3, "minor": 1, "patch": 0, "prerelease": "rc"}),
         json!({"major": 3, "minor": 1}),
     ] {
         let fake = Fake::new(vec![reply(value), version()]).await;
