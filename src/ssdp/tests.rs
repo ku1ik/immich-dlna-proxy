@@ -124,10 +124,12 @@ fn queue_admits_all_targets_atomically_and_never_exceeds_bound() {
         mx: Duration::from_secs(5),
     };
 
-    for _ in 0..1000 {
+    for _ in 0..51 {
         responses.enqueue(all, LOCAL, now, || 0);
     }
 
+    assert_eq!(responses.pending.len(), 255);
+    responses.enqueue(all, LOCAL, now, || 0);
     assert_eq!(responses.pending.len(), 255);
 
     assert_eq!(

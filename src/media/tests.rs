@@ -1086,12 +1086,12 @@ async fn redirects_share_one_absolute_header_budget() {
 
 #[tokio::test]
 async fn ready_headers_at_or_after_deadline_are_rejected_without_an_extra_hop() {
-    for (redirect, elapsed) in [
-        (false, 14),
-        (false, 15),
-        (false, 16),
-        (true, 15),
-        (true, 16),
+    for (redirect, elapsed, expected) in [
+        (false, 14, StatusCode::OK),
+        (false, 15, StatusCode::GATEWAY_TIMEOUT),
+        (false, 16, StatusCode::GATEWAY_TIMEOUT),
+        (true, 15, StatusCode::GATEWAY_TIMEOUT),
+        (true, 16, StatusCode::GATEWAY_TIMEOUT),
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
@@ -1157,11 +1157,8 @@ async fn ready_headers_at_or_after_deadline_are_rejected_without_an_extra_hop() 
 
         assert_eq!(
             result.status(),
-            if elapsed < 15 {
-                StatusCode::OK
-            } else {
-                StatusCode::GATEWAY_TIMEOUT
-            }
+            expected,
+            "redirect={redirect}, elapsed={elapsed}"
         );
 
         assert!(listener.accept().now_or_never().is_none());

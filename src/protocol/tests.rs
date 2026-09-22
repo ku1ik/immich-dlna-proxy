@@ -918,7 +918,18 @@ fn faults_have_upnp_namespace_codes_and_descriptions() {
 
 #[test]
 fn scpds_advertise_only_implemented_actions_and_event_variables() {
-    for service in [Service::ContentDirectory, Service::ConnectionManager] {
+    for (service, expected, action_count) in [
+        (Service::ContentDirectory, &["SystemUpdateID"][..], 4),
+        (
+            Service::ConnectionManager,
+            &[
+                "SourceProtocolInfo",
+                "SinkProtocolInfo",
+                "CurrentConnectionIDs",
+            ],
+            3,
+        ),
+    ] {
         let xml = scpd(service);
         assert_xml(xml);
         assert!(xml.contains("<scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">"));
@@ -933,16 +944,6 @@ fn scpds_advertise_only_implemented_actions_and_event_variables() {
         ] {
             assert!(!xml.contains(absent));
         }
-
-        let expected: &[&str] = match service {
-            Service::ContentDirectory => &["SystemUpdateID"],
-
-            Service::ConnectionManager => &[
-                "SourceProtocolInfo",
-                "SinkProtocolInfo",
-                "CurrentConnectionIDs",
-            ],
-        };
 
         assert_eq!(xml.matches("sendEvents=\"yes\"").count(), expected.len());
 
@@ -998,15 +999,7 @@ fn scpds_advertise_only_implemented_actions_and_event_variables() {
         }
 
         assert!(references.is_subset(&states));
-
-        assert_eq!(
-            actions.len(),
-            if service == Service::ContentDirectory {
-                4
-            } else {
-                3
-            }
-        );
+        assert_eq!(actions.len(), action_count);
 
         for action in actions {
             assert!(service.inputs(&action).is_ok());
