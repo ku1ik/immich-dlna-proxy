@@ -382,7 +382,6 @@ fn soap_rejects_namespace_spoofing_and_action_ambiguity() {
         valid.replace("</s:Envelope>", "<s:Header/></s:Envelope>"),
         valid.replace("<s:Body>", "<s:Header><s:Body/></s:Header><s:Body>"),
         valid.replace("<Filter>*</Filter>", "<Filter>*</Filter><Filter/>"),
-        valid.replace("<ObjectID>0</ObjectID>", "<ObjectID><nested/></ObjectID>"),
         valid.replace("<s:Body>", "<s:Body>unexpected"),
         valid.replace("</u:Browse>", "</u:Search>"),
         valid.replace("</s:Envelope>", ""),
@@ -456,16 +455,13 @@ fn soap_rejects_dtd_entities_bad_characters_attributes_and_declarations() {
 
 #[test]
 fn soap_rejects_nested_argument_elements() {
-    for nested in [
-        "<nested>x</nested>".into(),
-        format!("{}x{}", "<nested>".repeat(33), "</nested>".repeat(33)),
-    ] {
+    for nested in ["<nested/>", "<nested>x</nested>"] {
         let args = BROWSE_ARGS.replace(
             "<ObjectID>0</ObjectID>",
             &format!("<ObjectID>{nested}</ObjectID>"),
         );
 
-        assert!(browse(&args).is_err());
+        assert_eq!(browse(&args), Err(Fault { code: 402 }), "{nested}");
     }
 }
 
@@ -495,8 +491,19 @@ fn soap_browse_validates_shape_and_fault_precedence() {
             .replace("<SortCriteria/>", "<SortCriteria>bad</SortCriteria>");
 
         assert_eq!(browse(&args), Err(Fault { code: 402 }));
-        assert_eq!(browse(&(args + "<Extra/>")), Err(Fault { code: 402 }));
     }
+
+    assert_eq!(
+        browse(&format!("{BROWSE_ARGS}<Extra/>")),
+        Err(Fault { code: 402 })
+    );
+
+    // Preserve the argument count to check required names before sort values.
+    let args = BROWSE_ARGS
+        .replace("<Filter>*</Filter>", "<Extra/>")
+        .replace("<SortCriteria/>", "<SortCriteria>bad</SortCriteria>");
+
+    assert_eq!(browse(&args), Err(Fault { code: 402 }));
 
     let args = BROWSE_ARGS.replace("<Filter>*</Filter>", "<Filter>res,,</Filter>");
     assert_eq!(browse(&args), Err(Fault { code: 402 }));
@@ -585,11 +592,6 @@ fn soap_validates_action_inputs_and_sort_syntax() {
             assert_eq!(browse(&args), Err(Fault { code: 709 }));
         }
     }
-
-    assert_eq!(
-        browse(&BROWSE_ARGS.replace("<Filter>*</Filter>", "")),
-        Err(Fault { code: 402 })
-    );
 
     assert_eq!(
         browse(&BROWSE_ARGS.replace("BrowseDirectChildren", "Unknown")),

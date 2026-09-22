@@ -314,14 +314,21 @@ state_directory = "/var/lib/immich-dlna-proxy"
         }
 
         for extra in [
-            "unknown = \"private-value\"",
             "friendly_name = \"\"",
             "friendly_name = \"\\u0001\"",
             "log_level = \"INFO\"",
         ] {
-            let error = parse_settings(&format!("{CONFIG}\n{extra}")).err().unwrap();
-            assert!(!error.to_string().contains("private-value"));
+            assert!(
+                parse_settings(&format!("{CONFIG}\n{extra}")).is_err(),
+                "{extra}"
+            );
         }
+
+        let error = parse_settings(&format!("{CONFIG}\nunknown = \"private-value\""))
+            .err()
+            .unwrap();
+
+        assert!(!error.to_string().contains("private-value"));
 
         assert!(
             parse_settings(&format!(
