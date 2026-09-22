@@ -6,10 +6,8 @@ use std::{
 
 use anyhow::{Context, ensure};
 use axum::{Router, body::Body, extract::Request, response::Response};
-use clap::Parser;
 use http::{HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
-    config::{is_non_loopback_unicast, resolve_interface},
     eventing::Subscriptions,
     media::{DISPLAY, MediaProxy, ORIGINAL, PLAYBACK, PREVIEW},
     server::Server,
@@ -35,37 +33,6 @@ pub(super) const FILES: [&str; 6] = [
     "video-original.mp4",
     "video-playback.mp4",
 ];
-
-#[derive(Parser)]
-#[command(about = "Serve a DLNA verification catalog from local fixture files")]
-pub(super) struct Arguments {
-    #[arg(long, value_name = "IP:PORT", value_parser = listen_address)]
-    listen: SocketAddrV4,
-    #[arg(long, value_name = "DIRECTORY")]
-    fixtures: PathBuf,
-}
-
-fn listen_address(value: &str) -> anyhow::Result<SocketAddrV4> {
-    let address: SocketAddrV4 = value.parse().context("expected an IPv4 socket address")?;
-
-    ensure!(
-        is_non_loopback_unicast(*address.ip()) && address.port() >= 1024,
-        "listen must be concrete non-loopback unicast IPv4 with port 1024-65535"
-    );
-
-    Ok(address)
-}
-
-#[cfg_attr(test, allow(dead_code))]
-pub(super) async fn run(arguments: Arguments) -> anyhow::Result<()> {
-    let interface_index = resolve_interface(*arguments.listen.ip())?;
-    let bound = Bound::bind(arguments.listen, arguments.fixtures).await?;
-    let discovery = Discovery::bind(interface_index, SERVER_UUID, arguments.listen)?;
-
-    tracing::info!(listen = %arguments.listen, upstream = %bound.upstream.local_addr()?, uuid = %SERVER_UUID, "fixture server ready");
-
-    bound.run(Some(discovery)).await
-}
 
 async fn validate_fixtures(directory: &Path) -> anyhow::Result<()> {
     ensure!(
@@ -333,6 +300,8 @@ impl Bound {
     }
 
     pub(super) async fn run(self, discovery: Option<Discovery>) -> anyhow::Result<()> {
+        tracing::info!(listen = %self.http.local_addr()?, upstream = %self.upstream.local_addr()?, uuid = %SERVER_UUID, "fixture server ready");
+
         let directory = self.directory;
 
         let router = Router::new().fallback(move |request| {
