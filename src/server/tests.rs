@@ -128,18 +128,24 @@ async fn descriptions_head_and_common_header() {
         "/upnp/content-directory/scpd.xml",
         "/upnp/connection-manager/scpd.xml",
     ] {
-        let get = server
-            .handle(peer, request(Method::GET, path, Body::empty()))
-            .await;
+        let mut get = request(Method::GET, path, Body::empty());
+
+        get.headers_mut()
+            .insert(header::HOST, HeaderValue::from_static("untrusted.example"));
+
+        let get = server.handle(peer, get).await;
 
         let length = get.headers()[header::CONTENT_LENGTH].clone();
         assert_eq!(get.status(), StatusCode::OK);
         assert_eq!(get.headers()[header::SERVER], crate::server_header());
         assert!(!body(get).await.contains("untrusted.example"));
 
-        let head = server
-            .handle(peer, request(Method::HEAD, path, Body::empty()))
-            .await;
+        let mut head = request(Method::HEAD, path, Body::empty());
+
+        head.headers_mut()
+            .insert(header::HOST, HeaderValue::from_static("untrusted.example"));
+
+        let head = server.handle(peer, head).await;
         assert_eq!(head.status(), StatusCode::OK);
         assert_eq!(head.headers()[header::CONTENT_LENGTH], length);
         assert!(body(head).await.is_empty());
