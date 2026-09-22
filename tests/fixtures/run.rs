@@ -6,7 +6,6 @@ use anyhow::{Context, ensure};
 use clap::Parser;
 use immich_dlna_proxy::{
     config::{is_non_loopback_unicast, resolve_interface},
-    lifecycle,
     ssdp::Discovery,
 };
 
@@ -35,7 +34,7 @@ fn listen_address(value: &str) -> anyhow::Result<SocketAddrV4> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
-    lifecycle::logging(tracing::Level::DEBUG)?;
+    immich_dlna_proxy::logging(tracing::Level::DEBUG)?;
 
     let interface_index = resolve_interface(*arguments.listen.ip())?;
     let bound = Bound::bind(arguments.listen, arguments.fixtures).await?;

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use immich_dlna_proxy::{config::Config, lifecycle};
+use immich_dlna_proxy::config::Config;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -14,9 +14,9 @@ struct Arguments {
 async fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
     let config = Config::load(&arguments.config)?;
-    lifecycle::logging(config.log_level)?;
+    immich_dlna_proxy::logging(config.log_level)?;
 
-    lifecycle::run(config).await
+    immich_dlna_proxy::run(config).await
 }
 
 #[cfg(test)]
