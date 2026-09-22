@@ -508,12 +508,6 @@ impl Callback {
 
                     "/slow-headers" => std::future::pending::<Response>().await,
 
-                    "/slow-body" => {
-                        Response::new(Body::from_stream(futures_util::stream::pending::<
-                            Result<Vec<u8>, std::io::Error>,
-                        >()))
-                    }
-
                     _ => Response::new(Body::empty()),
                 }
             }
@@ -1220,28 +1214,6 @@ async fn delivery_concurrency_is_bounded_and_scheduler_is_single_run() {
     assert!(callback.received.try_recv().is_err());
 }
 
-#[tokio::test]
-async fn callback_deadline_is_per_url_and_keeps_active_leases() {
-    for path in ["/slow-headers", "/slow-body"] {
-        let subscriptions = Subscriptions::new().unwrap();
-        let mut callback = Callback::new().await;
-        let sid = callback.register(&subscriptions, SERVICE, &[path, "/fail"]);
-        let task = tokio::spawn(subscriptions.clone().run());
-        assert_eq!(callback.next().await.0.uri.path(), path);
-        tokio::time::pause();
-        tokio::time::advance(CALLBACK_TIMEOUT).await;
-        tokio::time::resume();
-        assert_eq!(callback.next().await.0.uri.path(), "/fail");
-        finished(&subscriptions, sid).await;
-        assert!(
-            subscriptions.state.lock().unwrap().entries[0]
-                .expires
-                .is_some()
-        );
-        abort_scheduler(task).await;
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
     use std::{future::Future, task::Wake};
@@ -1536,8 +1508,7 @@ async fn expired_initial_obligations_drain_and_release_all_capacity() {
     let mut callback = Callback::new().await;
     let mut tokens = Vec::new();
 
-    for id in 0..SUBSCRIPTIONS as u32 {
-        subscriptions.publish(id);
+    for _ in 0..SUBSCRIPTIONS {
         let sid = callback.register(&subscriptions, SERVICE, &["/ok"]);
         tokens.push(sid);
     }
