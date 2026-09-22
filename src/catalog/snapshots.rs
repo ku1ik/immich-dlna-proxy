@@ -328,7 +328,12 @@ fn project_item(
         .ok_or_else(|| anyhow!("eligible Immich asset is missing originalFileName"))?;
 
     let video = dto.kind == "VIDEO";
-    let mime = dto.original_mime_type.as_deref().and_then(media_type);
+
+    let mime = dto
+        .original_mime_type
+        .as_deref()
+        .and_then(crate::mime::parse)
+        .map(str::to_ascii_lowercase);
 
     let (representation, mime) = if video {
         (
@@ -511,10 +516,6 @@ fn encoded_size(value: &impl Serialize, limit: usize) -> Result<usize> {
         .map_err(|_| anyhow!("catalog projected byte limit exceeded"))?;
 
     Ok(count.bytes)
-}
-
-fn media_type(value: &str) -> Option<String> {
-    crate::mime::parse(value).map(str::to_ascii_lowercase)
 }
 
 #[cfg(test)]
