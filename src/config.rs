@@ -19,13 +19,6 @@ use uuid::Uuid;
 
 const KEY_BYTES: u64 = 8 * 1024;
 
-#[derive(clap::Parser)]
-#[command(version, about)]
-pub struct Arguments {
-    #[arg(long, value_name = "PATH")]
-    pub config: PathBuf,
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
@@ -288,37 +281,6 @@ sort_locale = "pl"
 server_uuid = "7B37DF49-B75D-4BCB-89A6-0C917A934643"
 state_directory = "/var/lib/immich-dlna-proxy"
 "#;
-
-    #[test]
-    fn cli_requires_config_and_exposes_only_config_help_and_version() {
-        use clap::Parser;
-
-        assert!(Arguments::try_parse_from(["immich-dlna-proxy"]).is_err());
-
-        let arguments =
-            Arguments::try_parse_from(["immich-dlna-proxy", "--config", "/run/proxy.toml"])
-                .unwrap();
-
-        assert_eq!(arguments.config, Path::new("/run/proxy.toml"));
-
-        for argument in ["--help", "--version"] {
-            let error = Arguments::try_parse_from(["immich-dlna-proxy", argument])
-                .err()
-                .unwrap();
-            assert!(!error.use_stderr());
-        }
-
-        assert!(
-            Arguments::try_parse_from([
-                "immich-dlna-proxy",
-                "--config",
-                "/run/proxy.toml",
-                "--listen",
-                "192.168.1.10:8200",
-            ])
-            .is_err()
-        );
-    }
 
     #[test]
     fn defaults_and_canonical_identity() {
