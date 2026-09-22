@@ -39,11 +39,40 @@ pub struct Server<C> {
     browses: Semaphore,
 }
 
-#[derive(Clone, Copy)]
-enum ServiceRoute {
+enum Route<'a> {
+    Device,
     Scpd(Service),
     Control(Service),
     Events(Service),
+    Media {
+        asset: &'a str,
+        representation: &'a str,
+    },
+}
+
+impl<'a> Route<'a> {
+    fn parse(path: &'a str) -> Option<Self> {
+        match path {
+            "/device.xml" => Some(Self::Device),
+            "/upnp/content-directory/scpd.xml" => Some(Self::Scpd(Service::ContentDirectory)),
+            "/upnp/connection-manager/scpd.xml" => Some(Self::Scpd(Service::ConnectionManager)),
+            "/upnp/content-directory/control" => Some(Self::Control(Service::ContentDirectory)),
+            "/upnp/connection-manager/control" => Some(Self::Control(Service::ConnectionManager)),
+            "/upnp/content-directory/events" => Some(Self::Events(Service::ContentDirectory)),
+            "/upnp/connection-manager/events" => Some(Self::Events(Service::ConnectionManager)),
+
+            _ => {
+                let (asset, representation) = path
+                    .strip_prefix(crate::media::ASSET_ROUTE_PREFIX)?
+                    .split_once('/')?;
+
+                Some(Self::Media {
+                    asset,
+                    representation,
+                })
+            }
+        }
+    }
 }
 
 impl<C: Catalog> Server<C> {
@@ -125,83 +154,53 @@ impl<C: Catalog> Server<C> {
             return empty(StatusCode::NOT_FOUND);
         }
 
-        let service_route = match path {
-            "/upnp/content-directory/scpd.xml" => {
-                Some(ServiceRoute::Scpd(Service::ContentDirectory))
-            }
-
-            "/upnp/connection-manager/scpd.xml" => {
-                Some(ServiceRoute::Scpd(Service::ConnectionManager))
-            }
-
-            "/upnp/content-directory/control" => {
-                Some(ServiceRoute::Control(Service::ContentDirectory))
-            }
-
-            "/upnp/connection-manager/control" => {
-                Some(ServiceRoute::Control(Service::ConnectionManager))
-            }
-
-            "/upnp/content-directory/events" => {
-                Some(ServiceRoute::Events(Service::ContentDirectory))
-            }
-
-            "/upnp/connection-manager/events" => {
-                Some(ServiceRoute::Events(Service::ConnectionManager))
-            }
-
-            _ => None,
+        let Some(route) = Route::parse(path) else {
+            return empty(StatusCode::NOT_FOUND);
         };
 
-        if let Some(ServiceRoute::Control(service)) = service_route {
-            if parts.method != Method::POST {
-                return method_not_allowed("POST");
-            }
-
-            let response = self
-                .control(service, parts.headers, body, started, peer)
-                .await;
-
-            tracing::debug!(%peer, ?service, status = response.status().as_u16(), elapsed_ms = started.elapsed().as_millis(), "control response");
-
-            return response;
-        }
-
-        let media_route = path
-            .strip_prefix(crate::media::ASSET_ROUTE_PREFIX)
-            .and_then(|path| path.split_once('/'));
-
-        if path != "/device.xml" && service_route.is_none() && media_route.is_none() {
-            return empty(StatusCode::NOT_FOUND);
-        }
-
-        if declared_body(&parts.headers) {
+        if !matches!(route, Route::Control(_)) && declared_body(&parts.headers) {
             return empty(StatusCode::BAD_REQUEST);
         }
 
-        if let Some(ServiceRoute::Events(service)) = service_route {
-            return self
-                .subscriptions
-                .request(service, peer, &parts.method, &parts.headers);
-        }
+        let document = match route {
+            Route::Control(service) => {
+                if parts.method != Method::POST {
+                    return method_not_allowed("POST");
+                }
 
-        if parts.method != Method::GET && parts.method != Method::HEAD {
-            return method_not_allowed("GET, HEAD");
-        }
+                let response = self
+                    .control(service, parts.headers, body, started, peer)
+                    .await;
 
-        if let Some((asset, representation)) = media_route {
-            tracing::debug!(%peer, "media request peer");
+                tracing::debug!(%peer, ?service, status = response.status().as_u16(), elapsed_ms = started.elapsed().as_millis(), "control response");
 
-            return self
-                .media
-                .serve(asset, representation, parts.method, parts.headers)
-                .await;
-        }
+                return response;
+            }
 
-        let document = match service_route {
-            Some(ServiceRoute::Scpd(service)) => protocol::scpd(service),
-            Some(ServiceRoute::Control(_) | ServiceRoute::Events(_)) => unreachable!(),
-            _ => &self.device,
+            Route::Events(service) => {
+                return self
+                    .subscriptions
+                    .request(service, peer, &parts.method, &parts.headers);
+            }
+
+            _ if parts.method != Method::GET && parts.method != Method::HEAD => {
+                return method_not_allowed("GET, HEAD");
+            }
+
+            Route::Media {
+                asset,
+                representation,
+            } => {
+                tracing::debug!(%peer, "media request peer");
+
+                return self
+                    .media
+                    .serve(asset, representation, parts.method, parts.headers)
+                    .await;
+            }
+
+            Route::Device => &self.device,
+            Route::Scpd(service) => protocol::scpd(service),
         };
 
         let mut response = xml(StatusCode::OK, document.to_owned());

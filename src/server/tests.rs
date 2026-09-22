@@ -281,6 +281,74 @@ async fn routing_rejects_invalid_headers_bodies_methods_and_peers() {
     assert!(server.catalog.actions.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn routing_preserves_path_body_and_method_error_precedence() {
+    let server = server(TestCatalog::default());
+
+    for (path, method, declared, status, allow) in [
+        ("/unknown", Method::POST, true, 404, None),
+        ("/device.xml?query", Method::POST, true, 404, None),
+        ("/device.xml", Method::POST, true, 400, None),
+        ("/device.xml", Method::POST, false, 405, Some("GET, HEAD")),
+        (
+            "/upnp/content-directory/scpd.xml",
+            Method::POST,
+            true,
+            400,
+            None,
+        ),
+        (
+            "/upnp/connection-manager/scpd.xml",
+            Method::POST,
+            false,
+            405,
+            Some("GET, HEAD"),
+        ),
+        (CDS, Method::GET, true, 405, Some("POST")),
+        (CDS, Method::POST, true, 415, None),
+        (EVENTS, Method::POST, true, 400, None),
+        (
+            EVENTS,
+            Method::POST,
+            false,
+            405,
+            Some("SUBSCRIBE, UNSUBSCRIBE"),
+        ),
+        ("/media/assets/bad", Method::POST, true, 404, None),
+        ("/media/assets/bad/unknown", Method::POST, true, 400, None),
+        (
+            "/media/assets/bad/unknown",
+            Method::POST,
+            false,
+            405,
+            Some("GET, HEAD"),
+        ),
+        ("/media/assets/bad/unknown", Method::GET, false, 404, None),
+    ] {
+        let mut request = request(method, path, Body::empty());
+
+        if declared {
+            request
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from_static("1"));
+        }
+
+        let response = server.route(request, Ipv4Addr::LOCALHOST).await;
+        assert_eq!(response.status().as_u16(), status, "{path}");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ALLOW)
+                .map(|value| value.to_str().unwrap()),
+            allow,
+            "{path}"
+        );
+    }
+
+    assert!(server.catalog.actions.lock().unwrap().is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn soap_body_bounds_and_processing_deadlines_are_retained() {
     let server = server(TestCatalog::default());
