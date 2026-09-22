@@ -643,8 +643,7 @@ fn null_root_with_retained_albums_rejects_load_without_removing_tmp() {
 }
 
 #[test]
-fn load_rejects_corruption_unknown_missing_fields_and_duplicate_uuid_aliases() {
-    let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+fn decoding_rejects_corruption_unknown_missing_fields_and_duplicate_uuid_aliases() {
     let valid = serde_json::to_string(&populated()).unwrap();
     let album = serde_json::to_string(&populated().albums[&id(2)]).unwrap();
     let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -659,9 +658,8 @@ fn load_rejects_corruption_unknown_missing_fields_and_duplicate_uuid_aliases() {
     for key in [uuid.to_owned(), uuid.to_uppercase()] {
         let single = duplicates.replace(&format!(",\"{}\":{album}", uuid.to_uppercase()), "");
         let single = single.replace(uuid, &key);
-        let directory = private_directory();
-        put(directory.path(), "revisions.json", single.as_bytes());
-        let (_store, loaded) = Store::open(directory.path(), id(1)).unwrap();
+        let loaded: Ledger = serde_json::from_str(&single).unwrap();
+        loaded.validate(id(1)).unwrap();
         assert_eq!(loaded.root_digest, Some(digest(1)));
         assert_eq!(loaded.albums.len(), 1);
 
@@ -680,10 +678,6 @@ fn load_rejects_corruption_unknown_missing_fields_and_duplicate_uuid_aliases() {
             "\"contents_digest\":null",
             "\"contents_digest\":null,\"present\":false",
         ),
-        valid.replace("\"contents_digest\":null", "\"contents_digest\":\"BAD\""),
-        valid.replace(&digest(2), &"A".repeat(64)),
-        valid.replace(&digest(2), &"g".repeat(64)),
-        valid.replace(&digest(2), &"a".repeat(63)),
         valid.replace("\"system_update_id\":1", "\"system_update_id\":4294967296"),
         valid.replace("\"system_update_id\":1", "\"system_update_id\":-1"),
         valid.replace(",\"contents_digest\":null", ""),
@@ -694,19 +688,69 @@ fn load_rejects_corruption_unknown_missing_fields_and_duplicate_uuid_aliases() {
     ];
 
     for json in invalid {
-        let directory = private_directory();
-        put(directory.path(), "revisions.json", json.as_bytes());
-
         assert!(
-            Store::open(directory.path(), id(1)).is_err(),
+            serde_json::from_str::<Ledger>(&json).is_err(),
             "accepted {json}"
         );
     }
+}
 
+#[test]
+fn validation_rejects_invalid_digests_and_identity() {
+    let valid = serde_json::to_string(&populated()).unwrap();
+
+    for json in [
+        valid.replace("\"contents_digest\":null", "\"contents_digest\":\"BAD\""),
+        valid.replace(&digest(2), &"A".repeat(64)),
+        valid.replace(&digest(2), &"g".repeat(64)),
+        valid.replace(&digest(2), &"a".repeat(63)),
+    ] {
+        let ledger: Ledger = serde_json::from_str(&json).unwrap();
+        assert!(ledger.validate(id(1)).is_err(), "accepted {json}");
+    }
+
+    let ledger = populated();
+    ledger.validate(id(1)).unwrap();
+    assert!(ledger.validate(id(99)).is_err());
+    assert!(ledger.validate(Uuid::nil()).is_err());
+}
+
+#[test]
+fn load_rejects_invalid_state_without_disclosing_json_or_removing_tmp() {
+    let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
+    let valid = serde_json::to_string(&populated()).unwrap();
     let directory = private_directory();
-    install(directory.path(), &populated());
-    assert!(Store::open(directory.path(), id(99)).is_err());
-    assert!(Store::open(directory.path(), Uuid::nil()).is_err());
+    put(directory.path(), "revisions.tmp", b"uncommitted");
+
+    for (json, uuid, diagnostic) in [
+        (
+            "{\"private-state-content\":0}".to_owned(),
+            id(1),
+            "invalid revision JSON at line ",
+        ),
+        (
+            valid.replace(&digest(2), "private-state-content"),
+            id(1),
+            "revision digest must be 64 lowercase hexadecimal characters",
+        ),
+        (
+            valid.clone(),
+            id(99),
+            "revision state has the wrong server UUID",
+        ),
+        (valid, Uuid::nil(), "server UUID must not be nil"),
+    ] {
+        put(directory.path(), "revisions.json", json.as_bytes());
+        let error = Store::open(directory.path(), uuid).err().unwrap();
+        let error = format!("{error:#}");
+        assert!(error.starts_with(diagnostic), "{error}");
+        assert!(!error.contains("private-state-content"), "{error}");
+
+        assert_eq!(
+            fs::read(directory.path().join("revisions.tmp")).unwrap(),
+            b"uncommitted"
+        );
+    }
 }
 
 #[test]
