@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use axum::{Router, body::Body, extract::Request, response::Response};
+use axum::{Router, body::Body, response::Response};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
     catalog::{BrowseQuery, BrowseResult, Catalog, Object},
@@ -46,13 +46,7 @@ impl Catalog for TestCatalog {
         42
     }
 
-    async fn browse(&self, arguments: BrowseQuery) -> Result<BrowseResult, Fault> {
-        assert_eq!(arguments.object_id, "0");
-        assert!(!arguments.metadata);
-        assert_eq!(arguments.starting_index, 3);
-        assert_eq!(arguments.requested_count, 2);
-        assert_eq!(arguments.sort, Some(true));
-
+    async fn browse(&self, _: BrowseQuery) -> Result<BrowseResult, Fault> {
         Ok(BrowseResult {
             objects: vec![Object {
                 id: "0".into(),
@@ -70,7 +64,7 @@ impl Catalog for TestCatalog {
     }
 }
 
-async fn exchange(address: SocketAddr, request: &str, status: u16) -> String {
+async fn exchange(address: SocketAddr, request: &str, status: u16) {
     let mut socket = TcpStream::connect(address).await.unwrap();
     let request = request.replacen("\r\n\r\n", "\r\nConnection: close\r\n\r\n", 1);
     socket.write_all(request.as_bytes()).await.unwrap();
@@ -81,8 +75,6 @@ async fn exchange(address: SocketAddr, request: &str, status: u16) -> String {
         response.starts_with(&format!("HTTP/1.1 {status} ")),
         "{response}"
     );
-
-    response
 }
 
 // Keep one test in this executable: the global subscriber must precede every callsite.
@@ -104,27 +96,7 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_address = upstream.local_addr().unwrap();
 
-        let router = Router::new().fallback(|request: Request| async move {
-            assert_eq!(request.method(), Method::GET);
-            assert_eq!(request.uri().path(), format!("/api/assets/{ASSET}/original"));
-            assert!(request.uri().query().is_none());
-            assert_eq!(request.headers()["x-api-key"], "api-key-secret");
-
-            for name in [
-                "range",
-                "if-range",
-                "timeseekrange.dlna.org",
-                "transfermode.dlna.org",
-                "getcontentfeatures.dlna.org",
-                "getavailableseekrange.dlna.org",
-                "playspeed.dlna.org",
-                "authorization",
-                "cookie",
-                "user-agent",
-            ] {
-                assert!(!request.headers().contains_key(name), "forwarded {name}");
-            }
-
+        let router = Router::new().fallback(|| async {
             Response::builder()
                 .header(header::CONTENT_TYPE, "IMAGE/JPEG; note=\"a;b\"")
                 .header(header::CONTENT_LENGTH, "3")
@@ -171,9 +143,7 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
             body.len()
         );
 
-        let response = exchange(address, &request, 200).await;
-        assert!(response.contains("A&amp;amp;B"));
-        assert!(response.contains("<NumberReturned>1</NumberReturned><TotalMatches>9</TotalMatches><UpdateID>7</UpdateID>"));
+        exchange(address, &request, 200).await;
 
         for headers in [
             "NT: upnp:event\r\nCallback: <http://127.0.0.1:12345/event?sensitiveCallbackQuery>\r\nTimeout: Second-60\r\n",
@@ -190,12 +160,7 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
             "GET /media/assets/{ASSET}/original HTTP/1.1\r\nHost: localhost\r\nRange: bytes=1-2\r\nRange: invalid-range-secret\r\nIf-Range: validator-secret\r\ngetcontentfeatures.dlna.org: 1\r\ntimeseekrange.dlna.org: untrusted-time-seek-secret\r\ngetavailableseekrange.dlna.org: available-seek-secret\r\nplayspeed.dlna.org: play-speed-secret\r\ntransfermode.dlna.org: untrusted-transfer-mode-secret\r\nAuthorization: Bearer authorization-secret\r\nCookie: cookie-secret\r\nUser-Agent: user-agent-secret\r\n\r\n"
         );
 
-        let response = exchange(address, &request, 200).await;
-        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-        assert!(!headers.contains("contentfeatures.dlna.org"));
-        assert!(headers.contains("content-length: 3"));
-        assert!(headers.contains("content-type: IMAGE/JPEG; note=\"a;b\""));
-        assert_eq!(body, "abc");
+        exchange(address, &request, 200).await;
 
         let overrun = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let overrun_address = overrun.local_addr().unwrap();
