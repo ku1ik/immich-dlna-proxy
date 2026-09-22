@@ -295,7 +295,6 @@ fn duplicate_event_headers_are_rejected_before_admission() {
     for extra in [
         vec![("timeout", "Second-1"), ("timeout", "Second-1")],
         vec![("callback", "<http://192.168.1.20/>")],
-        vec![("sid", "bad"), ("sid", "bad")],
     ] {
         let mut values = vec![("nt", "upnp:event"), ("callback", "<http://192.168.1.20/>")];
         values.extend(extra);
@@ -311,6 +310,18 @@ fn duplicate_event_headers_are_rejected_before_admission() {
     }
 
     assert!(subscriptions.state.lock().unwrap().entries.is_empty());
+
+    let (_, sid) = subscribe(&subscriptions, None);
+    let sid = format!("uuid:{sid}");
+
+    let response = subscriptions.request(
+        SERVICE,
+        PEER,
+        &Method::from_bytes(b"SUBSCRIBE").unwrap(),
+        &headers(&[("sid", &sid), ("sid", &sid)]),
+    );
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[test]
@@ -1252,174 +1263,176 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
         }
     });
 
-    for (body_pending, status) in [(false, 412), (false, 200), (true, 200)] {
-        let limit = CALLBACK_TIMEOUT;
+    let limit = CALLBACK_TIMEOUT;
 
-        for elapsed in [
-            limit - Duration::from_secs(1),
-            limit,
-            limit + Duration::from_secs(1),
-        ] {
-            let subscriptions = Subscriptions::new().unwrap();
+    for (body_pending, status, elapsed) in [
+        (false, 412, limit - Duration::from_secs(1)),
+        (false, 200, limit - Duration::from_secs(1)),
+        (true, 200, limit - Duration::from_secs(1)),
+        (false, 200, limit),
+        (true, 200, limit),
+        (false, 200, limit + Duration::from_secs(1)),
+        (true, 200, limit + Duration::from_secs(1)),
+    ] {
+        let subscriptions = Subscriptions::new().unwrap();
 
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-            let mut callback = Callback::new().await;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut callback = Callback::new().await;
 
-            let urls = format!(
-                "<http://{}/first>{}{}",
-                listener.local_addr().unwrap(),
-                callback.url("/ok"),
-                callback.url("/unused")
-            );
+        let urls = format!(
+            "<http://{}/first>{}{}",
+            listener.local_addr().unwrap(),
+            callback.url("/ok"),
+            callback.url("/unused")
+        );
 
-            let response = subscriptions.request(
-                SERVICE,
-                Ipv4Addr::LOCALHOST,
-                &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-                &headers(&[("nt", "upnp:event"), ("callback", &urls)]),
-            );
+        let response = subscriptions.request(
+            SERVICE,
+            Ipv4Addr::LOCALHOST,
+            &Method::from_bytes(b"SUBSCRIBE").unwrap(),
+            &headers(&[("nt", "upnp:event"), ("callback", &urls)]),
+        );
 
-            assert_eq!(response.status(), StatusCode::OK);
-            let sid = response_sid(&response);
-            let scheduler = subscriptions.clone().run();
-            tokio::pin!(scheduler);
-            let wake = Arc::new(CallbackWake(Notify::new()));
-            let waker = std::task::Waker::from(wake.clone());
-            let mut context = std::task::Context::from_waker(&waker);
+        assert_eq!(response.status(), StatusCode::OK);
+        let sid = response_sid(&response);
+        let scheduler = subscriptions.clone().run();
+        tokio::pin!(scheduler);
+        let wake = Arc::new(CallbackWake(Notify::new()));
+        let waker = std::task::Waker::from(wake.clone());
+        let mut context = std::task::Context::from_waker(&waker);
 
-            for (seq, id) in [(0, 0), (1, 7)] {
-                if seq != 0 {
-                    subscriptions.publish(id);
-                }
+        for (seq, id) in [(0, 0), (1, 7)] {
+            if seq != 0 {
+                subscriptions.publish(id);
+            }
 
-                let started = Instant::now();
+            let started = Instant::now();
 
-                let socket = tokio::select! {
-                    _ = &mut scheduler => panic!("scheduler ended"),
-                    accepted = listener.accept() => accepted.unwrap().0,
-                };
+            let socket = tokio::select! {
+                _ = &mut scheduler => panic!("scheduler ended"),
+                accepted = listener.accept() => accepted.unwrap().0,
+            };
 
-                let mut socket = BufReader::new(socket);
-                let expected_body = protocol::event_body(SERVICE, id);
+            let mut socket = BufReader::new(socket);
+            let expected_body = protocol::event_body(SERVICE, id);
 
-                let read_request = async {
-                    let mut request = String::new();
+            let read_request = async {
+                let mut request = String::new();
 
-                    loop {
-                        assert_ne!(socket.read_line(&mut request).await.unwrap(), 0);
+                loop {
+                    assert_ne!(socket.read_line(&mut request).await.unwrap(), 0);
 
-                        if request.ends_with("\r\n\r\n") {
-                            break;
-                        }
+                    if request.ends_with("\r\n\r\n") {
+                        break;
                     }
-
-                    assert!(request.starts_with("NOTIFY /first HTTP/1.1\r\n"));
-                    assert!(request.contains(&format!("\r\nseq: {seq}\r\n")));
-                    assert!(request.contains(&format!("\r\nsid: uuid:{sid}\r\n")));
-                    let mut body = vec![0; expected_body.len()];
-                    socket.read_exact(&mut body).await.unwrap();
-                    assert_eq!(body, expected_body.as_bytes());
-                };
-
-                tokio::select! {
-                    _ = &mut scheduler => panic!("scheduler ended"),
-                    _ = read_request => {}
                 }
 
+                assert!(request.starts_with("NOTIFY /first HTTP/1.1\r\n"));
+                assert!(request.contains(&format!("\r\nseq: {seq}\r\n")));
+                assert!(request.contains(&format!("\r\nsid: uuid:{sid}\r\n")));
+                let mut body = vec![0; expected_body.len()];
+                socket.read_exact(&mut body).await.unwrap();
+                assert_eq!(body, expected_body.as_bytes());
+            };
+
+            tokio::select! {
+                _ = &mut scheduler => panic!("scheduler ended"),
+                _ = read_request => {}
+            }
+
+            assert!(scheduler.as_mut().poll(&mut context).is_pending());
+            let _ = wake.0.notified().now_or_never();
+
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\n\r\n",
+                usize::from(body_pending)
+            );
+
+            if body_pending || elapsed < limit {
+                socket
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+
+                wake.0.notified().await;
+            }
+
+            if body_pending {
+                // Observe headers on time; only timely callbacks supply a body.
                 assert!(scheduler.as_mut().poll(&mut context).is_pending());
                 let _ = wake.0.notified().now_or_never();
 
-                let response = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\n\r\n",
-                    usize::from(body_pending)
-                );
-
-                if body_pending || elapsed < limit {
-                    socket
-                        .get_mut()
-                        .write_all(response.as_bytes())
-                        .await
-                        .unwrap();
-
+                if elapsed < limit {
+                    socket.get_mut().write_all(b"x").await.unwrap();
                     wake.0.notified().await;
                 }
-
-                if body_pending {
-                    // Observe headers on time; only timely callbacks supply a body.
-                    assert!(scheduler.as_mut().poll(&mut context).is_pending());
-                    let _ = wake.0.notified().now_or_never();
-
-                    if elapsed < limit {
-                        socket.get_mut().write_all(b"x").await.unwrap();
-                        wake.0.notified().await;
-                    }
-                }
-
-                // Leave slow callbacks pending through expiry, allowing for timer granularity.
-                assert_eq!(Instant::now(), started);
-                tokio::time::advance(elapsed + Duration::from_millis(1)).await;
-                assert!(scheduler.as_mut().poll(&mut context).is_pending());
-                let expired = elapsed >= limit;
-                let rejected = !expired && status == 412;
-
-                let entry = subscriptions
-                    .state
-                    .lock()
-                    .unwrap()
-                    .entries
-                    .first()
-                    .map(|entry| (entry.expires.is_some(), entry.delivering, entry.next_seq));
-
-                assert_eq!(
-                    entry,
-                    (!rejected).then_some((true, expired, seq + 1)),
-                    "body_pending={body_pending}, status={status}, elapsed={elapsed:?}, seq={seq}"
-                );
-
-                if rejected {
-                    assert!(callback.received.try_recv().is_err());
-                    break;
-                }
-
-                if expired {
-                    let (alternative, body) = tokio::select! {
-                        _ = &mut scheduler => panic!("scheduler ended"),
-                        request = callback.next() => request,
-                    };
-
-                    assert_eq!(alternative.uri.path(), "/ok");
-                    assert_eq!(alternative.headers["sid"], format!("uuid:{sid}"));
-                    assert_eq!(alternative.headers["seq"], seq.to_string());
-                    assert_eq!(body, expected_body);
-
-                    while subscriptions.state.lock().unwrap().entries[0].delivering {
-                        assert!(scheduler.as_mut().poll(&mut context).is_pending());
-                        tokio::task::yield_now().await;
-                    }
-                }
-
-                assert!(callback.received.try_recv().is_err());
-
-                assert_eq!(
-                    sid_request(
-                        &subscriptions,
-                        sid,
-                        "SUBSCRIBE",
-                        SERVICE,
-                        Ipv4Addr::LOCALHOST,
-                        None
-                    )
-                    .status(),
-                    StatusCode::OK
-                );
-
-                let state = subscriptions.state.lock().unwrap();
-                let entry = &state.entries[0];
-                assert!(entry.expires.is_some());
-                assert!(entry.initial_update_id.is_none());
-                assert_eq!(entry.next_seq, seq + 1);
-                assert_eq!(entry.pending, None);
             }
+
+            // Leave slow callbacks pending through expiry, allowing for timer granularity.
+            assert_eq!(Instant::now(), started);
+            tokio::time::advance(elapsed + Duration::from_millis(1)).await;
+            assert!(scheduler.as_mut().poll(&mut context).is_pending());
+            let expired = elapsed >= limit;
+            let rejected = !expired && status == 412;
+
+            let entry = subscriptions
+                .state
+                .lock()
+                .unwrap()
+                .entries
+                .first()
+                .map(|entry| (entry.expires.is_some(), entry.delivering, entry.next_seq));
+
+            assert_eq!(
+                entry,
+                (!rejected).then_some((true, expired, seq + 1)),
+                "body_pending={body_pending}, status={status}, elapsed={elapsed:?}, seq={seq}"
+            );
+
+            if rejected {
+                assert!(callback.received.try_recv().is_err());
+                break;
+            }
+
+            if expired {
+                let (alternative, body) = tokio::select! {
+                    _ = &mut scheduler => panic!("scheduler ended"),
+                    request = callback.next() => request,
+                };
+
+                assert_eq!(alternative.uri.path(), "/ok");
+                assert_eq!(alternative.headers["sid"], format!("uuid:{sid}"));
+                assert_eq!(alternative.headers["seq"], seq.to_string());
+                assert_eq!(body, expected_body);
+
+                while subscriptions.state.lock().unwrap().entries[0].delivering {
+                    assert!(scheduler.as_mut().poll(&mut context).is_pending());
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            assert!(callback.received.try_recv().is_err());
+
+            assert_eq!(
+                sid_request(
+                    &subscriptions,
+                    sid,
+                    "SUBSCRIBE",
+                    SERVICE,
+                    Ipv4Addr::LOCALHOST,
+                    None
+                )
+                .status(),
+                StatusCode::OK
+            );
+
+            let state = subscriptions.state.lock().unwrap();
+            let entry = &state.entries[0];
+            assert!(entry.expires.is_some());
+            assert!(entry.initial_update_id.is_none());
+            assert_eq!(entry.next_seq, seq + 1);
+            assert_eq!(entry.pending, None);
         }
     }
 

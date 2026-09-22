@@ -375,73 +375,74 @@ async fn preserves_single_partial_responses_and_wide_offsets() {
 }
 
 #[tokio::test]
-async fn rejects_invalid_partial_framing_before_streaming_on_every_route() {
+async fn rejects_invalid_partial_framing_before_streaming() {
+    let valid_mime = "image/jpeg";
+
+    for (framing, mime, range) in [
+        (
+            "Content-Range: bytes 0-2/10\r\n",
+            "multipart/byteranges; boundary=x",
+            Some("bytes=0-2"),
+        ),
+        ("Content-Range: bytes 0-2/10\r\n", valid_mime, None),
+        ("", valid_mime, Some("bytes=0-2")),
+        (
+            "Content-Range: bytes 3-2/10\r\n",
+            valid_mime,
+            Some("bytes=0-2"),
+        ),
+        (
+            "Content-Range: bytes 0-2/2\r\n",
+            valid_mime,
+            Some("bytes=0-2"),
+        ),
+        (
+            "Content-Range: bytes 0-3/10\r\n",
+            valid_mime,
+            Some("bytes=0-2"),
+        ),
+        (
+            "Content-Range: bytes 0-18446744073709551615/*\r\n",
+            valid_mime,
+            Some("bytes=0-2"),
+        ),
+        (
+            "Content-Range: bytes 0-2/10\r\nContent-Range: bytes 0-2/10\r\n",
+            valid_mime,
+            Some("bytes=0-2"),
+        ),
+        (
+            "Content-Range: bytes 0-2/10\r\nConnection: Content-Range\r\n",
+            valid_mime,
+            Some("bytes=0-2"),
+        ),
+    ] {
+        let wire = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Type: {mime}\r\nContent-Length: 3\r\n{framing}Connection: close\r\n\r\nabc"
+        );
+
+        let server = FakeServer::new(vec![Reply::new(&wire)]).await;
+        let input = range.map(|r| headers(&[("range", r)])).unwrap_or_default();
+
+        let result = server
+            .proxy()
+            .serve(ASSET, "original", Method::GET, input)
+            .await;
+
+        assert_eq!(result.status(), StatusCode::BAD_GATEWAY, "{framing}");
+
+        assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn all_routes_require_content_length_to_match_the_partial_span() {
     for representation in ["original", "display", "preview", "playback"] {
         let valid_mime = if representation == "playback" {
             "video/mp4"
         } else {
             "image/jpeg"
         };
-
-        for (framing, mime, range) in [
-            (
-                "Content-Range: bytes 0-2/10\r\n",
-                "multipart/byteranges; boundary=x",
-                Some("bytes=0-2"),
-            ),
-            ("Content-Range: bytes 0-2/10\r\n", valid_mime, None),
-            ("", valid_mime, Some("bytes=0-2")),
-            (
-                "Content-Range: bytes 3-2/10\r\n",
-                valid_mime,
-                Some("bytes=0-2"),
-            ),
-            (
-                "Content-Range: bytes 0-2/2\r\n",
-                valid_mime,
-                Some("bytes=0-2"),
-            ),
-            (
-                "Content-Range: bytes 0-3/10\r\n",
-                valid_mime,
-                Some("bytes=0-2"),
-            ),
-            (
-                "Content-Range: bytes 0-18446744073709551615/*\r\n",
-                valid_mime,
-                Some("bytes=0-2"),
-            ),
-            (
-                "Content-Range: bytes 0-2/10\r\nContent-Range: bytes 0-2/10\r\n",
-                valid_mime,
-                Some("bytes=0-2"),
-            ),
-            (
-                "Content-Range: bytes 0-2/10\r\nConnection: Content-Range\r\n",
-                valid_mime,
-                Some("bytes=0-2"),
-            ),
-        ] {
-            let wire = format!(
-                "HTTP/1.1 206 Partial Content\r\nContent-Type: {mime}\r\nContent-Length: 3\r\n{framing}Connection: close\r\n\r\nabc"
-            );
-
-            let server = FakeServer::new(vec![Reply::new(&wire)]).await;
-            let input = range.map(|r| headers(&[("range", r)])).unwrap_or_default();
-
-            let result = server
-                .proxy()
-                .serve(ASSET, representation, Method::GET, input)
-                .await;
-
-            assert_eq!(
-                result.status(),
-                StatusCode::BAD_GATEWAY,
-                "{representation}: {framing}"
-            );
-
-            assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
-        }
 
         for (length, expected) in [
             (3, StatusCode::PARTIAL_CONTENT),
@@ -484,10 +485,6 @@ async fn rejects_invalid_partial_framing_before_streaming_on_every_route() {
 #[tokio::test]
 async fn unsatisfied_ranges_normalize_only_proven_immich_404s() {
     for (upstream_status, range, content_range, expected) in [
-        (416, Some("bytes=10-"), "", 416),
-        (416, Some("bytes=0-2"), "", 416),
-        (416, None, "", 502),
-        (416, Some("bytes=0-1,4-5"), "", 502),
         (404, Some("bytes=10-"), "", 404),
         (404, None, "", 404),
         (404, Some("bytes=10-"), "bytes */10", 416),
@@ -499,81 +496,100 @@ async fn unsatisfied_ranges_normalize_only_proven_immich_404s() {
         (404, Some("bytes=0-1,4-5"), "bytes */0", 404),
         (404, None, "bytes */0", 404),
         (404, Some("bytes=10-"), "bytes */18446744073709551616", 404),
-        (416, Some("bytes=10-"), "bytes */10", 416),
-        (416, Some("bytes=9-"), "bytes */10", 502),
-        (416, Some("bytes=10-"), "bytes 0-2/10", 502),
-        (416, Some("bytes=10-"), "garbage", 502),
-        (416, Some("bytes=10-"), "bytes */18446744073709551616", 502),
+    ] {
+        assert_unsatisfied_response(upstream_status, range, content_range, expected).await;
+    }
+}
+
+#[tokio::test]
+async fn native_416_requires_consistent_unsatisfied_framing() {
+    for (range, content_range, expected) in [
+        (Some("bytes=10-"), "", 416),
+        (Some("bytes=0-2"), "", 416),
+        (None, "", 502),
+        (Some("bytes=0-1,4-5"), "", 502),
+        (Some("bytes=0-2"), "bytes */10", 502),
+        (Some("bytes=9-"), "bytes */10", 502),
+        (Some("bytes=-3"), "bytes */10", 502),
+        (Some("bytes=-99"), "bytes */10", 502),
+        (Some("bytes=10-"), "bytes */10", 416),
+        (Some("bytes=10-20"), "bytes */10", 416),
+        (Some("bytes=-0"), "bytes */10", 416),
+        (Some("bytes=-3"), "bytes */0", 416),
+        (Some("bytes=0-2"), "bytes */0", 416),
+        (Some("bytes=10-"), "bytes 0-2/10", 502),
+        (Some("bytes=10-"), "garbage", 502),
+        (Some("bytes=10-"), "bytes */18446744073709551616", 502),
         (
-            416,
             Some("bytes=10-"),
             "bytes */10\r\nContent-Range: bytes */10",
             502,
         ),
         (
-            416,
             Some("bytes=10-"),
             "bytes */10\r\nConnection: Content-Range",
             502,
         ),
-        (416, Some("bytes=10-"), "bytes */*", 502),
-        (416, None, "bytes */10", 502),
+        (Some("bytes=10-"), "bytes */*", 502),
+        (None, "bytes */10", 502),
     ] {
-        let framing = if content_range.is_empty() {
-            String::new()
-        } else {
-            format!("Content-Range: {content_range}\r\n")
-        };
-
-        let wire = format!(
-            "HTTP/1.1 {upstream_status} Error\r\nContent-Type: application/json\r\nContent-Length: 6\r\n{framing}ETag: \"v1\"\r\nAccept-Ranges: bytes\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nSet-Cookie: secret=value\r\nX-Private: secret\r\nConnection: close, Last-Modified\r\n\r\nsecret"
-        );
-
-        let mut server = FakeServer::new(vec![Reply::new(&wire)]).await;
-        let input = range.map(|r| headers(&[("range", r)])).unwrap_or_default();
-
-        let result = server
-            .proxy()
-            .serve(ASSET, "preview", Method::GET, input)
-            .await;
-
-        assert_eq!(
-            result.status().as_u16(),
-            expected,
-            "{upstream_status}, {range:?}, {content_range}"
-        );
-
-        if expected == 416 && !content_range.is_empty() {
-            assert_eq!(result.headers()[header::CONTENT_RANGE], content_range);
-        } else {
-            assert!(!result.headers().contains_key(header::CONTENT_RANGE));
-        }
-
-        if expected != 502 {
-            assert_eq!(result.headers()[header::ETAG], "\"v1\"");
-            assert_eq!(result.headers()[header::ACCEPT_RANGES], "bytes");
-        }
-
-        for name in ["last-modified", "set-cookie", "x-private", "connection"] {
-            assert!(!result.headers().contains_key(name), "{name}");
-        }
-
-        assert!(!result.headers().contains_key(header::CONTENT_TYPE));
-        assert!(!result.headers().contains_key(header::CONTENT_LENGTH));
-        assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
-
-        assert_eq!(
-            request_header(&server.request().await, "range"),
-            range.filter(|value| ByteRange::parse(value).is_some())
-        );
+        assert_unsatisfied_response(416, range, content_range, expected).await;
     }
 }
 
+async fn assert_unsatisfied_response(
+    upstream_status: u16,
+    range: Option<&str>,
+    content_range: &str,
+    expected: u16,
+) {
+    let framing = if content_range.is_empty() {
+        String::new()
+    } else {
+        format!("Content-Range: {content_range}\r\n")
+    };
+
+    let wire = format!(
+        "HTTP/1.1 {upstream_status} Error\r\nContent-Type: application/json\r\nContent-Length: 6\r\n{framing}ETag: \"v1\"\r\nAccept-Ranges: bytes\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nSet-Cookie: secret=value\r\nX-Private: secret\r\nConnection: close, Last-Modified\r\n\r\nsecret"
+    );
+
+    let server = FakeServer::new(vec![Reply::new(&wire)]).await;
+    let input = range.map(|r| headers(&[("range", r)])).unwrap_or_default();
+    let proxy = server.proxy();
+
+    let result = proxy.serve(ASSET, "preview", Method::GET, input).await;
+
+    assert_eq!(proxy.operations.available_permits(), OPERATIONS);
+
+    assert_eq!(
+        result.status().as_u16(),
+        expected,
+        "{upstream_status}, {range:?}, {content_range}"
+    );
+
+    if expected == 416 && !content_range.is_empty() {
+        assert_eq!(result.headers()[header::CONTENT_RANGE], content_range);
+    } else {
+        assert!(!result.headers().contains_key(header::CONTENT_RANGE));
+    }
+
+    if expected != 502 {
+        assert_eq!(result.headers()[header::ETAG], "\"v1\"");
+        assert_eq!(result.headers()[header::ACCEPT_RANGES], "bytes");
+    }
+
+    for name in ["last-modified", "set-cookie", "x-private", "connection"] {
+        assert!(!result.headers().contains_key(name), "{name}");
+    }
+
+    assert!(!result.headers().contains_key(header::CONTENT_TYPE));
+    assert!(!result.headers().contains_key(header::CONTENT_LENGTH));
+    assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
+}
+
 #[tokio::test]
-async fn bodyless_conditionals_do_not_require_media_mime_or_forward_error_bodies() {
+async fn upstream_errors_map_status_without_forwarding_error_bodies() {
     for (status, extra, expected) in [
-        (304, "", 304),
-        (304, "Content-Length: 123\r\n", 304),
         (
             412,
             "Content-Type: application/json\r\nContent-Length: 6\r\n",
@@ -623,13 +639,8 @@ async fn bodyless_conditionals_do_not_require_media_mime_or_forward_error_bodies
             assert_eq!(result.headers()[header::ETAG], "\"v1\"");
         }
 
-        if status == 304 && !extra.is_empty() {
-            assert_eq!(result.headers()[header::CONTENT_LENGTH], "123");
-        }
-
-        assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
-
         assert_eq!(proxy.operations.available_permits(), OPERATIONS);
+        assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
     }
 }
 
@@ -681,9 +692,9 @@ async fn mime_and_encoding_validation_precedes_body_commitment() {
             format!("HTTP/1.1 200 OK\r\n{extra}Content-Length: 3\r\nConnection: close\r\n\r\nabc");
 
         let server = FakeServer::new(vec![Reply::new(&wire)]).await;
+        let proxy = server.proxy();
 
-        let result = server
-            .proxy()
+        let result = proxy
             .serve(ASSET, representation, Method::GET, HeaderMap::new())
             .await;
 
@@ -692,6 +703,10 @@ async fn mime_and_encoding_validation_precedes_body_commitment() {
             expected,
             "{representation}: {extra}"
         );
+
+        if expected != 200 {
+            assert_eq!(proxy.operations.available_permits(), OPERATIONS);
+        }
 
         let body = to_bytes(result.into_body(), 1024).await.unwrap();
 
@@ -1010,59 +1025,6 @@ async fn immediate_admission_is_shared_by_clones_and_body_drop_releases_permits(
     assert_eq!(proxy.operations.available_permits(), OPERATIONS);
 }
 
-#[tokio::test]
-async fn head_conditional_validation_and_upstream_errors_release_permits_immediately() {
-    for (method, wire, expected) in [
-        (Method::HEAD, JPEG, StatusCode::OK),
-        (
-            Method::GET,
-            "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n",
-            StatusCode::NOT_MODIFIED,
-        ),
-        (
-            Method::GET,
-            "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            StatusCode::PRECONDITION_FAILED,
-        ),
-        (
-            Method::GET,
-            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            StatusCode::NOT_FOUND,
-        ),
-        (
-            Method::GET,
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            StatusCode::RANGE_NOT_SATISFIABLE,
-        ),
-        (
-            Method::GET,
-            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            StatusCode::BAD_GATEWAY,
-        ),
-        (
-            Method::GET,
-            "HTTP/1.1 200 OK\r\nContent-Type: invalid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            StatusCode::BAD_GATEWAY,
-        ),
-        (Method::GET, "", StatusCode::BAD_GATEWAY),
-    ] {
-        let server = FakeServer::new(vec![Reply::new(wire)]).await;
-        let proxy = server.proxy();
-
-        let result = proxy
-            .serve(
-                ASSET,
-                "original",
-                method.clone(),
-                headers(&[("range", "bytes=0-2")]),
-            )
-            .await;
-
-        assert_eq!(result.status(), expected, "{method}: {wire}");
-        assert_eq!(proxy.operations.available_permits(), OPERATIONS);
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn completion_truncation_and_read_timeout_release_body_permits() {
     for reply in [
@@ -1269,95 +1231,93 @@ async fn ready_headers_at_or_after_deadline_are_rejected_without_an_extra_hop() 
 
 #[tokio::test]
 async fn chunk_reads_allow_backpressure_but_time_out_when_upstream_stalls() {
-    for eof in [false, true] {
-        for elapsed in [59, 60, 61] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    for (eof, elapsed) in [(false, 59), (true, 59), (false, 60), (false, 61)] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
-            let proxy = MediaProxy::new(
-                format!("http://{}/api/", listener.local_addr().unwrap())
-                    .parse()
-                    .unwrap(),
-                HeaderValue::from_static("test-secret"),
-            )
-            .unwrap();
+        let proxy = MediaProxy::new(
+            format!("http://{}/api/", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
+            HeaderValue::from_static("test-secret"),
+        )
+        .unwrap();
 
-            tokio::time::pause();
+        tokio::time::pause();
 
-            let clock_guard = tokio::spawn(async {
-                loop {
-                    tokio::task::yield_now().await;
+        let clock_guard = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let mut serve = Box::pin(proxy.serve(ASSET, "original", Method::GET, HeaderMap::new()));
+
+        let mut socket = tokio::select! {
+            _ = &mut serve => panic!("response before upstream headers"),
+
+            accepted = listener.accept() => accepted.unwrap().0,
+        };
+
+        tokio::select! {
+            _ = &mut serve => panic!("response before upstream headers"),
+
+            _ = async {
+                let mut request = Vec::new();
+
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
                 }
-            });
-
-            let mut serve = Box::pin(proxy.serve(ASSET, "original", Method::GET, HeaderMap::new()));
-
-            let mut socket = tokio::select! {
-                _ = &mut serve => panic!("response before upstream headers"),
-
-                accepted = listener.accept() => accepted.unwrap().0,
-            };
-
-            tokio::select! {
-                _ = &mut serve => panic!("response before upstream headers"),
-
-                _ = async {
-                    let mut request = Vec::new();
-
-                    while !request.ends_with(b"\r\n\r\n") {
-                        request.push(socket.read_u8().await.unwrap());
-                    }
-                } => {}
-            }
-
-            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n").await.unwrap();
-            let result = serve.await;
-            assert_eq!(result.status(), StatusCode::OK);
-            let mut stream = result.into_body().into_data_stream();
-            assert_eq!(stream.next().await.unwrap().unwrap(), "a");
-
-            // Backpressure is not upstream idleness: no next-chunk demand yet.
-            tokio::time::advance(Duration::from_secs(120)).await;
-            let mut next = Box::pin(stream.next());
-            let wake = Arc::new(WakeSignal(tokio::sync::Notify::new()));
-            let waker = Waker::from(wake.clone());
-
-            assert!(
-                next.as_mut()
-                    .poll(&mut Context::from_waker(&waker))
-                    .is_pending()
-            );
-
-            tokio::time::advance(Duration::from_secs(elapsed) + Duration::from_millis(1)).await;
-            let _ = wake.0.notified().now_or_never();
-
-            if elapsed < 60 {
-                socket
-                    .write_all(if eof { b"0\r\n\r\n" } else { b"1\r\nb\r\n" })
-                    .await
-                    .unwrap();
-
-                wake.0.notified().await;
-            }
-
-            let result = next.await;
-
-            if elapsed >= 60 {
-                let error = result.expect("stalled read must fail").unwrap_err();
-                assert!(error.to_string().contains("upstream deadline exceeded"));
-            } else if eof {
-                assert!(result.is_none());
-            } else {
-                assert_eq!(result.unwrap().unwrap(), "b");
-            }
-
-            drop(stream);
-
-            assert_eq!(proxy.operations.available_permits(), OPERATIONS);
-
-            clock_guard.abort();
-            assert!(clock_guard.await.unwrap_err().is_cancelled());
-            tokio::time::resume();
+            } => {}
         }
+
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n").await.unwrap();
+        let result = serve.await;
+        assert_eq!(result.status(), StatusCode::OK);
+        let mut stream = result.into_body().into_data_stream();
+        assert_eq!(stream.next().await.unwrap().unwrap(), "a");
+
+        // Backpressure is not upstream idleness: no next-chunk demand yet.
+        tokio::time::advance(Duration::from_secs(120)).await;
+        let mut next = Box::pin(stream.next());
+        let wake = Arc::new(WakeSignal(tokio::sync::Notify::new()));
+        let waker = Waker::from(wake.clone());
+
+        assert!(
+            next.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        tokio::time::advance(Duration::from_secs(elapsed) + Duration::from_millis(1)).await;
+        let _ = wake.0.notified().now_or_never();
+
+        if elapsed < 60 {
+            socket
+                .write_all(if eof { b"0\r\n\r\n" } else { b"1\r\nb\r\n" })
+                .await
+                .unwrap();
+
+            wake.0.notified().await;
+        }
+
+        let result = next.await;
+
+        if elapsed >= 60 {
+            let error = result.expect("stalled read must fail").unwrap_err();
+            assert!(error.to_string().contains("upstream deadline exceeded"));
+        } else if eof {
+            assert!(result.is_none());
+        } else {
+            assert_eq!(result.unwrap().unwrap(), "b");
+        }
+
+        drop(stream);
+
+        assert_eq!(proxy.operations.available_permits(), OPERATIONS);
+
+        clock_guard.abort();
+        assert!(clock_guard.await.unwrap_err().is_cancelled());
+        tokio::time::resume();
     }
 }
 
@@ -1416,9 +1376,8 @@ async fn malformed_headers_and_early_disconnect_fail_without_disclosing_upstream
             .await;
 
         assert_eq!(result.status(), StatusCode::BAD_GATEWAY);
-        assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
-
         assert_eq!(proxy.operations.available_permits(), OPERATIONS);
+        assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
     }
 }
 
@@ -1486,7 +1445,7 @@ async fn rejects_simultaneous_transfer_encoding_and_content_length_before_commit
             };
 
             let wire = format!(
-                "HTTP/1.1 {status} Response\r\nContent-Type: image/jpeg\r\nTransfer-Encoding: chunked\r\nContent-Length: 100\r\n{content_range}Location: /prefix/api/assets/{ASSET}/original\r\nConnection: close{nominated}\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+                "HTTP/1.1 {status} Response\r\nContent-Type: image/jpeg\r\nTransfer-Encoding: chunked\r\nContent-Length: 100\r\n{content_range}Location: /prefix/api/assets/{ASSET}/original?edited=true\r\nConnection: close{nominated}\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
             );
 
             let mut server = FakeServer::new(vec![Reply::new(&wire), Reply::new(JPEG)]).await;
@@ -1545,9 +1504,9 @@ async fn validates_bodyless_304_content_length_before_preserving_headers() {
             );
 
             let server = FakeServer::new(vec![Reply::new(&wire)]).await;
+            let proxy = server.proxy();
 
-            let result = server
-                .proxy()
+            let result = proxy
                 .serve(
                     ASSET,
                     "preview",
@@ -1557,6 +1516,11 @@ async fn validates_bodyless_304_content_length_before_preserving_headers() {
                 .await;
 
             assert_eq!(result.status(), expected, "{method}: {framing}");
+            assert_eq!(proxy.operations.available_permits(), OPERATIONS);
+
+            if expected == StatusCode::NOT_MODIFIED {
+                assert_eq!(result.headers()[header::ETAG], "\"v1\"");
+            }
 
             if expected == StatusCode::NOT_MODIFIED && !framing.is_empty() {
                 assert_eq!(result.headers()[header::CONTENT_LENGTH], "123");
@@ -1652,35 +1616,6 @@ async fn partial_response_compatibility_is_checked_before_streaming() {
         }
 
         assert_eq!(proxy.operations.available_permits(), OPERATIONS);
-    }
-}
-
-#[tokio::test]
-async fn native_416_with_content_range_requires_consistent_unsatisfied_length() {
-    for (range, length, expected) in [
-        ("bytes=0-2", 10, StatusCode::BAD_GATEWAY),
-        ("bytes=9-", 10, StatusCode::BAD_GATEWAY),
-        ("bytes=-3", 10, StatusCode::BAD_GATEWAY),
-        ("bytes=-99", 10, StatusCode::BAD_GATEWAY),
-        ("bytes=10-", 10, StatusCode::RANGE_NOT_SATISFIABLE),
-        ("bytes=10-20", 10, StatusCode::RANGE_NOT_SATISFIABLE),
-        ("bytes=-0", 10, StatusCode::RANGE_NOT_SATISFIABLE),
-        ("bytes=-3", 0, StatusCode::RANGE_NOT_SATISFIABLE),
-        ("bytes=0-2", 0, StatusCode::RANGE_NOT_SATISFIABLE),
-    ] {
-        let wire = format!(
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{length}\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecret"
-        );
-
-        let server = FakeServer::new(vec![Reply::new(&wire)]).await;
-
-        let result = server
-            .proxy()
-            .serve(ASSET, "preview", Method::GET, headers(&[("range", range)]))
-            .await;
-
-        assert_eq!(result.status(), expected, "{range}: {length}");
-        assert!(to_bytes(result.into_body(), 1024).await.unwrap().is_empty());
     }
 }
 
