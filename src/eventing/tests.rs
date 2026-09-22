@@ -203,11 +203,6 @@ fn malformed_headers_never_reserve_capacity() {
             vec![("sid", "bad"), ("nt", "upnp:event")],
             StatusCode::BAD_REQUEST,
         ),
-        (
-            "SUBSCRIBE",
-            vec![("nt", "upnp:event"), ("nt", "upnp:event")],
-            StatusCode::BAD_REQUEST,
-        ),
         ("UNSUBSCRIBE", vec![], StatusCode::BAD_REQUEST),
         (
             "UNSUBSCRIBE",
@@ -291,34 +286,33 @@ fn subscription_capacity_is_bounded() {
 #[test]
 fn duplicate_event_headers_are_rejected_before_admission() {
     let subscriptions = Subscriptions::new().unwrap();
+    let sid = "uuid:00000000-0000-0000-0000-000000000001";
 
-    for extra in [
-        vec![("timeout", "Second-1"), ("timeout", "Second-1")],
-        vec![("callback", "<http://192.168.1.20/>")],
+    for values in [
+        &[("nt", "upnp:event"), ("nt", "upnp:event")][..],
+        &[
+            ("nt", "upnp:event"),
+            ("callback", "<http://192.168.1.20/>"),
+            ("timeout", "Second-1"),
+            ("timeout", "Second-1"),
+        ],
+        &[
+            ("nt", "upnp:event"),
+            ("callback", "<http://192.168.1.20/>"),
+            ("callback", "<http://192.168.1.20/>"),
+        ],
+        &[("sid", sid), ("sid", sid)],
     ] {
-        let mut values = vec![("nt", "upnp:event"), ("callback", "<http://192.168.1.20/>")];
-        values.extend(extra);
-
         let response = subscriptions.request(
             SERVICE,
             PEER,
             &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-            &headers(&values),
+            &headers(values),
         );
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{values:?}");
     }
 
-    let sid = "uuid:00000000-0000-0000-0000-000000000001";
-
-    let response = subscriptions.request(
-        SERVICE,
-        PEER,
-        &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-        &headers(&[("sid", sid), ("sid", sid)]),
-    );
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(subscriptions.state.lock().unwrap().entries.is_empty());
 }
 
