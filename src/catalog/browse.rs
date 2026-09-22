@@ -355,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn ids_and_date_ordering() {
+    fn object_ids_accept_canonical_namespaces_and_normalize_uuids() {
         let album = Uuid::from_u128(100_000);
         let asset = Uuid::from_u128(0xabcdef);
         let id = format!("album:{album}:asset:{asset}");
@@ -389,7 +389,10 @@ mod tests {
         ] {
             assert_eq!(parse_id(id), Err(Fault { code: 701 }));
         }
+    }
 
+    #[test]
+    fn date_ordering_uses_capture_then_uuid_ties_and_keeps_missing_dates_last() {
         let early = "2023-12-31T22:30:00Z".parse::<DateTime<Utc>>().unwrap();
         let late = "2024-01-01T00:30:00Z".parse::<DateTime<Utc>>().unwrap();
         let low = Uuid::from_u128(1);

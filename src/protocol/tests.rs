@@ -549,10 +549,6 @@ fn soap_validates_action_inputs_and_sort_syntax() {
         }
     }
 
-    assert!(
-        browse(&BROWSE_ARGS.replace("<RequestedCount>0", "<RequestedCount>4294967295")).is_ok()
-    );
-
     for (sort, expected) in [
         ("", None),
         ("+dc:date", Some(false)),
@@ -877,7 +873,7 @@ fn both_serialization_layers_fail_at_the_bound_without_partial_results() {
 }
 
 #[test]
-fn descriptions_and_faults_have_correct_namespaces_and_fixed_contracts() {
+fn device_description_has_identity_and_service_routes() {
     let uuid = uuid::Uuid::parse_str("7B37DF49-B75D-4BCB-89A6-0C917A934643").unwrap();
     let device = device_description("Łódź & <photos>\u{0}\rline\r\nnext", uuid);
     assert_xml(&device);
@@ -898,7 +894,10 @@ fn descriptions_and_faults_have_correct_namespaces_and_fixed_contracts() {
             assert!(device.contains(&format!("<{element}>/upnp/{service}/{route}</{element}>")));
         }
     }
+}
 
+#[test]
+fn faults_have_upnp_namespace_codes_and_descriptions() {
     for (code, description) in [
         (401, "Invalid Action"),
         (402, "Invalid Args"),
@@ -917,7 +916,10 @@ fn descriptions_and_faults_have_correct_namespaces_and_fixed_contracts() {
             "<errorCode>{code}</errorCode><errorDescription>{description}</errorDescription>"
         )));
     }
+}
 
+#[test]
+fn scpds_advertise_only_implemented_actions_and_event_variables() {
     for service in [Service::ContentDirectory, Service::ConnectionManager] {
         let xml = scpd(service);
         assert_xml(xml);

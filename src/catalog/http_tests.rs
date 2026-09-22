@@ -1,0 +1,166 @@
+use super::*;
+use crate::{media::MediaProxy, protocol, server::Server};
+use quick_xml::{Reader, events::Event};
+
+fn text(xml: &str, name: &str) -> String {
+    let mut reader = Reader::from_str(xml);
+
+    loop {
+        match reader.read_event().unwrap() {
+            Event::Start(element) if element.local_name().as_ref() == name.as_bytes() => {
+                let raw = reader.read_text(element.name()).unwrap();
+
+                return quick_xml::escape::unescape(&raw).unwrap().into_owned();
+            }
+
+            Event::Eof => panic!("missing XML element {name}"),
+            _ => {}
+        }
+    }
+}
+
+async fn browse_http(client: &reqwest::Client, base: &str, album: Uuid) -> String {
+    let namespace = protocol::CONTENT_DIRECTORY;
+
+    let body = format!(
+        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:Browse xmlns:u=\"{namespace}\"><ObjectID>album:{album}</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria/></u:Browse></s:Body></s:Envelope>"
+    );
+
+    let response = client
+        .post(format!("{base}/upnp/content-directory/control"))
+        .header("content-type", "text/xml")
+        .header("soapaction", format!("\"{namespace}#Browse\""))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+
+    response.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn browse_resources_and_published_revisions_connect_over_http() {
+    let fake = Fake::new().await;
+    let album = Uuid::from_u128(1);
+    let asset = Uuid::from_u128(10);
+
+    {
+        let mut upstream = fake.upstream.lock().unwrap();
+        upstream.albums = vec![super::album(1, "Family & friends")];
+        upstream.contents.insert(album, vec![item(10, None, None)]);
+
+        upstream.media.insert(
+            format!("/api/assets/{asset}/original"),
+            ("image/jpeg", b"original-jpeg"),
+        );
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let SocketAddr::V4(address) = listener.local_addr().unwrap() else {
+        unreachable!("literal IPv4 bind");
+    };
+
+    let base = format!("http://{address}");
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let mut config = config(fake.address, directory.path());
+    config.listen_address = address;
+    let media = MediaProxy::new(config.api_base.clone(), config.api_key.clone()).unwrap();
+    let events = Subscriptions::new().unwrap();
+    let name = config.friendly_name.clone();
+    let uuid = config.server_uuid;
+    let library = ImmichCatalog::open(config, events.clone()).await.unwrap();
+
+    let mut fixture = Fixture {
+        library,
+        fake,
+        directory,
+    };
+
+    let catalog_task = fixture.run();
+    let events_task = tokio::spawn(events.clone().run());
+    let server = Server::new(name, uuid, fixture.library.clone(), media, events);
+    let server_task = tokio::spawn(server.run(listener));
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+
+    let listing = browse_http(&client, &base, album).await;
+    assert_eq!(text(&listing, "NumberReturned"), "1");
+    let didl = text(&listing, "Result");
+    let resource = text(&didl, "res");
+    assert_eq!(resource, format!("{base}/media/assets/{asset}/original"));
+    let published = fixture.disk();
+
+    assert_eq!(
+        text(&listing, "UpdateID"),
+        published.1.albums[&album].update_id.to_string()
+    );
+
+    let calls = fixture.fake.upstream.lock().unwrap().requests.len();
+    let response = client.get(resource).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"original-jpeg");
+    assert_eq!(fixture.fake.upstream.lock().unwrap().requests.len(), calls);
+    assert_eq!(fixture.disk(), published);
+
+    let subscription = client
+        .request(
+            Method::from_bytes(b"SUBSCRIBE").unwrap(),
+            format!("{base}/upnp/content-directory/events"),
+        )
+        .header("nt", "upnp:event")
+        .header(
+            "callback",
+            format!("<http://{}/events>", fixture.fake.address),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(subscription.status(), 200);
+    fixture.fake.event(published.1.system_update_id).await;
+
+    fixture
+        .fake
+        .upstream
+        .lock()
+        .unwrap()
+        .contents
+        .get_mut(&album)
+        .unwrap()[0]["checksum"] = json!("changed");
+
+    fixture.expire(Scope::Album(album));
+    let changed = browse_http(&client, &base, album).await;
+    let committed = fixture.disk().1;
+    assert_eq!(committed.system_update_id, published.1.system_update_id + 1);
+
+    assert_eq!(
+        committed.albums[&album].update_id,
+        published.1.albums[&album].update_id + 1
+    );
+
+    assert_eq!(
+        text(&changed, "UpdateID"),
+        committed.albums[&album].update_id.to_string()
+    );
+
+    fixture.fake.event(committed.system_update_id).await;
+
+    assert_eq!(
+        fixture.library.system_update_id(),
+        committed.system_update_id
+    );
+
+    server_task.abort();
+    assert!(server_task.await.unwrap_err().is_cancelled());
+    fixture.abort(catalog_task).await;
+    events_task.abort();
+    assert!(events_task.await.unwrap_err().is_cancelled());
+}

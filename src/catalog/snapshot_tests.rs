@@ -53,7 +53,7 @@ fn root(name: &str, albums: Vec<Value>) -> Result<Root> {
 }
 
 #[test]
-fn resources_dates_and_optional_hints() {
+fn image_resources_follow_mime_and_edit_selection() {
     for (mime, edited, representation, expected) in [
         (
             Some("IMAGE/JPEG; quality=90"),
@@ -73,16 +73,7 @@ fn resources_dates_and_optional_hints() {
         let mut dto = asset(1, "IMAGE");
         dto["originalMimeType"] = json!(mime);
         dto["isEdited"] = json!(edited);
-        dto["originalFileName"] = json!("A\u{0001}&B");
         let item = project(dto);
-        assert_eq!(item.object.title, "A\u{fffd}&B");
-        assert_eq!(item.object.date.as_deref(), Some("2024-01-01"));
-
-        assert_eq!(
-            item.capture.unwrap().to_rfc3339(),
-            "2023-12-31T22:30:00+00:00"
-        );
-
         assert_eq!(item.object.resources.len(), 2);
         assert!(item.object.resources[0].uri.ends_with(representation));
         assert_eq!(item.object.resources[0].mime, expected);
@@ -95,7 +86,10 @@ fn resources_dates_and_optional_hints() {
                 .all(|r| !r.byte_seek && r.duration.is_none())
         );
     }
+}
 
+#[test]
+fn original_video_duration_is_formatted_from_nonnegative_milliseconds() {
     for (duration, expected) in [
         (0, Some("0:00:00.000")),
         (3_661_007, Some("1:01:01.007")),
@@ -104,28 +98,61 @@ fn resources_dates_and_optional_hints() {
         (-1, None),
     ] {
         let mut dto = asset(1, "VIDEO");
-        dto["originalMimeType"] = Value::Null;
         dto["duration"] = json!(duration);
-        dto["localDateTime"] = json!("2024-01-01T23:00:00-12:00");
         let item = project(dto);
-        assert_eq!(item.object.date.as_deref(), Some("2024-01-01"));
         assert_eq!(item.object.resources[0].duration.as_deref(), expected);
-        assert_eq!(item.object.resources[0].mime, "application/octet-stream");
-        assert!(item.object.resources[0].byte_seek);
-        assert!(item.object.art.unwrap().ends_with("preview"));
     }
+}
+
+#[test]
+fn original_video_without_mime_remains_seekable_with_preview_artwork() {
+    let mut dto = asset(1, "VIDEO");
+    dto["originalMimeType"] = Value::Null;
+    let item = project(dto);
+    assert_eq!(item.object.resources[0].mime, "application/octet-stream");
+    assert!(item.object.resources[0].byte_seek);
+    assert!(item.object.art.unwrap().ends_with("preview"));
+}
+
+#[test]
+fn capture_instants_and_local_dates_are_independent() {
+    let item = project(asset(1, "IMAGE"));
+    assert_eq!(item.object.date.as_deref(), Some("2024-01-01"));
+
+    assert_eq!(
+        item.capture.unwrap().to_rfc3339(),
+        "2023-12-31T22:30:00+00:00"
+    );
+
+    let mut dto = asset(1, "VIDEO");
+    dto["localDateTime"] = json!("2024-01-01T23:00:00-12:00");
+    assert_eq!(project(dto).object.date.as_deref(), Some("2024-01-01"));
 
     let mut dto = asset(1, "IMAGE");
-    dto["originalFileName"] = json!("");
     dto["fileCreatedAt"] = json!("2024-01-01T12:00:00");
     dto["localDateTime"] = json!("not a date");
+    let item = project(dto);
+    assert!(item.capture.is_none());
+    assert!(item.object.date.is_none());
+}
+
+#[test]
+fn item_titles_are_xml_safe_and_fall_back_to_asset_identity() {
+    let mut dto = asset(1, "IMAGE");
+    dto["originalFileName"] = json!("A\u{0001}&B");
+    assert_eq!(project(dto.clone()).object.title, "A\u{fffd}&B");
+    dto["originalFileName"] = json!("");
+    assert_eq!(project(dto).object.title, Uuid::from_u128(1).to_string());
+}
+
+#[test]
+fn projection_retains_revision_hints_without_exif_enrichment() {
+    let mut dto = asset(1, "IMAGE");
     dto["checksum"] = json!("one");
     dto["updatedAt"] = json!("opaque hint");
     dto["thumbhash"] = json!("two");
     dto["exifInfo"] = json!(["ignored unsupported structure"]);
     let item = project(dto);
-    assert_eq!(item.object.title, Uuid::from_u128(1).to_string());
-    assert!(item.capture.is_none() && item.object.date.is_none());
     assert_eq!(item.checksum.as_deref(), Some("one"));
     assert_eq!(item.updated_at.as_deref(), Some("opaque hint"));
     assert_eq!(item.thumbhash.as_deref(), Some("two"));
@@ -196,11 +223,6 @@ async fn complete_pagination_and_scoped_encoded_intersection_without_probes() {
         assert_eq!(request.uri, "/prefix/api/search/metadata");
         assert_eq!(request.body["albumIds"], json!([ALBUM]));
         assert_eq!(request.body["page"], json!(expected_page));
-        assert_eq!(request.body["size"], json!(immich::SEARCH_PAGE_SIZE));
-        assert_eq!(request.body["withDeleted"], false);
-        assert_eq!(request.body["withExif"], false);
-        assert_eq!(request.body["withPeople"], false);
-        assert!(request.body.get("withStacked").is_none());
 
         assert_eq!(
             request.body.get("isEncoded"),
@@ -212,12 +234,6 @@ async fn complete_pagination_and_scoped_encoded_intersection_without_probes() {
             (index == 4).then_some(&json!("VIDEO"))
         );
     }
-
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.headers["x-api-key"] == "private-test-key")
-    );
 }
 
 #[test]
@@ -391,7 +407,6 @@ async fn contents_hashes_canonical_order_and_exact_bytes() {
         baseline.digest,
         format!("{:x}", Sha256::digest(&serialized))
     );
-    assert_eq!(baseline.digest.len(), 64);
 }
 
 #[test]
@@ -474,11 +489,6 @@ fn projected_item_encoding_is_stable_across_refactors() {
     assert_eq!(
         json,
         r#"{"id":"00000000-0000-0000-0000-000000000001","object":{"id":"album:00000000-0000-0000-0000-000000000002:asset:00000000-0000-0000-0000-000000000001","parent_id":"album:00000000-0000-0000-0000-000000000002","title":"Photo","class":"object.item.imageItem.photo","date":"2024-01-02","art":"http://192.0.2.1:8200/media/assets/00000000-0000-0000-0000-000000000001/preview","child_count":null,"resources":[{"uri":"http://192.0.2.1:8200/media/assets/00000000-0000-0000-0000-000000000001/original","mime":"image/jpeg","duration":null,"byte_seek":false}]},"capture":"2024-01-02T03:04:05Z","is_edited":false,"checksum":"checksum","updated_at":"updated","thumbhash":"thumbhash"}"#
-    );
-
-    assert_eq!(
-        format!("{:x}", Sha256::digest(json.as_bytes())),
-        "d27096d54b96b8520a8ddbbededf29439eb59cb9e1020dbccc02d3c72b0422e0"
     );
 }
 

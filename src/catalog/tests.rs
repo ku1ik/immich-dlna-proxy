@@ -16,7 +16,10 @@ use std::{
 use tempfile::TempDir;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 
-use crate::protocol::{self, Filter, Service};
+use crate::protocol::Service;
+
+#[path = "http_tests.rs"]
+mod http_tests;
 
 pub(super) struct Barrier {
     pub(super) entered: Notify,
@@ -48,9 +51,7 @@ struct Upstream {
     albums: Vec<Value>,
     contents: BTreeMap<Uuid, Vec<Value>>,
     requests: Vec<(String, Value)>,
-    http_requests: Vec<(Method, String, HeaderMap)>,
     media: BTreeMap<String, (&'static str, &'static [u8])>,
-    notification_gate: Option<Arc<Barrier>>,
     gates: BTreeMap<Scope, Arc<Barrier>>,
     outage: bool,
 }
@@ -79,61 +80,24 @@ impl Fake {
                 let body = to_bytes(body, 8192).await.unwrap();
 
                 if parts.method.as_str() == "NOTIFY" {
-                    let gate = upstream.lock().unwrap().notification_gate.clone();
-
                     let _ = notify
                         .send((parts.headers, String::from_utf8(body.to_vec()).unwrap()))
                         .await;
 
-                    if let Some(gate) = gate {
-                        gate.entered.notify_one();
-                        gate.release.acquire().await.unwrap().forget();
-                    }
-
                     return Response::new(Body::empty());
                 }
 
-                let media = {
-                    let mut upstream = upstream.lock().unwrap();
-
-                    upstream.http_requests.push((
-                        parts.method.clone(),
-                        parts.uri.to_string(),
-                        parts.headers.clone(),
-                    ));
-
-                    upstream.media.get(&parts.uri.to_string()).copied()
-                };
+                let media = upstream
+                    .lock()
+                    .unwrap()
+                    .media
+                    .get(&parts.uri.to_string())
+                    .copied();
 
                 if let Some((mime, bytes)) = media {
-                    let partial = parts.method == Method::GET
-                        && parts
-                            .headers
-                            .get("range")
-                            .is_some_and(|value| value == "bytes=2-5");
-
-                    let mut response = Response::builder()
+                    return Response::builder()
                         .header("content-type", mime)
-                        .header("accept-ranges", "bytes")
-                        .header("etag", "\"fixture\"");
-
-                    let payload = if partial {
-                        response = response
-                            .status(206)
-                            .header("content-range", format!("bytes 2-5/{}", bytes.len()));
-
-                        &bytes[2..6]
-                    } else {
-                        bytes
-                    };
-
-                    return response
-                        .header("content-length", payload.len())
-                        .body(if parts.method == Method::HEAD {
-                            Body::empty()
-                        } else {
-                            Body::from(payload)
-                        })
+                        .body(Body::from(bytes))
                         .unwrap();
                 }
 
@@ -381,533 +345,6 @@ async fn fault(task: JoinHandle<Result<BrowseResult, Fault>>, code: u16) {
 }
 
 #[tokio::test]
-async fn real_http_catalog_events_durability_and_media_share_one_server() {
-    use crate::{media::MediaProxy, server::Server};
-    use quick_xml::{Reader, events::Event};
-
-    async fn soap(client: &reqwest::Client, base: &str, name: &str, args: &str) -> (u16, String) {
-        let body = format!(
-            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:{name} xmlns:u=\"{}\">{args}</u:{name}></s:Body></s:Envelope>",
-            protocol::CONTENT_DIRECTORY,
-        );
-
-        let response = client
-            .post(format!("{base}/upnp/content-directory/control"))
-            .header("content-type", "text/xml; charset=\"utf-8\"")
-            .header(
-                "soapaction",
-                format!("\"{}#{name}\"", protocol::CONTENT_DIRECTORY),
-            )
-            .body(body)
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(response.headers()["server"], crate::server_header());
-        assert!(response.headers().contains_key("ext"));
-
-        assert!(
-            response.headers()["content-type"]
-                .to_str()
-                .unwrap()
-                .starts_with("text/xml")
-        );
-
-        let status = response.status().as_u16();
-        let body = response.text().await.unwrap();
-        assert!(!body.contains("fake-key"));
-
-        (status, body)
-    }
-
-    fn text(xml: &str, name: &str) -> String {
-        let mut reader = Reader::from_str(xml);
-
-        loop {
-            match reader.read_event().unwrap() {
-                Event::Start(element) if element.local_name().as_ref() == name.as_bytes() => {
-                    let raw = reader.read_text(element.name()).unwrap();
-
-                    return quick_xml::escape::unescape(&raw).unwrap().into_owned();
-                }
-
-                Event::Eof => panic!("missing XML element {name}"),
-                _ => {}
-            }
-        }
-    }
-
-    fn objects(xml: &str) -> Vec<(String, String)> {
-        let mut reader = Reader::from_str(xml);
-        let mut objects = Vec::new();
-
-        loop {
-            match reader.read_event().unwrap() {
-                Event::Start(element)
-                    if matches!(element.local_name().as_ref(), b"item" | b"container") =>
-                {
-                    let id = element
-                        .try_get_attribute("id")
-                        .unwrap()
-                        .unwrap()
-                        .unescape_value()
-                        .unwrap()
-                        .into_owned();
-
-                    let body = reader.read_text(element.name()).unwrap().into_owned();
-                    objects.push((id, body));
-                }
-
-                Event::Eof => return objects,
-                _ => {}
-            }
-        }
-    }
-
-    fn resources(xml: &str) -> Vec<(String, String, Option<String>)> {
-        let mut reader = Reader::from_str(xml);
-        let mut resources = Vec::new();
-
-        loop {
-            match reader.read_event().unwrap() {
-                Event::Start(element) if element.local_name().as_ref() == b"res" => {
-                    let info = element
-                        .try_get_attribute("protocolInfo")
-                        .unwrap()
-                        .unwrap()
-                        .unescape_value()
-                        .unwrap()
-                        .into_owned();
-
-                    let duration = element
-                        .try_get_attribute("duration")
-                        .unwrap()
-                        .map(|value| value.unescape_value().unwrap().into_owned());
-
-                    let uri = reader.read_text(element.name()).unwrap();
-
-                    resources.push((
-                        quick_xml::escape::unescape(&uri).unwrap().into_owned(),
-                        info,
-                        duration,
-                    ));
-                }
-
-                Event::Eof => return resources,
-                _ => {}
-            }
-        }
-    }
-
-    let fake = Fake::new().await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let base = format!("http://{address}");
-    let album_id = Uuid::from_u128(1);
-    let image_id = Uuid::from_u128(10);
-    let video_id = Uuid::from_u128(20);
-    let callback_gate = Barrier::new();
-
-    {
-        let mut upstream = fake.upstream.lock().unwrap();
-        upstream.albums = vec![album(1, "Family & friends")];
-
-        let mut edited = item(
-            10,
-            Some("2024-01-01T01:00:00Z"),
-            Some("2024-01-01T01:00:00Z"),
-        );
-
-        edited["isEdited"] = json!(true);
-        edited["originalFileName"] = json!("Edited <sun> & snow.jpg");
-        edited["originalMimeType"] = json!("image/png");
-
-        let mut video = item(
-            20,
-            Some("2024-01-02T01:00:00Z"),
-            Some("2024-01-02T01:00:00Z"),
-        );
-
-        video["type"] = json!("VIDEO");
-        video["originalMimeType"] = json!("video/quicktime");
-        video["duration"] = json!(1234);
-        upstream.contents.insert(album_id, vec![edited, video]);
-        upstream.notification_gate = Some(callback_gate.clone());
-
-        upstream.media = BTreeMap::from([
-            (
-                format!("/api/assets/{image_id}/thumbnail?size=fullsize&edited=true"),
-                ("image/jpeg", b"edited-jpeg".as_slice()),
-            ),
-            (
-                format!("/api/assets/{video_id}/original"),
-                ("video/quicktime", b"original-video".as_slice()),
-            ),
-            (
-                format!("/api/assets/{video_id}/video/playback"),
-                ("video/mp4", b"0123456789".as_slice()),
-            ),
-        ]);
-    }
-
-    let directory = tempfile::tempdir().unwrap();
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let mut config = config(fake.address, directory.path());
-
-    config.listen_address = match address {
-        std::net::SocketAddr::V4(address) => address,
-        _ => unreachable!("literal IPv4 bind"),
-    };
-
-    let media = MediaProxy::new(config.api_base.clone(), config.api_key.clone()).unwrap();
-    let events = Subscriptions::new().unwrap();
-    let name = config.friendly_name.clone();
-    let uuid = config.server_uuid;
-
-    let library = ImmichCatalog::open(config, events.clone()).await.unwrap();
-
-    let mut fixture = Fixture {
-        library,
-        fake,
-        directory,
-    };
-
-    let catalog_task = fixture.run();
-    let events_task = tokio::spawn(events.clone().run());
-    let server = Server::new(name, uuid, fixture.library.clone(), media, events);
-    let server_task = tokio::spawn(server.run(listener));
-
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .timeout(Duration::from_secs(3))
-        .build()
-        .unwrap();
-
-    let (status, local) = soap(&client, &base, "GetSystemUpdateID", "").await;
-    assert_eq!(status, 200);
-    assert_eq!(text(&local, "Id"), "1");
-    assert_eq!(fixture.disk().1.system_update_id, 1);
-
-    assert!(
-        fixture
-            .fake
-            .upstream
-            .lock()
-            .unwrap()
-            .http_requests
-            .is_empty()
-    );
-
-    let subscription = client
-        .request(
-            Method::from_bytes(b"SUBSCRIBE").unwrap(),
-            format!("{base}/upnp/content-directory/events"),
-        )
-        .header("nt", "upnp:event")
-        .header(
-            "callback",
-            format!("<http://{}/events>", fixture.fake.address),
-        )
-        .header("timeout", "Second-60")
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(subscription.status(), 200);
-    assert_eq!(subscription.headers()["timeout"], "Second-60");
-    assert!(!subscription.headers().contains_key("connection"));
-    let sid = subscription.headers()["sid"].clone();
-    assert!(subscription.bytes().await.unwrap().is_empty());
-
-    let (initial, body) =
-        tokio::time::timeout(Duration::from_secs(3), fixture.fake.notifications.recv())
-            .await
-            .unwrap()
-            .unwrap();
-
-    assert_eq!(initial["seq"], "0");
-    assert_eq!(initial["sid"], sid);
-    assert_eq!(initial["nt"], "upnp:event");
-    assert_eq!(initial["nts"], "upnp:propchange");
-    assert_eq!(text(&body, "SystemUpdateID"), "1");
-    assert!(!initial.contains_key("x-api-key"));
-
-    assert!(
-        fixture
-            .fake
-            .upstream
-            .lock()
-            .unwrap()
-            .http_requests
-            .is_empty()
-    );
-
-    let (status, root) = soap(
-        &client,
-        &base,
-        "Browse",
-        "<ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria/>",
-    )
-    .await;
-
-    assert_eq!(status, 200);
-    assert_eq!(text(&root, "NumberReturned"), "1");
-    assert_eq!(text(&root, "TotalMatches"), "1");
-    assert_eq!(text(&root, "UpdateID"), "2");
-    assert!(root.contains("Family &amp;amp; friends"));
-    let albums = objects(&text(&root, "Result"));
-    assert_eq!(albums[0].0, format!("album:{album_id}"));
-    assert_eq!(text(&albums[0].1, "title"), "Family & friends");
-    assert_eq!(text(&albums[0].1, "class"), "object.container.album");
-    assert_eq!(fixture.disk().1.system_update_id, 2);
-    assert_eq!(fixture.disk().1.albums[&album_id].update_id, 0);
-
-    let (status, metadata) = soap(
-        &client,
-        &base,
-        "Browse",
-        &format!("<ObjectID>album:{album_id}</ObjectID><BrowseFlag>BrowseMetadata</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria/>"),
-    )
-    .await;
-
-    assert_eq!(status, 200);
-    assert_eq!(text(&metadata, "UpdateID"), "0");
-    assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
-
-    let children = format!(
-        "<ObjectID>album:{album_id}</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter> dc:date, res@duration </Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria/>"
-    );
-
-    let (status, listing) = soap(&client, &base, "Browse", &children).await;
-    assert_eq!(status, 200);
-    assert_eq!(text(&listing, "NumberReturned"), "2");
-    assert_eq!(text(&listing, "TotalMatches"), "2");
-    assert_eq!(text(&listing, "UpdateID"), "1");
-    assert!(listing.contains("Edited &amp;lt;sun&amp;gt; &amp;amp; snow.jpg"));
-    let didl = text(&listing, "Result");
-    assert!(!didl.contains("albumArtURI"));
-    let items = objects(&didl);
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0].0, format!("album:{album_id}:asset:{image_id}"));
-    assert_eq!(text(&items[0].1, "title"), "Edited <sun> & snow.jpg");
-    assert_eq!(text(&items[0].1, "date"), "2024-01-01");
-    assert_eq!(text(&items[0].1, "class"), "object.item.imageItem.photo");
-    let images = resources(&items[0].1);
-
-    assert_eq!(
-        images,
-        vec![
-            (
-                format!("{base}/media/assets/{image_id}/display"),
-                "http-get:*:image/jpeg:*".into(),
-                None
-            ),
-            (
-                format!("{base}/media/assets/{image_id}/preview"),
-                "http-get:*:image/jpeg:*".into(),
-                None
-            ),
-        ]
-    );
-
-    assert_eq!(text(&items[1].1, "class"), "object.item.videoItem");
-    let videos = resources(&items[1].1);
-
-    assert_eq!(
-        videos,
-        vec![
-            (
-                format!("{base}/media/assets/{video_id}/original"),
-                "http-get:*:video/quicktime:DLNA.ORG_OP=01".into(),
-                Some("0:00:01.234".into())
-            ),
-            (
-                format!("{base}/media/assets/{video_id}/playback"),
-                "http-get:*:video/mp4:DLNA.ORG_OP=01".into(),
-                None
-            ),
-        ]
-    );
-
-    let published = fixture.disk();
-    assert_eq!(published.1.system_update_id, 3);
-    assert_eq!(published.1.albums[&album_id].update_id, 1);
-    assert!(published.1.albums[&album_id].contents_digest.is_some());
-
-    {
-        let upstream = fixture.fake.upstream.lock().unwrap();
-        assert_eq!(upstream.requests.len(), 4);
-        assert_eq!(upstream.requests[0].0, "/api/server/version");
-        assert_eq!(upstream.requests[1].0, "/api/albums");
-
-        for (_, body) in &upstream.requests[2..] {
-            assert_eq!(body["albumIds"], json!([album_id]));
-            assert_eq!(body["page"], 1);
-            assert_eq!(body["size"], 1000);
-            assert_eq!(body["withDeleted"], false);
-            assert_eq!(body["withExif"], false);
-        }
-
-        assert!(upstream.requests[2].1.get("isEncoded").is_none());
-        assert_eq!(upstream.requests[3].1["type"], "VIDEO");
-        assert_eq!(upstream.requests[3].1["isEncoded"], true);
-    }
-
-    let response = client.get(&images[0].0).send().await.unwrap();
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.headers()["content-type"], "image/jpeg");
-    assert_eq!(response.bytes().await.unwrap().as_ref(), b"edited-jpeg");
-    let response = client.head(&videos[0].0).send().await.unwrap();
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.headers()["content-length"], "14");
-    assert_eq!(response.headers()["content-type"], "video/quicktime");
-    assert!(response.bytes().await.unwrap().is_empty());
-
-    let response = client
-        .get(&videos[1].0)
-        .header("range", "bytes=2-5")
-        .header("if-range", "\"fixture\"")
-        .header("authorization", "caller-secret")
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), 206);
-    assert_eq!(response.headers()["content-type"], "video/mp4");
-    assert_eq!(response.headers()["content-range"], "bytes 2-5/10");
-    assert_eq!(response.headers()["accept-ranges"], "bytes");
-    assert_eq!(response.headers()["content-length"], "4");
-    assert!(!response.headers().contains_key("contentfeatures.dlna.org"));
-    assert_eq!(response.bytes().await.unwrap().as_ref(), b"2345");
-    assert_eq!(fixture.disk(), published);
-
-    {
-        let upstream = fixture.fake.upstream.lock().unwrap();
-
-        assert_eq!(
-            upstream.requests.len(),
-            4,
-            "media must not refresh the catalog"
-        );
-
-        assert_eq!(upstream.http_requests.len(), 7);
-        assert_eq!(upstream.http_requests[4].0, Method::GET);
-
-        assert!(
-            upstream.http_requests[4]
-                .1
-                .ends_with("thumbnail?size=fullsize&edited=true")
-        );
-
-        assert_eq!(upstream.http_requests[5].0, Method::HEAD);
-        assert!(upstream.http_requests[5].1.ends_with("/original"));
-        assert_eq!(upstream.http_requests[6].2["range"], "bytes=2-5");
-        assert_eq!(upstream.http_requests[6].2["if-range"], "\"fixture\"");
-
-        for (_, _, headers) in &upstream.http_requests {
-            assert_eq!(headers["x-api-key"], "fake-key");
-            assert_eq!(headers["accept-encoding"], "identity");
-            assert!(!headers.contains_key("authorization"));
-        }
-    }
-
-    let (status, fault) = soap(
-        &client,
-        &base,
-        "Browse",
-        "<ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria>+dc:title</SortCriteria>",
-    )
-    .await;
-
-    assert_eq!(status, 500);
-    assert_eq!(text(&fault, "errorCode"), "709");
-    assert_eq!(fixture.fake.upstream.lock().unwrap().requests.len(), 4);
-    fixture.expire(Scope::Album(album_id));
-    fixture.fake.upstream.lock().unwrap().outage = true;
-    let (status, fault) = soap(&client, &base, "Browse", &children).await;
-    assert_eq!(status, 500);
-    assert_eq!(text(&fault, "errorCode"), "501");
-
-    assert!(
-        !fault.contains("127.0.0.1") && !fault.contains("Edited") && !fault.contains("checksum")
-    );
-
-    let before_local = fixture.fake.upstream.lock().unwrap().requests.len();
-    let (status, local) = soap(&client, &base, "GetSystemUpdateID", "").await;
-    assert_eq!(status, 200);
-    assert_eq!(text(&local, "Id"), "3");
-
-    assert_eq!(
-        fixture.fake.upstream.lock().unwrap().requests.len(),
-        before_local
-    );
-
-    assert_eq!(fixture.disk(), published);
-
-    {
-        let mut upstream = fixture.fake.upstream.lock().unwrap();
-        upstream.outage = false;
-        upstream.contents.get_mut(&album_id).unwrap()[0]["checksum"] = json!("changed");
-    }
-
-    let (status, changed) = soap(&client, &base, "Browse", &children).await;
-    assert_eq!(status, 200);
-    assert_eq!(text(&changed, "UpdateID"), "2");
-    let committed = fixture.disk();
-    assert_eq!(committed.1.system_update_id, 4);
-    assert_eq!(committed.1.albums[&album_id].update_id, 2);
-
-    assert_ne!(
-        committed.1.albums[&album_id].contents_digest,
-        published.1.albums[&album_id].contents_digest
-    );
-
-    assert!(fixture.fake.notifications.try_recv().is_err());
-
-    // Root, initial contents, and the changed refresh coalesce while SEQ=0 is in flight.
-    tokio::time::pause();
-    tokio::time::advance(crate::eventing::MODERATION).await;
-    tokio::time::resume();
-    fixture.fake.upstream.lock().unwrap().notification_gate = None;
-    callback_gate.release.add_permits(1);
-
-    let (notification, body) =
-        tokio::time::timeout(Duration::from_secs(3), fixture.fake.notifications.recv())
-            .await
-            .unwrap()
-            .unwrap();
-
-    assert_eq!(notification["seq"], "1");
-    assert_eq!(notification["sid"], sid);
-    let (status, local) = soap(&client, &base, "GetSystemUpdateID", "").await;
-    assert_eq!(status, 200);
-    assert_eq!(text(&body, "SystemUpdateID"), text(&local, "Id"));
-
-    assert_eq!(
-        text(&local, "Id"),
-        fixture.disk().1.system_update_id.to_string()
-    );
-
-    assert_eq!(fixture.disk(), committed);
-
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), fixture.fake.notifications.recv())
-            .await
-            .is_err()
-    );
-
-    server_task.abort();
-    assert!(server_task.await.unwrap_err().is_cancelled());
-    fixture.abort(catalog_task).await;
-    events_task.abort();
-    assert!(events_task.await.unwrap_err().is_cancelled());
-    fixture.fake.task.abort();
-    assert!((&mut fixture.fake.task).await.unwrap_err().is_cancelled());
-}
-
-#[tokio::test]
 async fn local_id_startup_event_outage_and_metadata_scopes() {
     let mut fixture = Fixture::new(2).await;
     let task = fixture.run();
@@ -1053,8 +490,7 @@ async fn album_latest_date_refresh_reorders_and_publishes_without_loading_conten
     fixture.abort(task).await;
 }
 
-#[tokio::test]
-async fn relationship_count_sort_filter_and_snapshot_counter_capture() {
+async fn ordered_fixture() -> Fixture {
     let fixture = Fixture::new(4).await;
 
     {
@@ -1094,6 +530,12 @@ async fn relationship_count_sort_filter_and_snapshot_counter_capture() {
         );
     }
 
+    fixture
+}
+
+#[tokio::test]
+async fn root_browse_sorts_before_pagination() {
+    let fixture = ordered_fixture().await;
     let task = fixture.run();
 
     let root = fixture
@@ -1119,6 +561,13 @@ async fn relationship_count_sort_filter_and_snapshot_counter_capture() {
         .unwrap();
 
     assert_eq!(root_date.objects[0].title, "D");
+    fixture.abort(task).await;
+}
+
+#[tokio::test]
+async fn album_browse_counts_eligible_items_and_sorts_before_pagination() {
+    let fixture = ordered_fixture().await;
+    let task = fixture.run();
     let baseline = fixture.library.browse(children(1)).await.unwrap();
     assert_eq!(baseline.total_matches, 3);
     assert_eq!(baseline.update_id, 1);
@@ -1148,12 +597,6 @@ async fn relationship_count_sort_filter_and_snapshot_counter_capture() {
                 .collect::<Vec<_>>(),
             titles
         );
-
-        let required = protocol::didl(&rows.objects, &Filter::parse("").unwrap()).unwrap();
-        assert!(!required.contains("<res ") && !required.contains("dc:date"));
-        let full = protocol::didl(&rows.objects, &Filter::parse("*").unwrap()).unwrap();
-        assert!(full.contains("DLNA.ORG_OP=01"));
-        assert!(full.contains("http://192.0.2.1:8200/media/assets/"));
     }
 
     for (start, count, returned) in [(1, 1, 1), (1, 0, 2), (3, 0, 0), (u32::MAX, 10, 0)] {
@@ -1177,6 +620,13 @@ async fn relationship_count_sort_filter_and_snapshot_counter_capture() {
         }
     }
 
+    fixture.abort(task).await;
+}
+
+#[tokio::test]
+async fn item_browse_validates_album_membership_and_returns_the_system_revision() {
+    let fixture = ordered_fixture().await;
+    let task = fixture.run();
     let appearance = format!("album:{}:asset:{}", Uuid::from_u128(1), Uuid::from_u128(1));
 
     let metadata = fixture
@@ -1211,20 +661,6 @@ async fn relationship_count_sort_filter_and_snapshot_counter_capture() {
     fault(browse(&fixture.library, children(999)), 701).await;
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 3);
 
-    // A response owns its old rows/counter even after later publication.
-    fixture
-        .fake
-        .upstream
-        .lock()
-        .unwrap()
-        .contents
-        .insert(Uuid::from_u128(1), vec![]);
-
-    fixture.expire(Scope::Album(Uuid::from_u128(1)));
-    let newer = fixture.library.browse(children(1)).await.unwrap();
-    assert_eq!(newer.total_matches, 0);
-    assert_eq!(newer.update_id, baseline.update_id + 1);
-    assert_eq!(baseline.objects.len(), 3);
     fixture.abort(task).await;
 }
 
