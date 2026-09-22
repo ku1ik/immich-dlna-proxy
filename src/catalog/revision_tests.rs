@@ -113,7 +113,7 @@ fn install(directory: &Path, ledger: &Ledger) {
 }
 
 #[test]
-fn first_installation_creates_no_files_and_restart_wraps_history() {
+fn first_installation_creates_no_files() {
     let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
     let directory = private_directory();
     let (store, mut ledger) = Store::open(directory.path(), id(1)).unwrap();
@@ -123,6 +123,10 @@ fn first_installation_creates_no_files_and_restart_wraps_history() {
     assert_eq!(ledger.system_update_id, 1);
     drop(store);
     assert_eq!(Store::open(directory.path(), id(1)).unwrap().1, empty());
+}
+
+#[test]
+fn restart_wraps_counters_and_retains_history() {
     let mut ledger = populated();
     ledger.system_update_id = u32::MAX;
     ledger.albums.get_mut(&id(2)).unwrap().update_id = u32::MAX;
