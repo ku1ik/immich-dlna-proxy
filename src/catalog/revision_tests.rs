@@ -656,8 +656,12 @@ fn decoding_rejects_corruption_unknown_missing_fields_and_duplicate_uuid_aliases
     );
 
     for key in [uuid.to_owned(), uuid.to_uppercase()] {
-        let single = duplicates.replace(&format!(",\"{}\":{album}", uuid.to_uppercase()), "");
-        let single = single.replace(uuid, &key);
+        let single = format!(
+            "{{\"server_uuid\":\"{}\",\"system_update_id\":0,\"root_digest\":\"{}\",\"albums\":{{\"{key}\":{album}}}}}",
+            id(1),
+            digest(1)
+        );
+
         let loaded: Ledger = serde_json::from_str(&single).unwrap();
         loaded.validate(id(1)).unwrap();
         assert_eq!(loaded.root_digest, Some(digest(1)));

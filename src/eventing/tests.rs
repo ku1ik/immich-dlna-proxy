@@ -759,7 +759,8 @@ async fn failed_attempts_allocate_sequence_once_wrap_and_preserve_future_pending
     let sid = callback.register(&subscriptions, SERVICE, &["/gated-fail", "/fail"]);
     let task = tokio::spawn(subscriptions.clone().run());
 
-    for (id, seq, future) in [(0, 0, None), (8, u32::MAX, Some(9)), (9, 1, None)] {
+    for (id, seq, next_seq, future) in [(0, 0, 1, None), (8, u32::MAX, 1, Some(9)), (9, 1, 2, None)]
+    {
         let (request, body) = callback.next().await;
         assert_eq!(request.uri.path(), "/gated-fail");
         assert_eq!(request.headers["seq"], seq.to_string());
@@ -782,7 +783,7 @@ async fn failed_attempts_allocate_sequence_once_wrap_and_preserve_future_pending
             let entry = &mut state.entries[0];
             assert!(entry.expires.is_some());
             assert_eq!(entry.pending, future);
-            assert_eq!(entry.next_seq, seq.wrapping_add(1).max(1));
+            assert_eq!(entry.next_seq, next_seq);
 
             if seq == 0 {
                 entry.next_seq = u32::MAX;
