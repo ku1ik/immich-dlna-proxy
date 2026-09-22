@@ -1158,7 +1158,7 @@ async fn whole_permit_covers_commit_wait_and_preparation_timeout_cleans_flight()
 
 #[tokio::test]
 async fn stale_unchanged_album_cannot_survive_root_removal_and_reappearance() {
-    let fixture = Fixture::new(2).await;
+    let fixture = Fixture::new(1).await;
     let task = fixture.run();
     fixture.library.browse(children(1)).await.unwrap();
     fixture.expire(Scope::Album(Uuid::from_u128(1)));
@@ -1450,7 +1450,7 @@ async fn publication_panic_after_persist_fails_stop_and_restores_candidate() {
 
 #[tokio::test]
 async fn preparation_panic_is_fatal_and_supervised_even_without_waiters() {
-    let fixture = Fixture::new(1).await;
+    let fixture = Fixture::new(0).await;
     let task = fixture.run();
     let mut barrier = Barrier::new();
     Arc::get_mut(&mut barrier).unwrap().panic = true;
@@ -1487,7 +1487,7 @@ async fn preparation_panic_is_fatal_and_supervised_even_without_waiters() {
 
 #[tokio::test]
 async fn abandoned_refresh_completes_and_expiry_alone_never_does_work() {
-    let fixture = Fixture::new(1).await;
+    let fixture = Fixture::new(0).await;
     let task = fixture.run();
     let barrier = Barrier::new();
 

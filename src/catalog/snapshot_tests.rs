@@ -247,27 +247,20 @@ fn eligible_assets_require_original_file_name() {
 async fn duplicates_compare_only_normalized_member_data_and_eligibility() {
     let first = asset(1, "IMAGE");
 
-    for field in [
-        "originalFileName",
-        "checksum",
-        "updatedAt",
-        "thumbhash",
-        "localDateTime",
-        "fileCreatedAt",
-        "isEdited",
-        "visibility",
-        "isTrashed",
-        "type",
+    for (field, replacement) in [
+        ("originalFileName", json!("changed")),
+        ("checksum", json!("changed")),
+        ("updatedAt", json!("changed")),
+        ("thumbhash", json!("changed")),
+        ("localDateTime", json!("2025-01-01T00:00:00Z")),
+        ("fileCreatedAt", json!("2025-01-01T00:00:00Z")),
+        ("isEdited", json!(true)),
+        ("visibility", json!("hidden")),
+        ("isTrashed", json!(true)),
+        ("type", json!("VIDEO")),
     ] {
         let mut second = first.clone();
-
-        second[field] = match field {
-            "isEdited" | "isTrashed" => json!(true),
-            "visibility" => json!("hidden"),
-            "type" => json!("VIDEO"),
-            "localDateTime" | "fileCreatedAt" => json!("2025-01-01T00:00:00Z"),
-            _ => json!("changed"),
-        };
+        second[field] = replacement;
 
         for reversed in [false, true] {
             let records = if reversed {
@@ -400,21 +393,15 @@ fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
     original.json(&item).unwrap();
     let original = original.finish().0;
 
-    for field in [
-        "checksum",
-        "updatedAt",
-        "thumbhash",
-        "fileCreatedAt",
-        "isEdited",
+    for (field, replacement) in [
+        ("checksum", json!("changed")),
+        ("updatedAt", json!("changed")),
+        ("thumbhash", json!("changed")),
+        ("fileCreatedAt", json!("2024-01-01T00:30:01+02:00")),
+        ("isEdited", json!(true)),
     ] {
         let mut changed = dto.clone();
-
-        changed[field] = match field {
-            "fileCreatedAt" => json!("2024-01-01T00:30:01+02:00"),
-            "isEdited" => json!(true),
-            _ => json!("changed"),
-        };
-
+        changed[field] = replacement;
         let changed = project(changed);
         let mut digest = Projection::new(SNAPSHOT_BYTES);
         digest.json(&changed).unwrap();
@@ -510,19 +497,13 @@ fn projected_root_encoding_is_stable_across_refactors() {
 
 #[tokio::test]
 async fn traversal_progress_and_combined_page_budget() {
-    for repeated in [false, true] {
-        let mut replies = vec![page(vec![asset(1, "IMAGE")], Some("2"))];
+    for items in [vec![], vec![asset(1, "IMAGE")]] {
+        let fake = SnapshotFixture::new(vec![
+            page(vec![asset(1, "IMAGE")], Some("2")),
+            page(items, Some("3")),
+        ])
+        .await;
 
-        replies.push(page(
-            if repeated {
-                vec![asset(1, "IMAGE")]
-            } else {
-                vec![]
-            },
-            Some("3"),
-        ));
-
-        let fake = SnapshotFixture::new(replies).await;
         assert!(fake.source.contents(ALBUM).await.is_err());
         assert_eq!(fake.api.requests.lock().unwrap().len(), 2);
     }
