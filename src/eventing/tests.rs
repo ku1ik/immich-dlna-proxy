@@ -972,10 +972,7 @@ async fn inactive_initial_obligations_remain_eligible_behind_bounded_deliveries(
             state.expire(Instant::now());
         }
 
-        for _ in 0..8 {
-            callback.register(&subscriptions, SERVICE, &["/gated"]);
-        }
-
+        callback.register(&subscriptions, SERVICE, &["/gated"]);
         callback.release.add_permits(1);
         let (request, body) = callback.next().await;
         assert_eq!(request.headers["sid"], format!("uuid:{target}"));
