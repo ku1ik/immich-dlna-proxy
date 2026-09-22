@@ -1,5 +1,5 @@
 use super::*;
-use axum::{Router, body::to_bytes, routing::any};
+use axum::{Router, body::to_bytes};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
@@ -455,7 +455,7 @@ impl Callback {
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         let gate = release.clone();
 
-        let app = Router::new().fallback(any(move |request: axum::extract::Request| {
+        let app = Router::new().fallback(move |request: axum::extract::Request| {
             let sender = sender.clone();
             let gate = gate.clone();
 
@@ -506,7 +506,7 @@ impl Callback {
                     _ => Response::new(Body::empty()),
                 }
             }
-        }));
+        });
 
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
