@@ -701,16 +701,14 @@ fn decoding_rejects_corruption_unknown_missing_fields_and_duplicate_uuid_aliases
 
 #[test]
 fn validation_rejects_invalid_digests_and_identity() {
-    let valid = serde_json::to_string(&populated()).unwrap();
+    let mut ledger = populated();
+    ledger.albums.get_mut(&id(2)).unwrap().contents_digest = Some("BAD".into());
+    assert!(ledger.validate(id(1)).is_err());
 
-    for json in [
-        valid.replace("\"contents_digest\":null", "\"contents_digest\":\"BAD\""),
-        valid.replace(&digest(2), &"A".repeat(64)),
-        valid.replace(&digest(2), &"g".repeat(64)),
-        valid.replace(&digest(2), &"a".repeat(63)),
-    ] {
-        let ledger: Ledger = serde_json::from_str(&json).unwrap();
-        assert!(ledger.validate(id(1)).is_err(), "accepted {json}");
+    for digest in ["A".repeat(64), "g".repeat(64), "a".repeat(63)] {
+        let mut ledger = populated();
+        ledger.albums.get_mut(&id(2)).unwrap().metadata_digest = digest.clone();
+        assert!(ledger.validate(id(1)).is_err(), "accepted {digest}");
     }
 
     let ledger = populated();
@@ -1029,13 +1027,7 @@ fn subprocess_worker() {
     };
 
     if mode == "invalid" {
-        ledger = ledger
-            .root_transition(
-                &"x".repeat(REVISION_BYTES + 1),
-                &BTreeMap::from([(id(2), digest(2))]),
-            )
-            .unwrap()
-            .unwrap();
+        ledger.root_digest = Some("invalid".into());
     }
 
     if mode == "temp-collision" {
