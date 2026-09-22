@@ -211,6 +211,148 @@ impl View {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{revisions::AlbumRevision, snapshots::Album};
+
+    #[test]
+    fn albums_default_to_latest_date_with_title_ties_and_missing_dates_last() {
+        let root_object = Object {
+            id: "0".into(),
+            parent_id: "-1".into(),
+            title: "Photos & videos".into(),
+            class: "object.container".into(),
+            date: None,
+            art: None,
+            child_count: None,
+            resources: Vec::new(),
+        };
+
+        let albums = [
+            (1, "Z", "2020-01-01", Some("2025-01-01")),
+            (2, "A", "2030-01-01", Some("2024-12-31")),
+            (3, "C", "2024-01-01", Some("2025-01-01")),
+            (4, "c", "2024-01-01", Some("2025-01-01")),
+            (5, "\u{106}", "2024-01-01", Some("2025-01-01")),
+            (6, "A missing", "2024-01-01", None),
+            (7, "B missing", "2024-01-01", None),
+            (8, "C missing", "2024-01-01", None),
+            (9, "D missing", "2024-01-01", None),
+        ]
+        .into_iter()
+        .rev()
+        .map(|(number, title, created, end)| {
+            let id = Uuid::from_u128(number);
+
+            let album = Album {
+                id,
+                object: Object {
+                    id: format!("album:{id}"),
+                    parent_id: "0".into(),
+                    title: title.into(),
+                    class: "object.container.album".into(),
+                    date: Some(created.into()),
+                    ..root_object.clone()
+                },
+                created_at: Some(format!("{created}T00:00:00Z").parse().unwrap()),
+                end_date: end.map(|date| format!("{date}T00:00:00Z").parse().unwrap()),
+                digest: format!("{number:064x}"),
+            };
+
+            (id, album)
+        })
+        .collect();
+
+        let root = Root {
+            object: root_object,
+            albums,
+            digest: "a".repeat(64),
+            bytes: 0,
+        };
+
+        let ledger = Ledger {
+            server_uuid: Uuid::from_u128(999),
+            system_update_id: 42,
+            root_digest: Some(root.digest.clone()),
+            albums: root
+                .albums
+                .iter()
+                .map(|(id, album)| {
+                    (
+                        *id,
+                        AlbumRevision {
+                            update_id: 0,
+                            present: true,
+                            metadata_digest: album.digest.clone(),
+                            contents_digest: None,
+                        },
+                    )
+                })
+                .collect(),
+        };
+
+        let view = View {
+            root: Arc::new(root),
+            contents: None,
+            ledger: Arc::new(ledger),
+        };
+
+        let collator = crate::config::collator("pl").unwrap();
+
+        for (sort, expected) in [
+            (None, [3, 4, 5, 1, 2, 6, 7, 8, 9]),
+            (Some(false), [1, 3, 4, 5, 6, 7, 8, 9, 2]),
+            (Some(true), [2, 3, 4, 5, 6, 7, 8, 9, 1]),
+        ] {
+            let query = BrowseQuery {
+                object_id: "0".into(),
+                metadata: false,
+                starting_index: 0,
+                requested_count: 0,
+                sort,
+            };
+
+            let full = view
+                .browse(ObjectId::Root, query.clone(), &collator)
+                .unwrap();
+
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|id| format!("album:{}", Uuid::from_u128(id)))
+                .collect();
+
+            assert_eq!(full.total_matches, 9);
+            assert_eq!(full.update_id, 42);
+
+            assert_eq!(
+                full.objects.iter().map(|o| &o.id).collect::<Vec<_>>(),
+                expected.iter().collect::<Vec<_>>()
+            );
+
+            for start in [0, 3, 6, 9] {
+                let page = view
+                    .browse(
+                        ObjectId::Root,
+                        BrowseQuery {
+                            starting_index: start,
+                            requested_count: 3,
+                            ..query.clone()
+                        },
+                        &collator,
+                    )
+                    .unwrap();
+
+                assert_eq!(page.total_matches, 9);
+                assert_eq!(page.update_id, full.update_id);
+
+                assert_eq!(
+                    page.objects,
+                    full.objects[start as usize..(start as usize + 3).min(9)]
+                );
+            }
+
+            let oldest_created = full.objects.iter().find(|o| o.title == "Z").unwrap();
+            assert_eq!(oldest_created.date.as_deref(), Some("2020-01-01"));
+        }
+    }
 
     #[test]
     fn ids_and_date_ordering() {

@@ -338,6 +338,36 @@ fn root_duplicates_titles_covers_and_canonical_digests() {
     );
 }
 
+#[test]
+fn album_latest_dates_are_optional_and_independent_of_advertised_dates() {
+    for (value, expected) in [
+        (None, None),
+        (Some(Value::Null), None),
+        (Some(json!("2025-99-01T00:00:00Z")), None),
+        (Some(json!(123)), None),
+        (
+            Some(json!("2025-01-01T01:30:00+02:00")),
+            Some("2024-12-31T23:30:00Z"),
+        ),
+    ] {
+        let mut dto = album(ALBUM);
+
+        if let Some(value) = value {
+            dto["endDate"] = value;
+        }
+
+        let root = root("Photos", vec![dto]).unwrap();
+        let album = &root.albums[&ALBUM];
+        assert_eq!(album.end_date, expected.map(|date| date.parse().unwrap()));
+        assert_eq!(album.object.date.as_deref(), Some("2023-12-31"));
+
+        assert_eq!(
+            album.created_at,
+            Some("2023-12-31T22:30:00Z".parse().unwrap())
+        );
+    }
+}
+
 #[tokio::test]
 async fn contents_hashes_canonical_order_and_exact_bytes() {
     let mut first = asset(2, "IMAGE");
