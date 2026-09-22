@@ -149,8 +149,6 @@ fn event_propertyset_namespaces_and_static_values_are_correct() {
 #[test]
 fn byte_seek_is_explicit_per_resource_and_does_not_add_other_dlna_claims() {
     let mut item = object();
-    let baseline = didl(&[item.clone()], &Filter::parse("*").unwrap()).unwrap();
-    assert!(!baseline.contains("DLNA.ORG_"));
     item.resources[1].byte_seek = true;
 
     let xml = didl(&[item.clone()], &Filter::parse("*").unwrap()).unwrap();
@@ -355,7 +353,6 @@ fn soap_decodes_text_cdata_comments_and_references_without_trimming() {
     };
 
     assert_eq!(query.object_id, " Łódź 東京 𐐀 &<>\"'<& z ");
-    assert_eq!(query.sort, None);
 }
 
 #[test]

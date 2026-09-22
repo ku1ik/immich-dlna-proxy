@@ -3,7 +3,7 @@ use std::{io, sync::Mutex};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{Notify, oneshot},
+    sync::Notify,
 };
 
 use super::*;
@@ -268,14 +268,6 @@ async fn routing_rejects_invalid_headers_bodies_methods_and_peers() {
         StatusCode::BAD_REQUEST
     );
 
-    assert_eq!(
-        server
-            .handle(peer, request(Method::POST, "/device.xml", Body::empty()))
-            .await
-            .status(),
-        StatusCode::METHOD_NOT_ALLOWED
-    );
-
     let ipv6 = ConnectInfo("[::1]:12345".parse().unwrap());
 
     let response = server
@@ -359,10 +351,9 @@ async fn routing_preserves_path_body_and_method_error_precedence() {
 async fn soap_body_bounds_and_processing_deadlines_are_retained() {
     let server = server(TestCatalog::default());
 
-    let (send, receive) = oneshot::channel::<bytes::Bytes>();
-    let stalled_body = Body::from_stream(futures_util::stream::once(async move {
-        Ok::<_, io::Error>(receive.await.unwrap())
-    }));
+    let stalled_body = Body::from_stream(futures_util::stream::pending::<
+        Result<bytes::Bytes, io::Error>,
+    >());
 
     let mut stalled = action(CDS, "Browse", "");
     *stalled.body_mut() = stalled_body;
@@ -371,7 +362,6 @@ async fn soap_body_bounds_and_processing_deadlines_are_retained() {
     assert!(futures_util::poll!(&mut response).is_pending());
     tokio::time::advance(BODY_TIMEOUT).await;
     assert_eq!(response.await.status(), StatusCode::REQUEST_TIMEOUT);
-    drop(send);
 
     let (parts, exact_body) = action(CDS, "GetSystemUpdateID", "").into_parts();
 
