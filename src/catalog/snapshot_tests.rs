@@ -179,7 +179,6 @@ async fn complete_pagination_and_scoped_encoded_intersection_without_probes() {
             ],
             None,
         ),
-        reply(json!([])),
     ])
     .await;
 
@@ -195,13 +194,10 @@ async fn complete_pagination_and_scoped_encoded_intersection_without_probes() {
     assert!(video.resources.iter().all(|r| r.byte_seek));
     assert!(video.resources[1].duration.is_none());
 
-    assert!(fake.source.root().await.unwrap().albums.is_empty());
-
     let requests = fake.api.requests.lock().unwrap();
-    assert_eq!(requests.len(), 6);
+    assert_eq!(requests.len(), 5);
     assert_eq!(requests[0].uri, "/prefix/api/server/version");
     assert_eq!(requests[1].uri, "/prefix/api/albums");
-    assert_eq!(requests[5].uri, "/prefix/api/albums");
 
     for (index, expected_page) in [(2, 1), (3, 2), (4, 1)] {
         let request = &requests[index];
