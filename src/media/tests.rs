@@ -878,7 +878,7 @@ async fn redirect_hop_limit_and_loops_are_enforced() {
         format!("/prefix/api/assets/{ASSET}/thumbnail?edited=true&size=fullsize"),
     ];
 
-    for count in [3, 4] {
+    for (count, expected) in [(3, StatusCode::OK), (4, StatusCode::BAD_GATEWAY)] {
         let mut replies: Vec<_> = targets[..count].iter().map(|target| {
             Reply::new(&format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
         }).collect();
@@ -891,14 +891,7 @@ async fn redirect_hop_limit_and_loops_are_enforced() {
             .serve(ASSET, "display", Method::GET, HeaderMap::new())
             .await;
 
-        assert_eq!(
-            result.status(),
-            if count == 3 {
-                StatusCode::OK
-            } else {
-                StatusCode::BAD_GATEWAY
-            }
-        );
+        assert_eq!(result.status(), expected, "{count} redirects");
 
         for _ in 0..4 {
             server.request().await;

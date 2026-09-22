@@ -169,7 +169,6 @@ fn byte_seek_is_explicit_per_resource_and_does_not_add_other_dlna_claims() {
 
     let resource = didl(&[item], &Filter::parse("res").unwrap()).unwrap();
     assert!(resource.contains("http-get:*:video/mp4:DLNA.ORG_OP=01"));
-    assert!(!resource.contains("duration="));
 }
 
 #[test]

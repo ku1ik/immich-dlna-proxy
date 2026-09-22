@@ -277,10 +277,7 @@ async fn versions_retry_only_failed_checks_and_cache_success() {
 
     let fake = Fake::new(vec![
         reply(json!({"major": 4, "minor": 0, "patch": 0, "prerelease": null, "extra": []})),
-        Response::builder()
-            .status(403)
-            .body(Body::from("private upstream body"))
-            .unwrap(),
+        Response::builder().status(403).body(Body::empty()).unwrap(),
         reply(json!([])),
     ])
     .await;
