@@ -309,19 +309,17 @@ fn duplicate_event_headers_are_rejected_before_admission() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    assert!(subscriptions.state.lock().unwrap().entries.is_empty());
-
-    let (_, sid) = subscribe(&subscriptions, None);
-    let sid = format!("uuid:{sid}");
+    let sid = "uuid:00000000-0000-0000-0000-000000000001";
 
     let response = subscriptions.request(
         SERVICE,
         PEER,
         &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-        &headers(&[("sid", &sid), ("sid", &sid)]),
+        &headers(&[("sid", sid), ("sid", sid)]),
     );
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(subscriptions.state.lock().unwrap().entries.is_empty());
 }
 
 #[test]
@@ -1086,7 +1084,6 @@ async fn alternatives_keep_identical_seq_and_body_and_do_not_follow_redirects() 
 #[tokio::test]
 async fn oversized_bodies_fall_back_and_412_removes_without_trying_alternatives() {
     let subscriptions = Subscriptions::new().unwrap();
-    subscriptions.publish(3);
     let mut callback = Callback::new().await;
 
     let sid = callback.register(

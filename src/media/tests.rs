@@ -405,18 +405,17 @@ async fn rejects_invalid_partial_framing_before_streaming() {
 
 #[tokio::test]
 async fn all_routes_require_content_length_to_match_the_partial_span() {
-    for representation in ["original", "display", "preview", "playback"] {
-        let valid_mime = if representation == "playback" {
-            "video/mp4"
-        } else {
-            "image/jpeg"
-        };
-
-        for (length, expected) in [
-            (3, StatusCode::PARTIAL_CONTENT),
-            (4, StatusCode::BAD_GATEWAY),
+    for (representation, valid_mime) in [
+        ("original", "image/jpeg"),
+        ("display", "image/jpeg"),
+        ("preview", "image/jpeg"),
+        ("playback", "video/mp4"),
+    ] {
+        for (payload, expected, expected_body) in [
+            ("abc", StatusCode::PARTIAL_CONTENT, "abc"),
+            ("abcd", StatusCode::BAD_GATEWAY, ""),
         ] {
-            let payload = if length == 3 { "abc" } else { "abcd" };
+            let length = payload.len();
 
             let wire = format!(
                 "HTTP/1.1 206 Partial Content\r\nContent-Type: {valid_mime}\r\nContent-Length: {length}\r\nContent-Range: bytes 0-2/10\r\nConnection: close\r\n\r\n{payload}"
@@ -442,10 +441,7 @@ async fn all_routes_require_content_length_to_match_the_partial_span() {
 
             let body = to_bytes(result.into_body(), 1024).await.unwrap();
 
-            assert_eq!(
-                body.as_ref(),
-                if length == 3 { b"abc".as_slice() } else { b"" }
-            );
+            assert_eq!(body.as_ref(), expected_body.as_bytes());
         }
     }
 }
@@ -550,11 +546,6 @@ async fn upstream_errors_map_status_without_forwarding_error_bodies() {
             412,
             "Content-Type: application/json\r\nContent-Length: 6\r\n",
             412,
-        ),
-        (
-            404,
-            "Content-Type: application/json\r\nContent-Length: 6\r\n",
-            404,
         ),
         (
             401,

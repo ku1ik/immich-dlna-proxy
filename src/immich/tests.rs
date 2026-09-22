@@ -139,22 +139,15 @@ fn critical_structure_is_required_but_additive_fields_are_ignored() {
         assert!(serde_json::from_value::<SearchResponse>(response).is_err());
     }
 
-    let mut dto = asset(1, "IMAGE");
+    let dto = json!({
+        "id": Uuid::from_u128(1),
+        "type": "IMAGE",
+        "visibility": "timeline",
+        "isTrashed": false,
+        "isEdited": false,
+        "stack": {"unexpected": [1, 2, 3]},
+    });
 
-    for field in [
-        "checksum",
-        "updatedAt",
-        "thumbhash",
-        "originalFileName",
-        "originalMimeType",
-        "fileCreatedAt",
-        "localDateTime",
-        "duration",
-    ] {
-        dto.as_object_mut().unwrap().remove(field);
-    }
-
-    dto["stack"] = json!({"unexpected": [1, 2, 3]});
     let asset: Asset = serde_json::from_value(dto).unwrap();
     assert!(asset.file_created_at.is_none());
     assert!(asset.original_file_name.is_none());
@@ -295,9 +288,7 @@ async fn versions_retry_only_failed_checks_and_cache_success() {
     let client = fake.new_client();
     client.ensure_supported_version().await.unwrap();
 
-    let error = format!("{:#}", client.albums().await.unwrap_err());
-    assert!(error.contains("403"));
-    assert!(!error.contains("private") && !error.contains("http://"));
+    assert!(client.albums().await.is_err());
 
     client.ensure_supported_version().await.unwrap();
 
@@ -362,7 +353,7 @@ async fn json_bound_is_enforced_before_parsing_with_and_without_content_length()
 
 #[tokio::test]
 async fn transport_failures_are_sanitized_and_do_not_retry() {
-    for status in [401, 404, 429, 500, 503] {
+    for status in [401, 403, 404, 429, 500, 503] {
         let fake = Fake::new(vec![
             Response::builder()
                 .status(status)
