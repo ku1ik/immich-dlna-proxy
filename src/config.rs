@@ -44,7 +44,7 @@ fn default_log_level() -> String {
 
 // Intentionally no Debug: configuration owns the upstream credential.
 pub struct Config {
-    pub(crate) api_base: Url,
+    pub(crate) api_base: ApiBase,
     pub(crate) api_key: HeaderValue,
     pub(crate) listen_address: SocketAddrV4,
     pub(crate) friendly_name: String,
@@ -59,7 +59,7 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = fs::read_to_string(path).context("cannot read configuration file")?;
         let settings = parse_settings(&text)?;
-        let api_base = normalize_api_base(&settings.immich_url)?;
+        let api_base = settings.immich_url.parse()?;
         let collator = collator(&settings.sort_locale)?;
         let api_key = read_key(&settings.immich_api_key_file)?;
         let interface_index = resolve_interface(*settings.listen_address.ip())?;
@@ -120,6 +120,23 @@ fn parse_settings(text: &str) -> anyhow::Result<Settings> {
     Ok(settings)
 }
 
+#[derive(Clone, Debug)]
+pub struct ApiBase(Url);
+
+impl ApiBase {
+    pub fn as_url(&self) -> &Url {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for ApiBase {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        normalize_api_base(value).map(Self)
+    }
+}
+
 fn normalize_api_base(value: &str) -> anyhow::Result<Url> {
     let mut url = Url::parse(value).map_err(|_| anyhow::anyhow!("invalid immich_url"))?;
 
@@ -138,10 +155,6 @@ fn normalize_api_base(value: &str) -> anyhow::Result<Url> {
     url.set_path(&path);
 
     Ok(url)
-}
-
-pub(crate) fn is_normalized_api_base(url: &Url) -> bool {
-    is_safe_api_base(url) && url.path().ends_with("/api/")
 }
 
 fn is_safe_api_base(url: &Url) -> bool {
@@ -385,8 +398,8 @@ state_directory = "/var/lib/immich-dlna-proxy"
                 "https://example.com/a%20b/api/",
             ),
         ] {
-            let base = normalize_api_base(input).unwrap();
-            assert!(is_normalized_api_base(&base));
+            let base: ApiBase = input.parse().unwrap();
+            let base = base.as_url();
             assert_eq!(base.as_str(), expected);
             assert_eq!(
                 base.join("albums").unwrap().as_str(),
@@ -401,7 +414,7 @@ state_directory = "/var/lib/immich-dlna-proxy"
             "https://example.com?x",
             "https://example.com#x",
         ] {
-            assert!(normalize_api_base(value).is_err());
+            assert!(value.parse::<ApiBase>().is_err());
         }
 
         for value in [
@@ -409,10 +422,8 @@ state_directory = "/var/lib/immich-dlna-proxy"
             "https://user@example.com/api/",
             "https://example.com/api/?query",
             "https://example.com/api/#fragment",
-            "https://example.com/api",
-            "https://example.com/not-api/",
         ] {
-            assert!(!is_normalized_api_base(&value.parse().unwrap()));
+            assert!(value.parse::<ApiBase>().is_err());
         }
     }
 

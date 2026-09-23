@@ -9,7 +9,10 @@ use axum::{Router, body::Body, extract::Request, response::Response};
 use http::{HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
     eventing::Subscriptions,
-    media::{DISPLAY, MediaProxy, ORIGINAL, PLAYBACK, PREVIEW},
+    media::{
+        MediaProxy,
+        Representation::{Display, Original, Playback, Preview},
+    },
     server::Server,
     ssdp::Discovery,
 };
@@ -110,20 +113,20 @@ fn media_file(
     use catalog::{GENERATED_JPEG_ID, ORIGINAL_JPEG_ID, VIDEO_ID};
 
     let representation = match (endpoint, query) {
-        ("original", None | Some("")) => ORIGINAL,
-        ("video/playback", None | Some("")) => PLAYBACK,
-        ("thumbnail", Some("size=fullsize&edited=true" | "edited=true&size=fullsize")) => DISPLAY,
-        ("thumbnail", Some("size=preview&edited=true" | "edited=true&size=preview")) => PREVIEW,
+        ("original", None | Some("")) => Original,
+        ("video/playback", None | Some("")) => Playback,
+        ("thumbnail", Some("size=fullsize&edited=true" | "edited=true&size=fullsize")) => Display,
+        ("thumbnail", Some("size=preview&edited=true" | "edited=true&size=preview")) => Preview,
         _ => return None,
     };
 
     match (asset, representation) {
-        (ORIGINAL_JPEG_ID, ORIGINAL) => Some(("original.jpg", "image/jpeg")),
-        (ORIGINAL_JPEG_ID, PREVIEW) => Some(("original-preview.jpg", "image/jpeg")),
-        (GENERATED_JPEG_ID, DISPLAY) => Some(("generated-display.jpg", "image/jpeg")),
-        (GENERATED_JPEG_ID, PREVIEW) => Some(("generated-preview.jpg", "image/jpeg")),
-        (VIDEO_ID, ORIGINAL) => Some(("video-original.mp4", "video/mp4")),
-        (VIDEO_ID, PLAYBACK) => Some(("video-playback.mp4", "video/mp4")),
+        (ORIGINAL_JPEG_ID, Original) => Some(("original.jpg", "image/jpeg")),
+        (ORIGINAL_JPEG_ID, Preview) => Some(("original-preview.jpg", "image/jpeg")),
+        (GENERATED_JPEG_ID, Display) => Some(("generated-display.jpg", "image/jpeg")),
+        (GENERATED_JPEG_ID, Preview) => Some(("generated-preview.jpg", "image/jpeg")),
+        (VIDEO_ID, Original) => Some(("video-original.mp4", "video/mp4")),
+        (VIDEO_ID, Playback) => Some(("video-playback.mp4", "video/mp4")),
         _ => None,
     }
 }

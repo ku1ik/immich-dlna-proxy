@@ -116,7 +116,11 @@ impl FakeServer {
     }
 
     fn proxy(&self) -> MediaProxy {
-        MediaProxy::new(self.base.clone(), HeaderValue::from_static("test-secret")).unwrap()
+        MediaProxy::new(
+            self.base.as_str().parse().unwrap(),
+            HeaderValue::from_static("test-secret"),
+        )
+        .unwrap()
     }
 
     async fn request(&mut self) -> String {

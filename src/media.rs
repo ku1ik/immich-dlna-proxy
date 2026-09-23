@@ -10,7 +10,7 @@ use tokio::{
 use url::Url;
 use uuid::Uuid;
 
-use crate::config::is_normalized_api_base;
+use crate::config::ApiBase;
 
 const OPERATIONS: usize = 16;
 const REDIRECTS: usize = 3;
@@ -18,19 +18,66 @@ const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) const ASSET_ROUTE_PREFIX: &str = "/media/assets/";
-pub const ORIGINAL: &str = "original";
-pub const DISPLAY: &str = "display";
-pub const PREVIEW: &str = "preview";
-pub const PLAYBACK: &str = "playback";
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Representation {
+    Original,
+    Display,
+    Preview,
+    Playback,
+}
 
-pub fn asset_url(address: SocketAddrV4, asset: Uuid, representation: &str) -> String {
+impl Representation {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "original" => Some(Self::Original),
+            "display" => Some(Self::Display),
+            "preview" => Some(Self::Preview),
+            "playback" => Some(Self::Playback),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::Display => "display",
+            Self::Preview => "preview",
+            Self::Playback => "playback",
+        }
+    }
+
+    fn endpoint(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::Display => "thumbnail?size=fullsize&edited=true",
+            Self::Preview => "thumbnail?size=preview&edited=true",
+            Self::Playback => "video/playback",
+        }
+    }
+
+    fn expected_mime(self) -> Option<&'static str> {
+        match self {
+            Self::Original => None,
+            Self::Display | Self::Preview => Some("image/jpeg"),
+            Self::Playback => Some("video/mp4"),
+        }
+    }
+
+    fn edited(self) -> bool {
+        matches!(self, Self::Display | Self::Preview)
+    }
+}
+
+pub fn asset_url(address: SocketAddrV4, asset: Uuid, representation: Representation) -> String {
+    let representation = representation.as_str();
+
     format!("http://{address}{ASSET_ROUTE_PREFIX}{asset}/{representation}")
 }
 
 #[derive(Clone)]
 pub struct MediaProxy {
     client: reqwest::Client,
-    api_base: Url,
+    api_base: ApiBase,
     api_key: HeaderValue,
     operations: Arc<Semaphore>,
 }
@@ -41,13 +88,6 @@ enum Failure {
     Upstream(&'static str),
     #[error("upstream deadline exceeded")]
     Timeout,
-}
-
-#[derive(Clone, Copy)]
-struct MediaRoute {
-    endpoint: &'static str,
-    expected_mime: Option<&'static str>,
-    edited: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -90,12 +130,7 @@ impl ByteRange {
 }
 
 impl MediaProxy {
-    pub fn new(api_base: Url, mut api_key: HeaderValue) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            is_normalized_api_base(&api_base),
-            "media requires a normalized HTTP(S) API directory"
-        );
-
+    pub fn new(api_base: ApiBase, mut api_key: HeaderValue) -> anyhow::Result<Self> {
         api_key.set_sensitive(true);
 
         let client = crate::outbound_client_builder().build()?;
@@ -119,32 +154,8 @@ impl MediaProxy {
             return response(StatusCode::NOT_FOUND);
         };
 
-        let route = match representation {
-            ORIGINAL => MediaRoute {
-                endpoint: "original",
-                expected_mime: None,
-                edited: false,
-            },
-
-            DISPLAY => MediaRoute {
-                endpoint: "thumbnail?size=fullsize&edited=true",
-                expected_mime: Some("image/jpeg"),
-                edited: true,
-            },
-
-            PREVIEW => MediaRoute {
-                endpoint: "thumbnail?size=preview&edited=true",
-                expected_mime: Some("image/jpeg"),
-                edited: true,
-            },
-
-            PLAYBACK => MediaRoute {
-                endpoint: "video/playback",
-                expected_mime: Some("video/mp4"),
-                edited: false,
-            },
-
-            _ => return response(StatusCode::NOT_FOUND),
+        let Some(route) = Representation::parse(representation) else {
+            return response(StatusCode::NOT_FOUND);
         };
 
         if method != Method::GET && method != Method::HEAD {
@@ -194,7 +205,7 @@ impl MediaProxy {
     async fn request(
         &self,
         asset: Uuid,
-        route: MediaRoute,
+        route: Representation,
         method: Method,
         headers: HeaderMap,
         permit: OwnedSemaphorePermit,
@@ -226,7 +237,7 @@ impl MediaProxy {
         let mut status = upstream.status();
         let mut safe = HeaderMap::new();
 
-        tracing::debug!(%asset, endpoint = route.endpoint, status = status.as_u16(), "upstream media response");
+        tracing::debug!(%asset, endpoint = route.endpoint(), status = status.as_u16(), "upstream media response");
 
         for name in [
             header::CONTENT_TYPE,
@@ -317,7 +328,7 @@ impl MediaProxy {
 
         if mime.eq_ignore_ascii_case("multipart/byteranges")
             || route
-                .expected_mime
+                .expected_mime()
                 .is_some_and(|expected| !mime.eq_ignore_ascii_case(expected))
         {
             return Err(Failure::Upstream("incompatible media MIME"));
@@ -364,7 +375,7 @@ impl MediaProxy {
     async fn fetch(
         &self,
         asset: Uuid,
-        route: MediaRoute,
+        route: Representation,
         method: &Method,
         mut forwarded: HeaderMap,
     ) -> Result<(reqwest::Response, Option<u64>), Failure> {
@@ -377,7 +388,8 @@ impl MediaProxy {
 
         let mut url = self
             .api_base
-            .join(&format!("assets/{asset}/{}", route.endpoint))
+            .as_url()
+            .join(&format!("assets/{asset}/{}", route.endpoint()))
             .map_err(|_| Failure::Upstream("invalid media endpoint"))?;
 
         let mut visited = vec![url.clone()];
@@ -432,7 +444,7 @@ impl MediaProxy {
 
             if visited.len() > REDIRECTS
                 || visited.contains(&target)
-                || !allowed_redirect(&self.api_base, route.edited, &target, asset)
+                || !allowed_redirect(self.api_base.as_url(), route.edited(), &target, asset)
             {
                 return Err(Failure::Upstream("unsafe or excessive media redirect"));
             }

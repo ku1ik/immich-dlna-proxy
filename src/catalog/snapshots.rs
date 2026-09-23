@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::{MAX_ALBUMS, Object, Resource, SNAPSHOT_BYTES};
 use crate::{
     immich::{Asset, Client},
-    media::{DISPLAY, ORIGINAL, PLAYBACK, PREVIEW, asset_url},
+    media::{Representation, asset_url},
     protocol::xml_char,
 };
 
@@ -192,7 +192,7 @@ impl Source {
                 let old_size = encoded_size(item, SNAPSHOT_BYTES)?;
 
                 item.object.resources.push(Resource {
-                    uri: asset_url(self.http_address, id, PLAYBACK),
+                    uri: asset_url(self.http_address, id, Representation::Playback),
                     mime: "video/mp4".into(),
                     duration: None,
                     byte_seek: true,
@@ -259,7 +259,7 @@ fn project_root(
                 date: created_at.map(|date| date.format("%Y-%m-%d").to_string()),
                 art: dto
                     .album_thumbnail_asset_id
-                    .map(|id| asset_url(http_address, id, PREVIEW)),
+                    .map(|id| asset_url(http_address, id, Representation::Preview)),
                 child_count: None,
                 resources: Vec::new(),
             },
@@ -337,7 +337,7 @@ fn project_item(
 
     let (representation, mime) = if video {
         (
-            ORIGINAL,
+            Representation::Original,
             mime.unwrap_or_else(|| "application/octet-stream".into()),
         )
     } else if !dto.is_edited
@@ -345,9 +345,12 @@ fn project_item(
             .as_deref()
             .is_some_and(|mime| matches!(mime, "image/jpeg" | "image/png" | "image/gif"))
     {
-        (ORIGINAL, mime.expect("checked original image MIME"))
+        (
+            Representation::Original,
+            mime.expect("checked original image MIME"),
+        )
     } else {
-        (DISPLAY, "image/jpeg".into())
+        (Representation::Display, "image/jpeg".into())
     };
 
     let duration = dto
@@ -373,7 +376,7 @@ fn project_item(
 
     if !video {
         resources.push(Resource {
-            uri: asset_url(http_address, dto.id, PREVIEW),
+            uri: asset_url(http_address, dto.id, Representation::Preview),
             mime: "image/jpeg".into(),
             duration: None,
             byte_seek: false,
@@ -403,7 +406,7 @@ fn project_item(
             }
             .into(),
             date,
-            art: Some(asset_url(http_address, dto.id, PREVIEW)),
+            art: Some(asset_url(http_address, dto.id, Representation::Preview)),
             child_count: None,
             resources,
         },

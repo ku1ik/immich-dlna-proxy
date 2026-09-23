@@ -2,7 +2,11 @@ use std::net::SocketAddrV4;
 
 use immich_dlna_proxy::{
     catalog::{BrowseQuery, BrowseResult, Catalog, Object, ObjectId, Resource, parse_id},
-    media::{DISPLAY, ORIGINAL, PLAYBACK, PREVIEW, asset_url},
+    media::{
+        Representation,
+        Representation::{Display, Original, Playback, Preview},
+        asset_url,
+    },
     protocol::Fault,
 };
 
@@ -85,7 +89,7 @@ impl Catalog for FixtureCatalog {
 }
 
 pub fn objects(address: SocketAddrV4) -> Vec<Object> {
-    let media = |asset: &str, representation: &str| {
+    let media = |asset: &str, representation: Representation| {
         asset_url(address, asset.parse().unwrap(), representation)
     };
 
@@ -106,7 +110,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             title: "Mixed JPEG and H264 AAC".into(),
             class: "object.container.album".into(),
             date: Some("2024-01-01".into()),
-            art: Some(media(ORIGINAL_JPEG_ID, PREVIEW)),
+            art: Some(media(ORIGINAL_JPEG_ID, Preview)),
             child_count: None,
             resources: Vec::new(),
         },
@@ -119,7 +123,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             "2024-01-01",
             "object.item.imageItem.photo",
             "image/jpeg",
-            [ORIGINAL, PREVIEW],
+            [Original, Preview],
         ),
         (
             GENERATED_JPEG_ID,
@@ -127,7 +131,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             "2024-01-02",
             "object.item.imageItem.photo",
             "image/jpeg",
-            [DISPLAY, PREVIEW],
+            [Display, Preview],
         ),
         (
             VIDEO_ID,
@@ -135,7 +139,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             "2024-01-03",
             "object.item.videoItem",
             "video/mp4",
-            [ORIGINAL, PLAYBACK],
+            [Original, Playback],
         ),
     ] {
         let resources = representations
@@ -143,7 +147,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             .map(|representation| Resource {
                 uri: media(asset, representation),
                 mime: mime.into(),
-                duration: (asset == VIDEO_ID && representation == ORIGINAL)
+                duration: (asset == VIDEO_ID && representation == Original)
                     .then(|| "0:00:30.000".into()),
                 byte_seek: asset == VIDEO_ID,
             })
@@ -155,7 +159,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             title: title.into(),
             class: class.into(),
             date: Some(date.into()),
-            art: (mime == "image/jpeg").then(|| media(asset, PREVIEW)),
+            art: (mime == "image/jpeg").then(|| media(asset, Preview)),
             child_count: None,
             resources,
         });
@@ -170,7 +174,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
         art: None,
         child_count: None,
         resources: vec![Resource {
-            uri: media(VIDEO_ID, PLAYBACK),
+            uri: media(VIDEO_ID, Playback),
             mime: "video/mp4".into(),
             duration: None,
             byte_seek: true,

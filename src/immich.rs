@@ -11,10 +11,9 @@ use anyhow::{Result, anyhow, ensure};
 use http::{HeaderValue, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{sync::OnceCell, time::timeout};
-use url::Url;
 use uuid::Uuid;
 
-use crate::config::is_normalized_api_base;
+use crate::config::ApiBase;
 
 pub(crate) const SEARCH_PAGE_SIZE: usize = 1_000;
 const JSON_BYTES: usize = 16 * 1024 * 1024;
@@ -22,7 +21,7 @@ const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) struct Client {
     client: reqwest::Client,
-    api_base: Url,
+    api_base: ApiBase,
     api_key: HeaderValue,
     version_checked: OnceCell<()>,
 }
@@ -122,12 +121,7 @@ struct Search {
 }
 
 impl Client {
-    pub(crate) fn new(api_base: Url, mut api_key: HeaderValue) -> Result<Self> {
-        ensure!(
-            is_normalized_api_base(&api_base),
-            "Immich requires a normalized HTTP(S) API directory"
-        );
-
+    pub(crate) fn new(api_base: ApiBase, mut api_key: HeaderValue) -> Result<Self> {
         api_key.set_sensitive(true);
 
         let client = crate::outbound_client_builder()
@@ -190,7 +184,10 @@ impl Client {
         self.version_checked
             .get_or_try_init(|| async {
                 let version: Version = self
-                    .json(self.client.get(self.api_base.join("server/version")?))
+                    .json(
+                        self.client
+                            .get(self.api_base.as_url().join("server/version")?),
+                    )
                     .await?;
 
                 ensure!(
@@ -208,7 +205,7 @@ impl Client {
     }
 
     pub(crate) async fn albums(&self) -> Result<Vec<Album>> {
-        self.json(self.client.get(self.api_base.join("albums")?))
+        self.json(self.client.get(self.api_base.as_url().join("albums")?))
             .await
     }
 
@@ -235,7 +232,7 @@ impl Client {
         let result: SearchResponse = self
             .json(
                 self.client
-                    .post(self.api_base.join("search/metadata")?)
+                    .post(self.api_base.as_url().join("search/metadata")?)
                     .json(&query),
             )
             .await?;

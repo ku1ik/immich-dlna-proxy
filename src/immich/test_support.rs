@@ -1,5 +1,6 @@
 use std::{collections::VecDeque, sync::Arc, sync::Mutex};
 
+use crate::config::ApiBase;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -9,7 +10,6 @@ use axum::{
 use http::HeaderValue;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
-use url::Url;
 use uuid::Uuid;
 
 use super::Client;
@@ -23,7 +23,7 @@ pub(crate) struct Received {
 
 pub(crate) struct Fake {
     pub(crate) requests: Arc<Mutex<Vec<Received>>>,
-    pub(super) api_base: Url,
+    pub(super) api_base: ApiBase,
     task: JoinHandle<()>,
 }
 
@@ -31,7 +31,7 @@ impl Fake {
     pub(crate) async fn new(replies: Vec<Response>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let api_base = Url::parse(&format!("http://{address}/prefix/api/")).unwrap();
+        let api_base = format!("http://{address}/prefix/api/").parse().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = requests.clone();
         let replies = Arc::new(Mutex::new(VecDeque::from(replies)));

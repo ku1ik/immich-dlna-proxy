@@ -301,7 +301,7 @@ async fn redirects_are_rejected_at_every_endpoint() {
         let fake = Fake::new(vec![
             Response::builder()
                 .status(StatusCode::FOUND)
-                .header(header::LOCATION, target.api_base.as_str())
+                .header(header::LOCATION, target.api_base.as_url().as_str())
                 .body(Body::empty())
                 .unwrap(),
         ])
