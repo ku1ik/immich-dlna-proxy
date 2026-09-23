@@ -249,7 +249,7 @@ fn soap_namespace_rejects_reserved_aliases_after_decoding() {
 
         assert_eq!(
             parse(&xml, "GetSortCapabilities"),
-            Err(Fault { code: 402 }),
+            Err(Fault::InvalidArgs),
             "{namespace}"
         );
     }
@@ -264,7 +264,7 @@ fn soap_namespace_rejects_reserved_aliases_after_decoding() {
 
         assert_eq!(
             parse(&xml, "GetSortCapabilities"),
-            Err(Fault { code: 402 }),
+            Err(Fault::InvalidArgs),
             "{declaration}"
         );
     }
@@ -284,7 +284,7 @@ fn soap_namespace_rejects_reserved_default_bindings() {
 
         assert_eq!(
             parse(&xml, "GetSortCapabilities"),
-            Err(Fault { code: 402 }),
+            Err(Fault::InvalidArgs),
             "{namespace}"
         );
     }
@@ -318,14 +318,14 @@ fn soap_namespace_decodes_aliases_once_and_restores_scopes() {
 
     assert_eq!(
         parse(&leaked, "GetSortCapabilities"),
-        Err(Fault { code: 402 })
+        Err(Fault::InvalidArgs)
     );
 
     let double_escaped = xml.replace("ContentDirectory:&#49;", "ContentDirectory:&amp;#49;");
 
     assert_eq!(
         parse(&double_escaped, "GetSortCapabilities"),
-        Err(Fault { code: 402 })
+        Err(Fault::InvalidArgs)
     );
 
     let duplicate = xml.replace(
@@ -335,7 +335,7 @@ fn soap_namespace_decodes_aliases_once_and_restores_scopes() {
 
     assert_eq!(
         parse(&duplicate, "GetSortCapabilities"),
-        Err(Fault { code: 402 })
+        Err(Fault::InvalidArgs)
     );
 }
 
@@ -382,7 +382,7 @@ fn soap_rejects_namespace_spoofing_and_action_ambiguity() {
         valid.replace("</u:Browse>", "</u:Search>"),
         valid.replace("</s:Envelope>", ""),
     ] {
-        assert_eq!(parse(&xml, "Browse"), Err(Fault { code: 402 }), "{xml}");
+        assert_eq!(parse(&xml, "Browse"), Err(Fault::InvalidArgs), "{xml}");
     }
 
     for header in [
@@ -395,7 +395,7 @@ fn soap_rejects_namespace_spoofing_and_action_ambiguity() {
     ] {
         assert_eq!(
             parse_action(valid.as_bytes(), &header, Service::ContentDirectory),
-            Err(Fault { code: 402 })
+            Err(Fault::InvalidArgs)
         );
     }
 }
@@ -457,7 +457,7 @@ fn soap_rejects_nested_argument_elements() {
             &format!("<ObjectID>{nested}</ObjectID>"),
         );
 
-        assert_eq!(browse(&args), Err(Fault { code: 402 }), "{nested}");
+        assert_eq!(browse(&args), Err(Fault::InvalidArgs), "{nested}");
     }
 }
 
@@ -486,12 +486,12 @@ fn soap_browse_validates_shape_and_fault_precedence() {
             .replace(argument, "")
             .replace("<SortCriteria/>", "<SortCriteria>bad</SortCriteria>");
 
-        assert_eq!(browse(&args), Err(Fault { code: 402 }));
+        assert_eq!(browse(&args), Err(Fault::InvalidArgs));
     }
 
     assert_eq!(
         browse(&format!("{BROWSE_ARGS}<Extra/>")),
-        Err(Fault { code: 402 })
+        Err(Fault::InvalidArgs)
     );
 
     // Preserve the argument count to check required names before sort values.
@@ -499,18 +499,18 @@ fn soap_browse_validates_shape_and_fault_precedence() {
         .replace("<Filter>*</Filter>", "<Extra/>")
         .replace("<SortCriteria/>", "<SortCriteria>bad</SortCriteria>");
 
-    assert_eq!(browse(&args), Err(Fault { code: 402 }));
+    assert_eq!(browse(&args), Err(Fault::InvalidArgs));
 
     let args = BROWSE_ARGS.replace("<Filter>*</Filter>", "<Filter>res,,</Filter>");
-    assert_eq!(browse(&args), Err(Fault { code: 402 }));
+    assert_eq!(browse(&args), Err(Fault::InvalidArgs));
     let args = args.replace("<SortCriteria/>", "<SortCriteria>bad</SortCriteria>");
-    assert_eq!(browse(&args), Err(Fault { code: 709 }));
+    assert_eq!(browse(&args), Err(Fault::InvalidSortCriteria));
 
     let args = args
         .replace("<StartingIndex>0", "<StartingIndex>1")
         .replace("BrowseDirectChildren", "BrowseMetadata");
 
-    assert_eq!(browse(&args), Err(Fault { code: 402 }));
+    assert_eq!(browse(&args), Err(Fault::InvalidArgs));
 
     let args = BROWSE_ARGS
         .replace("<ObjectID>0", "<ObjectID>not-an-id")
@@ -530,7 +530,7 @@ fn soap_browse_validates_shape_and_fault_precedence() {
 fn soap_validates_action_inputs_and_sort_syntax() {
     assert_eq!(
         parse(&request("Search", ""), "Search"),
-        Err(Fault { code: 401 })
+        Err(Fault::InvalidAction)
     );
 
     assert_eq!(
@@ -538,7 +538,7 @@ fn soap_validates_action_inputs_and_sort_syntax() {
             &request("GetSortCapabilities", "<Extra/>"),
             "GetSortCapabilities"
         ),
-        Err(Fault { code: 402 })
+        Err(Fault::InvalidArgs)
     );
 
     for value in ["", "-1", "+1", " 1", "1 ", "4294967296", "1.0"] {
@@ -548,7 +548,7 @@ fn soap_validates_action_inputs_and_sort_syntax() {
                 &format!("<{name}>{value}</{name}>"),
             );
 
-            assert_eq!(browse(&args), Err(Fault { code: 402 }), "{args}");
+            assert_eq!(browse(&args), Err(Fault::InvalidArgs), "{args}");
         }
     }
 
@@ -585,20 +585,20 @@ fn soap_validates_action_inputs_and_sort_syntax() {
                 )
                 .replace("BrowseDirectChildren", flag);
 
-            assert_eq!(browse(&args), Err(Fault { code: 709 }));
+            assert_eq!(browse(&args), Err(Fault::InvalidSortCriteria));
         }
     }
 
     assert_eq!(
         browse(&BROWSE_ARGS.replace("BrowseDirectChildren", "Unknown")),
-        Err(Fault { code: 402 })
+        Err(Fault::InvalidArgs)
     );
 
     let args = BROWSE_ARGS
         .replace("BrowseDirectChildren", "BrowseMetadata")
         .replace("<StartingIndex>0", "<StartingIndex>1");
 
-    assert_eq!(browse(&args), Err(Fault { code: 402 }));
+    assert_eq!(browse(&args), Err(Fault::InvalidArgs));
 
     for (value, expected) in [
         ("0", Ok(Action::GetCurrentConnectionInfo(0))),
@@ -608,11 +608,11 @@ fn soap_validates_action_inputs_and_sort_syntax() {
             Ok(Action::GetCurrentConnectionInfo(i32::MIN)),
         ),
         ("2147483647", Ok(Action::GetCurrentConnectionInfo(i32::MAX))),
-        ("2147483648", Err(Fault { code: 402 })),
-        ("-2147483649", Err(Fault { code: 402 })),
-        ("", Err(Fault { code: 402 })),
-        (" 0", Err(Fault { code: 402 })),
-        ("bad", Err(Fault { code: 402 })),
+        ("2147483648", Err(Fault::InvalidArgs)),
+        ("-2147483649", Err(Fault::InvalidArgs)),
+        ("", Err(Fault::InvalidArgs)),
+        (" 0", Err(Fault::InvalidArgs)),
+        ("bad", Err(Fault::InvalidArgs)),
     ] {
         let xml = request(
             "GetCurrentConnectionInfo",
@@ -667,7 +667,7 @@ fn soap_returns_typed_static_actions_and_rejects_wrong_service_actions() {
                 &format!("{}#{name}", service.namespace()),
                 service
             ),
-            Err(Fault { code: 401 })
+            Err(Fault::InvalidAction)
         );
     }
 }
@@ -718,11 +718,7 @@ fn filters_select_only_requested_available_properties() {
         "dc:*",
         "res@*",
     ] {
-        assert_eq!(
-            Filter::parse(invalid),
-            Err(Fault { code: 402 }),
-            "{invalid}"
-        );
+        assert_eq!(Filter::parse(invalid), Err(Fault::InvalidArgs), "{invalid}");
     }
 }
 
@@ -829,12 +825,12 @@ fn both_serialization_layers_fail_at_the_bound_without_partial_results() {
 
     assert_eq!(
         didl_bounded(&objects, &filter, encoded_size - 1),
-        Err(Fault { code: 501 })
+        Err(Fault::ActionFailed)
     );
 
     assert_eq!(
         didl_bounded(&objects, &filter, xml.len()),
-        Err(Fault { code: 501 })
+        Err(Fault::ActionFailed)
     );
 
     let args = [("Result", xml.as_str())];
@@ -853,20 +849,20 @@ fn both_serialization_layers_fail_at_the_bound_without_partial_results() {
             &args,
             response.len() - 1
         ),
-        Err(Fault { code: 501 })
+        Err(Fault::ActionFailed)
     );
 
     let mut writer = Xml::new(8, false);
-    assert_eq!(writer.text("&&"), Err(Fault { code: 501 }));
+    assert_eq!(writer.text("&&"), Err(Fault::ActionFailed));
     assert_eq!(writer.value, "&amp;");
     assert!(writer.value.len() <= writer.limit);
 
     let mut writer = Xml::new(8, true);
-    assert_eq!(writer.text("&"), Err(Fault { code: 501 }));
+    assert_eq!(writer.text("&"), Err(Fault::ActionFailed));
     assert!(writer.value.is_empty());
 
     let mut writer = Xml::new(3, false);
-    assert_eq!(writer.text("𐐀"), Err(Fault { code: 501 }));
+    assert_eq!(writer.text("𐐀"), Err(Fault::ActionFailed));
     assert!(writer.value.is_empty());
 }
 
@@ -896,16 +892,24 @@ fn device_description_has_identity_and_service_routes() {
 
 #[test]
 fn faults_have_upnp_namespace_codes_and_descriptions() {
-    for (code, description) in [
-        (401, "Invalid Action"),
-        (402, "Invalid Args"),
-        (501, "Action Failed"),
-        (701, "No Such Object"),
-        (706, "Invalid Connection Reference"),
-        (709, "Unsupported or Invalid Sort Criteria"),
-        (710, "No Such Container"),
+    for (fault, code, description) in [
+        (Fault::InvalidAction, 401, "Invalid Action"),
+        (Fault::InvalidArgs, 402, "Invalid Args"),
+        (Fault::ActionFailed, 501, "Action Failed"),
+        (Fault::NoSuchObject, 701, "No Such Object"),
+        (
+            Fault::InvalidConnectionReference,
+            706,
+            "Invalid Connection Reference",
+        ),
+        (
+            Fault::InvalidSortCriteria,
+            709,
+            "Unsupported or Invalid Sort Criteria",
+        ),
+        (Fault::NoSuchContainer, 710, "No Such Container"),
     ] {
-        let xml = fault_xml(Fault { code });
+        let xml = fault_xml(fault);
         assert_xml(&xml);
         assert!(xml.contains("<faultcode>s:Client</faultcode>"));
         assert!(xml.contains("<UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\">"));

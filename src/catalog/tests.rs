@@ -340,7 +340,7 @@ async fn fault(task: JoinHandle<Result<BrowseResult, Fault>>, code: u16) {
         .unwrap()
         .unwrap();
 
-    assert_eq!(result.err(), Some(Fault { code }));
+    assert_eq!(result.err().map(Fault::code), Some(code));
 }
 
 #[tokio::test]

@@ -97,8 +97,8 @@ pub struct Resource {
 #[cfg(test)]
 static SPAWN_OR_REOPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-const FAILED: Fault = Fault { code: 501 };
-const MISSING: Fault = Fault { code: 701 };
+const FAILED: Fault = Fault::ActionFailed;
+const MISSING: Fault = Fault::NoSuchObject;
 
 // Eviction always has room for the retained root and the album being published.
 const _: () = {

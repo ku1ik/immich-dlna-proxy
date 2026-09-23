@@ -27,7 +27,7 @@ pub enum ObjectId {
 }
 
 pub fn parse_id(value: &str) -> Result<ObjectId, Fault> {
-    let invalid = Fault { code: 701 };
+    let invalid = Fault::NoSuchObject;
     let mut parts = value.split(':');
 
     match (parts.next(), parts.next(), parts.next()) {
@@ -183,7 +183,7 @@ impl View {
                     return Err(MISSING);
                 }
 
-                return Err(Fault { code: 710 });
+                return Err(Fault::NoSuchContainer);
             }
         };
 
@@ -369,7 +369,7 @@ mod tests {
             &format!("{id}:extra"),
             &format!("album:{album}:asset:"),
         ] {
-            assert_eq!(parse_id(id), Err(Fault { code: 701 }));
+            assert_eq!(parse_id(id), Err(Fault::NoSuchObject));
         }
     }
 

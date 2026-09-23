@@ -50,31 +50,50 @@ impl Service {
             )
             | (Self::ConnectionManager, "GetProtocolInfo" | "GetCurrentConnectionIDs") => Ok(&[]),
 
-            _ => Err(Fault { code: 401 }),
+            _ => Err(Fault::InvalidAction),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Fault {
-    pub code: u16,
+pub enum Fault {
+    InvalidAction,
+    InvalidArgs,
+    ActionFailed,
+    NoSuchObject,
+    InvalidConnectionReference,
+    InvalidSortCriteria,
+    NoSuchContainer,
+}
+
+impl Fault {
+    pub fn code(self) -> u16 {
+        match self {
+            Self::InvalidAction => 401,
+            Self::InvalidArgs => 402,
+            Self::ActionFailed => 501,
+            Self::NoSuchObject => 701,
+            Self::InvalidConnectionReference => 706,
+            Self::InvalidSortCriteria => 709,
+            Self::NoSuchContainer => 710,
+        }
+    }
 }
 
 pub(crate) fn fault_xml(fault: Fault) -> String {
-    let description = match fault.code {
-        401 => "Invalid Action",
-        402 => "Invalid Args",
-        501 => "Action Failed",
-        701 => "No Such Object",
-        706 => "Invalid Connection Reference",
-        709 => "Unsupported or Invalid Sort Criteria",
-        710 => "No Such Container",
-        _ => "Action Failed",
+    let description = match fault {
+        Fault::InvalidAction => "Invalid Action",
+        Fault::InvalidArgs => "Invalid Args",
+        Fault::ActionFailed => "Action Failed",
+        Fault::NoSuchObject => "No Such Object",
+        Fault::InvalidConnectionReference => "Invalid Connection Reference",
+        Fault::InvalidSortCriteria => "Unsupported or Invalid Sort Criteria",
+        Fault::NoSuchContainer => "No Such Container",
     };
 
     format!(
         "{ENVELOPE_START}<s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>{}</errorCode><errorDescription>{description}</errorDescription></UPnPError></detail></s:Fault>{ENVELOPE_END}",
-        fault.code
+        fault.code()
     )
 }
 
@@ -116,7 +135,7 @@ fn action_arguments(
     name: &str,
     mut arguments: BTreeMap<String, String>,
 ) -> Result<Action, Fault> {
-    let invalid = Fault { code: 402 };
+    let invalid = Fault::InvalidArgs;
     let inputs = service.inputs(name)?;
 
     // Check the complete shape before value validation, including sort faults.
@@ -141,7 +160,7 @@ fn action_arguments(
 
         "Browse" => {}
 
-        _ => return Err(Fault { code: 401 }),
+        _ => return Err(Fault::InvalidAction),
     }
 
     let number = |name| {
@@ -171,7 +190,7 @@ fn action_arguments(
         "" => None,
         "+dc:date" => Some(false),
         "-dc:date" => Some(true),
-        _ => return Err(Fault { code: 709 }),
+        _ => return Err(Fault::InvalidSortCriteria),
     };
 
     let filter = Filter::parse(&arguments["Filter"])?;
@@ -216,12 +235,12 @@ fn qname(name: &str) -> bool {
 fn resolved_namespace(namespace: ResolveResult<'_>) -> Result<&str, Fault> {
     match namespace {
         ResolveResult::Bound(namespace) => {
-            std::str::from_utf8(namespace.into_inner()).map_err(|_| Fault { code: 402 })
+            std::str::from_utf8(namespace.into_inner()).map_err(|_| Fault::InvalidArgs)
         }
 
         ResolveResult::Unbound => Ok(""),
 
-        ResolveResult::Unknown(_) => Err(Fault { code: 402 }),
+        ResolveResult::Unknown(_) => Err(Fault::InvalidArgs),
     }
 }
 
@@ -230,7 +249,7 @@ pub(crate) fn parse_action(
     soap_action: &str,
     service: Service,
 ) -> Result<Action, Fault> {
-    let invalid = Fault { code: 402 };
+    let invalid = Fault::InvalidArgs;
 
     let source = std::str::from_utf8(body).map_err(|_| invalid)?;
 
@@ -524,7 +543,7 @@ impl Xml {
         let used = cost.and_then(|cost| self.used.checked_add(cost));
 
         if used.is_none_or(|used| used > self.limit) {
-            return Err(Fault { code: 501 });
+            return Err(Fault::ActionFailed);
         }
 
         self.used = used.unwrap();
@@ -626,7 +645,7 @@ impl Filter {
                 || (element.is_empty() && attribute.is_none())
                 || attribute.is_some_and(|attribute| !qname(attribute))
             {
-                return Err(Fault { code: 402 });
+                return Err(Fault::InvalidArgs);
             }
 
             match (element, attribute) {

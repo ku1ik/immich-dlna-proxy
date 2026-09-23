@@ -225,14 +225,14 @@ impl<C: Catalog> Server<C> {
         }
 
         let Some(soap_action) = single(&headers, "soapaction") else {
-            return soap(Err(Fault { code: 402 }));
+            return soap(Err(Fault::InvalidArgs));
         };
 
         if single(&headers, "content-length")
             .and_then(|value| value.parse::<u64>().ok())
             .is_some_and(|length| length > SOAP_BODY_BYTES as u64)
         {
-            return soap(Err(Fault { code: 501 }));
+            return soap(Err(Fault::ActionFailed));
         }
 
         let body_deadline = started + BODY_TIMEOUT;
@@ -250,7 +250,7 @@ impl<C: Catalog> Server<C> {
                         .source()
                         .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
                     {
-                        return soap(Err(Fault { code: 501 }));
+                        return soap(Err(Fault::ActionFailed));
                     }
 
                     return empty(StatusCode::BAD_REQUEST);
@@ -261,20 +261,20 @@ impl<C: Catalog> Server<C> {
         let deadline = started + CONTROL_PROCESSING_TIMEOUT;
 
         if Instant::now() >= deadline {
-            return soap(Err(Fault { code: 501 }));
+            return soap(Err(Fault::ActionFailed));
         }
 
         let parsed = protocol::parse_action(&body, soap_action, service);
 
         if Instant::now() >= deadline {
-            return soap(Err(Fault { code: 501 }));
+            return soap(Err(Fault::ActionFailed));
         }
 
         let action = match parsed {
             Ok(action) => action,
 
             Err(fault) => {
-                tracing::debug!(%peer, ?service, code = fault.code, "SOAP request rejected");
+                tracing::debug!(%peer, ?service, code = fault.code(), "SOAP request rejected");
 
                 return soap(Err(fault));
             }
@@ -284,7 +284,7 @@ impl<C: Catalog> Server<C> {
         tracing::debug!(%peer, ?service, action = name, "SOAP action");
 
         if Instant::now() >= deadline {
-            return soap(Err(Fault { code: 501 }));
+            return soap(Err(Fault::ActionFailed));
         }
 
         // Keep admission outside timed execution, including fault construction and handoff.
@@ -300,16 +300,16 @@ impl<C: Catalog> Server<C> {
 
         let result = timeout_at(deadline, execute(&self.catalog, service, action, peer))
             .await
-            .unwrap_or(Err(Fault { code: 501 }));
+            .unwrap_or(Err(Fault::ActionFailed));
 
         let result = if Instant::now() < deadline {
             result
         } else {
-            Err(Fault { code: 501 })
+            Err(Fault::ActionFailed)
         };
 
         if let Err(fault) = &result {
-            tracing::debug!(%peer, ?service, code = fault.code, "SOAP action failed");
+            tracing::debug!(%peer, ?service, code = fault.code(), "SOAP action failed");
         }
 
         soap(result)
@@ -370,7 +370,7 @@ async fn execute<C: Catalog>(
 
         Action::GetCurrentConnectionInfo(id) => {
             if id != 0 {
-                return Err(Fault { code: 706 });
+                return Err(Fault::InvalidConnectionReference);
             }
 
             response(&[

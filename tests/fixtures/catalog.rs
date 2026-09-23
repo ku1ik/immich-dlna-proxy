@@ -33,7 +33,7 @@ impl Catalog for FixtureCatalog {
             .0
             .iter()
             .find(|object| object.id == id)
-            .ok_or(Fault { code: 701 })?;
+            .ok_or(Fault::NoSuchObject)?;
 
         tracing::info!(object = %id, metadata = args.metadata, "fixture Browse selection");
 
@@ -46,7 +46,7 @@ impl Catalog for FixtureCatalog {
         }
 
         if object.class.starts_with("object.item") {
-            return Err(Fault { code: 710 });
+            return Err(Fault::NoSuchContainer);
         }
 
         let mut children: Vec<_> = self
