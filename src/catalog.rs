@@ -599,7 +599,7 @@ impl ImmichCatalog {
 
                 let token = match scope {
                     Scope::Root => Token::Root,
-                    Scope::Album(id) => Token::Album(id, state.ledger.albums[&id].clone()),
+                    Scope::Album(id) => Token::Album(id, state.ledger.albums[&id]),
                 };
 
                 let (sender, receiver) = watch::channel(None);

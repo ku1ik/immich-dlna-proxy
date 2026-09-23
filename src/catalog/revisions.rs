@@ -33,7 +33,7 @@ pub(super) struct Ledger {
     pub(super) albums: BTreeMap<Uuid, AlbumRevision>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AlbumRevision {
     pub(super) update_id: u32,
@@ -194,21 +194,16 @@ impl Ledger {
         digest: &Digest,
     ) -> anyhow::Result<Option<Self>> {
         let album = self.albums.get(&id).filter(|album| album.present);
-        let album = album.context("contents transition requires a present album")?;
+        let mut album = *album.context("contents transition requires a present album")?;
 
         if album.contents_digest.as_ref() == Some(digest) {
             return Ok(None);
         }
 
-        let mut next = self.clone();
-
-        let album = next
-            .albums
-            .get_mut(&id)
-            .expect("validated album exists in clone");
-
         album.update_id = album.update_id.wrapping_add(1);
         album.contents_digest = Some(*digest);
+        let mut next = self.clone();
+        next.albums.insert(id, album);
         next.system_update_id = next.system_update_id.wrapping_add(1);
 
         Ok(Some(next))
