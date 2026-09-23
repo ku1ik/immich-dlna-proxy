@@ -246,6 +246,7 @@ fn project_root(
     records: Vec<crate::immich::Album>,
     bad_dates: &mut usize,
 ) -> Result<Root> {
+    // Canonical snapshots omit child count; Browse metadata supplies the current count.
     let root_object = Object {
         kind: ObjectKind::Root { child_count: None },
         title: friendly_name.to_owned(),
