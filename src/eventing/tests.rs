@@ -918,29 +918,21 @@ async fn inactive_initial_obligations_remain_eligible_behind_bounded_deliveries(
         let subscriptions = Subscriptions::new().unwrap();
         subscriptions.publish(17);
         let mut callback = Callback::new().await;
-        let mut inflight = Vec::new();
+        let mut expected = std::collections::BTreeSet::new();
 
         for _ in 0..DELIVERIES {
-            inflight.push(callback.register(&subscriptions, SERVICE, &["/gated"]));
+            let sid = callback.register(&subscriptions, SERVICE, &["/gated"]);
+            expected.insert(format!("uuid:{sid}"));
         }
 
         let task = tokio::spawn(subscriptions.clone().run());
 
-        let mut seen = std::collections::BTreeSet::new();
-
-        for _ in &inflight {
-            seen.insert(
-                callback.next().await.0.headers["sid"]
-                    .to_str()
-                    .unwrap()
-                    .to_owned(),
-            );
+        for _ in 0..DELIVERIES {
+            let (request, _) = callback.next().await;
+            assert!(expected.remove(request.headers["sid"].to_str().unwrap()));
         }
 
-        assert_eq!(
-            seen,
-            inflight.iter().map(|sid| format!("uuid:{sid}")).collect()
-        );
+        assert!(expected.is_empty());
 
         let target = callback.register(&subscriptions, SERVICE, &["/gated"]);
 
