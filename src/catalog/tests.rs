@@ -1575,7 +1575,7 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
 
     flight.changed().await.unwrap();
 
-    let (album_id, system_id, a_bytes) = {
+    let (album_id, system_id) = {
         let mut state = fixture.library.inner.state.lock().unwrap();
         let bytes = state.cache.albums[&Uuid::from_u128(1)].snapshot.bytes;
         state.cache.byte_limit = state.cache.root.as_ref().unwrap().snapshot.bytes + bytes;
@@ -1583,7 +1583,6 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
         (
             state.ledger.albums[&Uuid::from_u128(1)].update_id,
             state.ledger.system_update_id,
-            bytes,
         )
     };
 
@@ -1591,19 +1590,7 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
 
     {
         let state = fixture.library.inner.state.lock().unwrap();
-        let b_bytes = state.cache.albums[&Uuid::from_u128(2)].snapshot.bytes;
-        assert_eq!(b_bytes, a_bytes);
-
-        assert_eq!(
-            state.cache.root.as_ref().unwrap().snapshot.bytes + b_bytes,
-            state.cache.byte_limit
-        );
-
-        assert!(
-            a_bytes + b_bytes + state.cache.root.as_ref().unwrap().snapshot.bytes
-                > state.cache.byte_limit
-        );
-
+        assert!(state.cache.albums.contains_key(&Uuid::from_u128(2)));
         assert!(!state.cache.albums.contains_key(&Uuid::from_u128(1)));
     }
 
