@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::Write,
     net::SocketAddrV4,
+    num::NonZeroUsize,
 };
 
 use anyhow::{Result, anyhow, ensure};
@@ -110,7 +111,7 @@ impl Source {
                 break;
             }
 
-            let mut page = 1;
+            let mut page = NonZeroUsize::MIN;
 
             loop {
                 ensure!(

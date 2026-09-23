@@ -5,7 +5,7 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 use anyhow::{Result, anyhow, ensure};
 use http::{HeaderValue, header};
@@ -63,7 +63,7 @@ pub(crate) struct Asset {
 #[derive(Debug)]
 pub(crate) struct AssetPage {
     pub(crate) items: Vec<Asset>,
-    pub(crate) next_page: Option<usize>,
+    pub(crate) next_page: Option<NonZeroUsize>,
 }
 
 #[derive(Deserialize)]
@@ -109,7 +109,7 @@ struct SearchAssets {
 #[serde(rename_all = "camelCase")]
 struct Search {
     album_ids: [Uuid; 1],
-    page: usize,
+    page: NonZeroUsize,
     size: usize,
     with_deleted: bool,
     with_exif: bool,
@@ -213,11 +213,9 @@ impl Client {
     pub(crate) async fn search_album(
         &self,
         album: Uuid,
-        page: usize,
+        page: NonZeroUsize,
         encoded_videos: bool,
     ) -> Result<AssetPage> {
-        ensure!(page > 0, "Immich search pages start at one");
-
         let query = Search {
             album_ids: [album],
             page,

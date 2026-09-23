@@ -33,9 +33,12 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
         Some("2024-01-01T00:30:00+02:00")
     );
 
-    let result = client.search_album(ALBUM, 1, false).await.unwrap();
+    let result = client
+        .search_album(ALBUM, NonZeroUsize::MIN, false)
+        .await
+        .unwrap();
 
-    assert_eq!(result.next_page, Some(2));
+    assert_eq!(result.next_page, NonZeroUsize::new(2));
     assert_eq!(result.items.len(), 2);
     assert_eq!(result.items[0].kind, "FUTURE_TYPE");
     assert_eq!(result.items[0].visibility, "future-visibility");
@@ -49,7 +52,10 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
 
     assert_eq!(fake.requests.lock().unwrap().len(), 2);
 
-    let result = client.search_album(ALBUM, 2, true).await.unwrap();
+    let result = client
+        .search_album(ALBUM, NonZeroUsize::new(2).unwrap(), true)
+        .await
+        .unwrap();
 
     assert_eq!(result.next_page, None);
     assert_eq!(result.items[0].id, Uuid::from_u128(2));
@@ -167,7 +173,10 @@ async fn structurally_invalid_responses_return_sanitized_errors() {
 
     for error in [
         client.albums().await.unwrap_err(),
-        client.search_album(ALBUM, 1, false).await.unwrap_err(),
+        client
+            .search_album(ALBUM, NonZeroUsize::MIN, false)
+            .await
+            .unwrap_err(),
     ] {
         assert_eq!(
             format!("{error:#}"),
@@ -230,7 +239,10 @@ async fn search_validates_page_numbers_and_continuation_tokens() {
         let client = fake.new_client();
 
         assert!(
-            client.search_album(ALBUM, 1, false).await.is_err(),
+            client
+                .search_album(ALBUM, NonZeroUsize::MIN, false)
+                .await
+                .is_err(),
             "{next}"
         );
 
@@ -240,11 +252,12 @@ async fn search_validates_page_numbers_and_continuation_tokens() {
     let fake = Fake::new(vec![page(vec![], Some("0"))]).await;
     let client = fake.new_client();
 
-    assert!(client.search_album(ALBUM, 0, false).await.is_err());
-
-    assert!(fake.requests.lock().unwrap().is_empty());
-
-    assert!(client.search_album(ALBUM, usize::MAX, false).await.is_err());
+    assert!(
+        client
+            .search_album(ALBUM, NonZeroUsize::MAX, false)
+            .await
+            .is_err()
+    );
 
     assert_eq!(fake.requests.lock().unwrap().len(), 1);
 }
@@ -314,7 +327,10 @@ async fn redirects_are_rejected_at_every_endpoint() {
 
             1 => client.albums().await.map(|_| ()),
 
-            _ => client.search_album(ALBUM, 1, false).await.map(|_| ()),
+            _ => client
+                .search_album(ALBUM, NonZeroUsize::MIN, false)
+                .await
+                .map(|_| ()),
         };
 
         assert!(result.is_err());
