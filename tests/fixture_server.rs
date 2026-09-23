@@ -22,7 +22,7 @@ mod tests {
     };
 
     struct Harness {
-        _directory: tempfile::TempDir,
+        directory: tempfile::TempDir,
         address: SocketAddrV4,
         client: reqwest::Client,
         task: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -56,7 +56,7 @@ mod tests {
                 .unwrap();
 
             Self {
-                _directory: directory,
+                directory,
                 address,
                 client,
                 task,
@@ -165,18 +165,33 @@ mod tests {
     async fn all_six_media_representations_support_get_head_and_ranges() {
         let harness = Harness::start().await;
 
-        for (index, (asset, representation, mime)) in [
-            (ORIGINAL_JPEG_ID, "original", "image/jpeg"),
-            (ORIGINAL_JPEG_ID, "preview", "image/jpeg"),
-            (GENERATED_JPEG_ID, "display", "image/jpeg"),
-            (GENERATED_JPEG_ID, "preview", "image/jpeg"),
-            (VIDEO_ID, "original", "video/mp4"),
-            (VIDEO_ID, "playback", "video/mp4"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let expected = bytes(index);
+        for (asset, representation, filename, mime) in [
+            (ORIGINAL_JPEG_ID, "original", "original.jpg", "image/jpeg"),
+            (
+                ORIGINAL_JPEG_ID,
+                "preview",
+                "original-preview.jpg",
+                "image/jpeg",
+            ),
+            (
+                GENERATED_JPEG_ID,
+                "display",
+                "generated-display.jpg",
+                "image/jpeg",
+            ),
+            (
+                GENERATED_JPEG_ID,
+                "preview",
+                "generated-preview.jpg",
+                "image/jpeg",
+            ),
+            (VIDEO_ID, "original", "video-original.mp4", "video/mp4"),
+            (VIDEO_ID, "playback", "video-playback.mp4", "video/mp4"),
+        ] {
+            let expected = tokio::fs::read(harness.directory.path().join(filename))
+                .await
+                .unwrap();
+
             let url = harness.url(&format!("/media/assets/{asset}/{representation}"));
 
             let response = harness.client.get(&url).send().await.unwrap();
