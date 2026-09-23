@@ -1485,11 +1485,11 @@ async fn callback_port_churn_closes_keep_alive_sockets_after_delivery() {
 async fn expired_initial_obligations_drain_and_release_all_capacity() {
     let subscriptions = Subscriptions::new().unwrap();
     let mut callback = Callback::new().await;
-    let mut tokens = Vec::new();
+    let mut expected = std::collections::BTreeMap::new();
 
     for _ in 0..SUBSCRIPTIONS {
         let sid = callback.register(&subscriptions, SERVICE, &["/ok"]);
-        tokens.push(sid);
+        expected.insert(format!("uuid:{sid}"), sid);
     }
 
     tokio::time::pause();
@@ -1497,18 +1497,17 @@ async fn expired_initial_obligations_drain_and_release_all_capacity() {
     tokio::time::resume();
 
     let task = tokio::spawn(subscriptions.clone().run());
-    let mut seen = std::collections::BTreeSet::new();
 
     for _ in 0..SUBSCRIPTIONS {
         let (request, _) = callback.next().await;
-        assert!(seen.insert(request.headers["sid"].to_str().unwrap().to_owned()));
+        let sid = expected
+            .remove(request.headers["sid"].to_str().unwrap())
+            .unwrap();
         assert_eq!(request.headers["seq"], "0");
-    }
-
-    for sid in tokens {
         finished(&subscriptions, sid).await;
     }
 
+    assert!(expected.is_empty());
     assert!(subscriptions.state.lock().unwrap().entries.is_empty());
     abort_scheduler(task).await;
 }
