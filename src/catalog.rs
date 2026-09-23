@@ -557,15 +557,21 @@ impl ImmichCatalog {
 
             let now = Instant::now();
 
-            if let Scope::Album(id) = scope
-                && !state
-                    .ledger
-                    .albums
-                    .get(&id)
-                    .is_some_and(|album| album.present)
-            {
-                return Err(MISSING);
-            }
+            let token = match scope {
+                Scope::Root => Token::Root,
+
+                Scope::Album(id) => {
+                    let revision = state
+                        .ledger
+                        .albums
+                        .get(&id)
+                        .filter(|revision| revision.present)
+                        .copied()
+                        .ok_or(MISSING)?;
+
+                    Token::Album(id, revision)
+                }
+            };
 
             if state.cache.is_fresh(scope, now) {
                 return state.view(scope);
@@ -596,11 +602,6 @@ impl ImmichCatalog {
                     .clone()
                     .try_acquire_owned()
                     .map_err(|_| FAILED)?;
-
-                let token = match scope {
-                    Scope::Root => Token::Root,
-                    Scope::Album(id) => Token::Album(id, state.ledger.albums[&id]),
-                };
 
                 let (sender, receiver) = watch::channel(None);
                 state.flights.insert(scope, receiver.clone());
