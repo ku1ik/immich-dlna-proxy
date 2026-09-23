@@ -550,13 +550,12 @@ impl Xml {
             Some(text.len())
         };
 
-        let used = cost.and_then(|cost| self.used.checked_add(cost));
+        let used = cost
+            .and_then(|cost| self.used.checked_add(cost))
+            .filter(|&used| used <= self.limit)
+            .ok_or(Fault::ActionFailed)?;
 
-        if used.is_none_or(|used| used > self.limit) {
-            return Err(Fault::ActionFailed);
-        }
-
-        self.used = used.unwrap();
+        self.used = used;
         self.value.push_str(text);
 
         Ok(())
