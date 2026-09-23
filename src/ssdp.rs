@@ -25,6 +25,25 @@ const RESPONSE_SPACING: Duration =
     Duration::from_nanos(1_000_000_000 / RESPONSES_PER_SECOND as u64);
 const TARGET_COUNT: usize = 5;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    RootDevice,
+    Uuid,
+    MediaServer,
+    ContentDirectory,
+    ConnectionManager,
+}
+
+impl Target {
+    const ALL: [Self; TARGET_COUNT] = [
+        Self::RootDevice,
+        Self::Uuid,
+        Self::MediaServer,
+        Self::ContentDirectory,
+        Self::ConnectionManager,
+    ];
+}
+
 pub struct Discovery {
     socket: UdpSocket,
     address: Ipv4Addr,
@@ -169,7 +188,7 @@ impl Discovery {
     fn announce(&self, destination: SocketAddrV4) -> anyhow::Result<()> {
         let mut result = Ok(());
 
-        for target in 0..self.targets.len() {
+        for target in Target::ALL {
             let message = message(&self.targets, &self.location, target, Message::Alive);
 
             if let Err(error) = self.send(message.as_bytes(), destination) {
@@ -194,15 +213,15 @@ enum Message {
 fn message(
     targets: &[String; TARGET_COUNT],
     location: &str,
-    target: usize,
+    target: Target,
     kind: Message,
 ) -> String {
-    let name = &targets[target];
+    let name = &targets[target as usize];
 
-    let usn = if target == 1 {
-        targets[1].clone()
+    let usn = if target == Target::Uuid {
+        targets[Target::Uuid as usize].clone()
     } else {
-        format!("{}::{name}", targets[1])
+        format!("{}::{name}", targets[Target::Uuid as usize])
     };
 
     let mut message = match kind {
@@ -237,7 +256,7 @@ fn targets(uuid: Uuid) -> [String; TARGET_COUNT] {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Search {
-    target: Option<usize>,
+    target: Option<Target>,
     mx: Duration,
 }
 
@@ -307,7 +326,11 @@ fn parse_search(bytes: &[u8], targets: &[String; TARGET_COUNT]) -> Option<Search
     let target = if st == "ssdp:all" {
         None
     } else {
-        Some(targets.iter().position(|target| target == st)?)
+        Some(
+            Target::ALL
+                .into_iter()
+                .find(|&target| targets[target as usize] == st)?,
+        )
     };
 
     Some(Search {
@@ -317,7 +340,7 @@ fn parse_search(bytes: &[u8], targets: &[String; TARGET_COUNT]) -> Option<Search
 }
 
 struct Pending {
-    target: usize,
+    target: Target,
     destination: SocketAddrV4,
     due: Instant,
     expires: Instant,
@@ -358,7 +381,7 @@ impl Responses {
             return;
         }
 
-        for target in 0..TARGET_COUNT {
+        for target in Target::ALL {
             if search.target.is_some_and(|selected| selected != target) {
                 continue;
             }

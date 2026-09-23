@@ -29,11 +29,11 @@ fn loopback() -> Discovery {
 fn parses_all_and_each_exact_target_and_clamps_mx() {
     let targets = targets(UUID);
 
-    for (index, target) in targets.iter().enumerate() {
+    for (kind, target) in Target::ALL.into_iter().zip(&targets) {
         assert_eq!(
             parse_search(search(target, "2").as_bytes(), &targets),
             Some(Search {
-                target: Some(index),
+                target: Some(kind),
                 mx: Duration::from_secs(2),
             })
         );
@@ -136,14 +136,14 @@ fn queue_admits_all_targets_atomically_and_never_exceeds_bound() {
         responses
             .pending
             .iter()
-            .filter(|entry| entry.target == 4)
+            .filter(|entry| entry.target == Target::ConnectionManager)
             .count(),
         51
     );
 
     responses.enqueue(
         Search {
-            target: Some(1),
+            target: Some(Target::Uuid),
             ..all
         },
         LOCAL,
@@ -155,7 +155,7 @@ fn queue_admits_all_targets_atomically_and_never_exceeds_bound() {
 
     responses.enqueue(
         Search {
-            target: Some(1),
+            target: Some(Target::Uuid),
             ..all
         },
         LOCAL,
@@ -175,7 +175,7 @@ fn response_delays_rate_burst_and_expiration_are_bounded() {
     let mut responses = Responses::new(now);
 
     let request = Search {
-        target: Some(0),
+        target: Some(Target::RootDevice),
         mx: Duration::from_secs(5),
     };
 
@@ -268,7 +268,7 @@ fn all_wire_messages_have_exact_target_usn_and_framing() {
 
     for target in 0..5 {
         for kind in [Message::Alive, Message::Response] {
-            let message = message(&targets, &location, target, kind);
+            let message = message(&targets, &location, Target::ALL[target], kind);
 
             let usn = if target == 1 {
                 targets[1].clone()
