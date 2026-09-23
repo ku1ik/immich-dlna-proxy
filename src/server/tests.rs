@@ -239,10 +239,11 @@ async fn routing_rejects_invalid_headers_bodies_methods_and_peers() {
 
     let mut oversized = request(Method::GET, "/device.xml", Body::empty());
 
-    for _ in 0..90 {
-        oversized
-            .headers_mut()
-            .append("x-large", HeaderValue::from_str(&"a".repeat(190)).unwrap());
+    for _ in 0..2 {
+        oversized.headers_mut().append(
+            "x-large",
+            HeaderValue::from_str(&"a".repeat(HEADER_BYTES / 2)).unwrap(),
+        );
     }
 
     assert_eq!(
