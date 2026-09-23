@@ -55,7 +55,7 @@ pub trait Catalog: Send + Sync + 'static {
     ) -> impl Future<Output = Result<BrowseResult, Fault>> + Send;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BrowseQuery {
     pub object_id: ObjectId,
     pub mode: BrowseMode,

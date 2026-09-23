@@ -412,7 +412,7 @@ mod tests {
                 sort,
             };
 
-            let full = view.browse(query.clone(), &collator).unwrap();
+            let full = view.browse(query, &collator).unwrap();
 
             let expected: Vec<_> = expected
                 .into_iter()
@@ -438,7 +438,7 @@ mod tests {
                                 starting_index: start,
                                 requested_count: 3,
                             },
-                            ..query.clone()
+                            ..query
                         },
                         &collator,
                     )
