@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use quick_xml::NsReader;
 
 use super::*;
-use crate::catalog::Resource;
+use crate::catalog::{ObjectKind, Resource};
+use uuid::Uuid;
 
 fn request(action: &str, arguments: &str) -> String {
     format!(
@@ -27,27 +28,27 @@ const BROWSE_ARGS: &str = "<ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildre
 
 fn object() -> Object {
     Object {
-        id: "album:a:asset:b".into(),
-        parent_id: "album:a".into(),
         title: "A&B".into(),
-        class: "object.item.videoItem".into(),
         date: Some("2026-01-02".into()),
         art: Some("http://192.0.2.1/preview?a=1&b=2".into()),
-        child_count: None,
-        resources: vec![
-            Resource {
-                uri: "http://192.0.2.1/original?a=1&b=2".into(),
-                mime: "video/quicktime".into(),
-                duration: Some("123:04:05.006".into()),
-                byte_seek: false,
-            },
-            Resource {
-                uri: "http://192.0.2.1/playback".into(),
-                mime: "video/mp4".into(),
-                duration: None,
-                byte_seek: false,
-            },
-        ],
+        kind: ObjectKind::Video {
+            album: Uuid::from_u128(10),
+            asset: Uuid::from_u128(11),
+            resources: vec![
+                Resource {
+                    uri: "http://192.0.2.1/original?a=1&b=2".into(),
+                    mime: "video/quicktime".into(),
+                    duration: Some("123:04:05.006".into()),
+                    byte_seek: false,
+                },
+                Resource {
+                    uri: "http://192.0.2.1/playback".into(),
+                    mime: "video/mp4".into(),
+                    duration: None,
+                    byte_seek: false,
+                },
+            ],
+        },
     }
 }
 
@@ -149,7 +150,11 @@ fn event_propertyset_namespaces_and_static_values_are_correct() {
 #[test]
 fn byte_seek_is_explicit_per_resource_and_does_not_add_other_dlna_claims() {
     let mut item = object();
-    item.resources[1].byte_seek = true;
+    let ObjectKind::Video { resources, .. } = &mut item.kind else {
+        panic!("expected video");
+    };
+
+    resources[1].byte_seek = true;
 
     let xml = didl(&[item.clone()], &Filter::parse("*").unwrap()).unwrap();
     assert!(xml.contains("http-get:*:video/mp4:DLNA.ORG_OP=01"));
@@ -762,15 +767,20 @@ fn didl_keeps_mandatory_fields_first_and_resource_order_truthful() {
     assert!(!bare_res.contains("duration="));
 
     let mut root = object();
-    root.class = "object.container".into();
-    root.child_count = Some(12);
-    root.resources.clear();
+
+    root.kind = ObjectKind::Root {
+        child_count: Some(12),
+    };
+
     let xml = didl(&[root.clone()], &Filter::parse("@childCount").unwrap()).unwrap();
     assert!(xml.contains("<container "));
     assert!(xml.contains("childCount=\"12\"><dc:title>"));
 
-    root.class = "object.container.album".into();
-    root.child_count = None;
+    root.kind = ObjectKind::Album {
+        id: Uuid::from_u128(10),
+        child_count: None,
+    };
+
     root.date = None;
     root.art = None;
     let xml = didl(&[root], &Filter::parse("*").unwrap()).unwrap();
@@ -788,12 +798,15 @@ fn serialization_sanitizes_xml_and_escapes_exactly_two_layers() {
     );
 
     let mut object = object();
-    object.id = "\" injected=\"yes<&".into();
     object.title = "A&B <title> Łódź 東京 𐐀\u{1}".into();
-    object.resources[0].mime = "video/mp4\" bad=\"value".into();
+    let ObjectKind::Video { resources, .. } = &mut object.kind else {
+        panic!("expected video");
+    };
+
+    resources[0].mime = "video/mp4\" bad=\"value".into();
     let xml = didl(&[object], &Filter::parse("*").unwrap()).unwrap();
     assert_xml(&xml);
-    assert!(xml.contains("id=\"&quot; injected=&quot;yes&lt;&amp;\""));
+    assert!(xml.contains("video/mp4&quot; bad=&quot;value"));
 
     let response = action_response(
         Service::ContentDirectory,

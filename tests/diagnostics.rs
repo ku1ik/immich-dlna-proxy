@@ -49,14 +49,12 @@ impl Catalog for TestCatalog {
     async fn browse(&self, _: BrowseQuery) -> Result<BrowseResult, Fault> {
         Ok(BrowseResult {
             objects: vec![Object {
-                id: "0".into(),
-                parent_id: "-1".into(),
+                kind: immich_dlna_proxy::catalog::ObjectKind::Root {
+                    child_count: Some(9),
+                },
                 title: "A&B".into(),
-                class: "object.container".into(),
                 date: None,
                 art: None,
-                child_count: Some(9),
-                resources: Vec::new(),
             }],
             total_matches: 9,
             update_id: 7,

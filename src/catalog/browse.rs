@@ -19,11 +19,21 @@ pub(super) struct View {
     pub(super) ledger: Arc<Ledger>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ObjectId {
     Root,
     Album(Uuid),
     Item { album: Uuid, asset: Uuid },
+}
+
+impl std::fmt::Display for ObjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root => f.write_str("0"),
+            Self::Album(album) => write!(f, "album:{album}"),
+            Self::Item { album, asset } => write!(f, "album:{album}:asset:{asset}"),
+        }
+    }
 }
 
 pub fn parse_id(value: &str) -> Result<ObjectId, Fault> {
@@ -111,7 +121,10 @@ impl View {
             let object = match id {
                 ObjectId::Root => {
                     let mut object = root.object.clone();
-                    object.child_count = Some(root.albums.len());
+
+                    object.kind = super::ObjectKind::Root {
+                        child_count: Some(root.albums.len()),
+                    };
 
                     object
                 }
@@ -216,14 +229,10 @@ mod tests {
     #[test]
     fn albums_default_to_latest_date_with_title_ties_and_missing_dates_last() {
         let root_object = Object {
-            id: "0".into(),
-            parent_id: "-1".into(),
+            kind: super::super::ObjectKind::Root { child_count: None },
             title: "Photos & videos".into(),
-            class: "object.container".into(),
             date: None,
             art: None,
-            child_count: None,
-            resources: Vec::new(),
         };
 
         let albums = [
@@ -244,10 +253,11 @@ mod tests {
             let album = Album {
                 id,
                 object: Object {
-                    id: format!("album:{id}"),
-                    parent_id: "0".into(),
+                    kind: super::super::ObjectKind::Album {
+                        id,
+                        child_count: None,
+                    },
                     title: title.into(),
-                    class: "object.container.album".into(),
                     date: Some(created.into()),
                     ..root_object.clone()
                 },
@@ -308,8 +318,11 @@ mod tests {
             assert_eq!(full.update_id, 42);
 
             assert_eq!(
-                full.objects.iter().map(|o| &o.id).collect::<Vec<_>>(),
-                expected.iter().collect::<Vec<_>>()
+                full.objects
+                    .iter()
+                    .map(|o| o.id().to_string())
+                    .collect::<Vec<_>>(),
+                expected
             );
 
             for start in [0, 3, 6, 9] {

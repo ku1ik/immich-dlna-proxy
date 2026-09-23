@@ -71,16 +71,100 @@ pub struct BrowseResult {
 }
 
 /// Complete projected metadata; callers own filtering and wire serialization.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Object {
-    pub id: String,
-    pub parent_id: String,
+    pub kind: ObjectKind,
     pub title: String,
-    pub class: String,
     pub date: Option<String>,
     pub art: Option<String>,
-    pub child_count: Option<usize>,
-    pub resources: Vec<Resource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObjectKind {
+    Root {
+        child_count: Option<usize>,
+    },
+    Album {
+        id: Uuid,
+        child_count: Option<usize>,
+    },
+    Photo {
+        album: Uuid,
+        asset: Uuid,
+        resources: Vec<Resource>,
+    },
+    Video {
+        album: Uuid,
+        asset: Uuid,
+        resources: Vec<Resource>,
+    },
+}
+
+impl Object {
+    pub fn id(&self) -> ObjectId {
+        match self.kind {
+            ObjectKind::Root { .. } => ObjectId::Root,
+            ObjectKind::Album { id, .. } => ObjectId::Album(id),
+            ObjectKind::Photo { album, asset, .. } | ObjectKind::Video { album, asset, .. } => {
+                ObjectId::Item { album, asset }
+            }
+        }
+    }
+
+    pub fn parent_id(&self) -> Option<ObjectId> {
+        match self.id() {
+            ObjectId::Root => None,
+            ObjectId::Album(_) => Some(ObjectId::Root),
+            ObjectId::Item { album, .. } => Some(ObjectId::Album(album)),
+        }
+    }
+
+    pub fn class(&self) -> &'static str {
+        match self.kind {
+            ObjectKind::Root { .. } => "object.container",
+            ObjectKind::Album { .. } => "object.container.album",
+            ObjectKind::Photo { .. } => "object.item.imageItem.photo",
+            ObjectKind::Video { .. } => "object.item.videoItem",
+        }
+    }
+
+    pub fn child_count(&self) -> Option<usize> {
+        match self.kind {
+            ObjectKind::Root { child_count } | ObjectKind::Album { child_count, .. } => child_count,
+            ObjectKind::Photo { .. } | ObjectKind::Video { .. } => None,
+        }
+    }
+
+    pub fn resources(&self) -> &[Resource] {
+        match &self.kind {
+            ObjectKind::Root { .. } | ObjectKind::Album { .. } => &[],
+            ObjectKind::Photo { resources, .. } | ObjectKind::Video { resources, .. } => resources,
+        }
+    }
+}
+
+// Keep the canonical projection stable independently of the in-memory model.
+impl Serialize for Object {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let mut object = serializer.serialize_struct("Object", 8)?;
+        object.serialize_field("id", &self.id().to_string())?;
+        object.serialize_field(
+            "parent_id",
+            &self
+                .parent_id()
+                .map_or_else(|| "-1".into(), |id| id.to_string()),
+        )?;
+        object.serialize_field("title", &self.title)?;
+        object.serialize_field("class", self.class())?;
+        object.serialize_field("date", &self.date)?;
+        object.serialize_field("art", &self.art)?;
+        object.serialize_field("child_count", &self.child_count())?;
+        object.serialize_field("resources", self.resources())?;
+
+        object.end()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

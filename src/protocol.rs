@@ -683,21 +683,27 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
     xml.raw("<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">")?;
 
     for object in objects {
-        let container =
-            object.class == "object.container" || object.class.starts_with("object.container.");
+        let container = matches!(
+            object.kind,
+            crate::catalog::ObjectKind::Root { .. } | crate::catalog::ObjectKind::Album { .. }
+        );
 
         let tag = if container { "container" } else { "item" };
         xml.raw("<")?;
         xml.raw(tag)?;
         xml.raw(" id=\"")?;
-        xml.text(&object.id)?;
+        xml.text(&object.id().to_string())?;
         xml.raw("\" parentID=\"")?;
-        xml.text(&object.parent_id)?;
+        xml.text(
+            &object
+                .parent_id()
+                .map_or_else(|| "-1".into(), |id| id.to_string()),
+        )?;
         xml.raw("\" restricted=\"1\"")?;
 
         if container
             && filter.child_count
-            && let Some(count) = object.child_count
+            && let Some(count) = object.child_count()
         {
             xml.raw(" childCount=\"")?;
             xml.raw(&count.to_string())?;
@@ -706,7 +712,7 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
 
         xml.raw(">")?;
         xml.element("dc:title", &object.title)?;
-        xml.element("upnp:class", &object.class)?;
+        xml.element("upnp:class", object.class())?;
 
         if filter.date
             && let Some(date) = &object.date
@@ -721,7 +727,7 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
         }
 
         if filter.res() {
-            for resource in &object.resources {
+            for resource in object.resources() {
                 xml.raw("<res protocolInfo=\"http-get:*:")?;
                 xml.text(&resource.mime)?;
                 xml.raw(if resource.byte_seek {

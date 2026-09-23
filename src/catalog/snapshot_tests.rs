@@ -74,14 +74,14 @@ fn image_resources_follow_mime_and_edit_selection() {
         dto["originalMimeType"] = json!(mime);
         dto["isEdited"] = json!(edited);
         let item = project(dto);
-        assert_eq!(item.object.resources.len(), 2);
-        assert!(item.object.resources[0].uri.ends_with(representation));
-        assert_eq!(item.object.resources[0].mime, expected);
-        assert!(item.object.resources[1].uri.ends_with("preview"));
+        assert_eq!(item.object.resources().len(), 2);
+        assert!(item.object.resources()[0].uri.ends_with(representation));
+        assert_eq!(item.object.resources()[0].mime, expected);
+        assert!(item.object.resources()[1].uri.ends_with("preview"));
 
         assert!(
             item.object
-                .resources
+                .resources()
                 .iter()
                 .all(|r| !r.byte_seek && r.duration.is_none())
         );
@@ -100,7 +100,7 @@ fn original_video_duration_is_formatted_from_nonnegative_milliseconds() {
         let mut dto = asset(1, "VIDEO");
         dto["duration"] = json!(duration);
         let item = project(dto);
-        assert_eq!(item.object.resources[0].duration.as_deref(), expected);
+        assert_eq!(item.object.resources()[0].duration.as_deref(), expected);
     }
 }
 
@@ -109,8 +109,8 @@ fn original_video_without_mime_remains_seekable_with_preview_artwork() {
     let mut dto = asset(1, "VIDEO");
     dto["originalMimeType"] = Value::Null;
     let item = project(dto);
-    assert_eq!(item.object.resources[0].mime, "application/octet-stream");
-    assert!(item.object.resources[0].byte_seek);
+    assert_eq!(item.object.resources()[0].mime, "application/octet-stream");
+    assert!(item.object.resources()[0].byte_seek);
     assert!(item.object.art.unwrap().ends_with("preview"));
 }
 
@@ -188,11 +188,11 @@ async fn complete_pagination_and_scoped_encoded_intersection_without_probes() {
     let contents = fake.source.contents(ALBUM).await.unwrap();
     assert_eq!(contents.items.len(), 1001);
     let video = &contents.items[&Uuid::from_u128(1001)].object;
-    assert_eq!(video.resources.len(), 2);
-    assert_eq!(video.resources[0].mime, "video/quicktime");
-    assert_eq!(video.resources[1].mime, "video/mp4");
-    assert!(video.resources.iter().all(|r| r.byte_seek));
-    assert!(video.resources[1].duration.is_none());
+    assert_eq!(video.resources().len(), 2);
+    assert_eq!(video.resources()[0].mime, "video/quicktime");
+    assert_eq!(video.resources()[1].mime, "video/mp4");
+    assert!(video.resources().iter().all(|r| r.byte_seek));
+    assert!(video.resources()[1].duration.is_none());
 
     let requests = fake.api.requests.lock().unwrap();
     assert_eq!(requests.len(), 5);
@@ -409,7 +409,11 @@ fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
     }
 
     let mut reversed = item.clone();
-    reversed.object.resources.reverse();
+    let ObjectKind::Photo { resources, .. } = &mut reversed.object.kind else {
+        panic!("expected photo");
+    };
+
+    resources.reverse();
     let mut digest = Projection::new(SNAPSHOT_BYTES);
     digest.json(&reversed).unwrap();
     assert_ne!(original, digest.finish().0);
@@ -430,21 +434,21 @@ fn projected_item_encoding_is_stable_across_refactors() {
     let item = Item {
         id: asset,
         object: Object {
-            id: format!("album:{album}:asset:{asset}"),
-            parent_id: format!("album:{album}"),
             title: "Photo".into(),
-            class: "object.item.imageItem.photo".into(),
             date: Some("2024-01-02".into()),
             art: Some(format!(
                 "http://192.0.2.1:8200/media/assets/{asset}/preview"
             )),
-            child_count: None,
-            resources: vec![Resource {
-                uri: format!("http://192.0.2.1:8200/media/assets/{asset}/original"),
-                mime: "image/jpeg".into(),
-                duration: None,
-                byte_seek: false,
-            }],
+            kind: ObjectKind::Photo {
+                album,
+                asset,
+                resources: vec![Resource {
+                    uri: format!("http://192.0.2.1:8200/media/assets/{asset}/original"),
+                    mime: "image/jpeg".into(),
+                    duration: None,
+                    byte_seek: false,
+                }],
+            },
         },
         capture: Some("2024-01-02T03:04:05Z".parse().unwrap()),
         is_edited: false,

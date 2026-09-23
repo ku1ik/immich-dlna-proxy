@@ -378,10 +378,10 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
     assert_eq!(root.total_matches, 1);
     assert_eq!(root.objects.len(), 1);
     assert_eq!(root.objects[0].title, "Photos & videos");
-    assert_eq!(root.objects[0].parent_id, "-1");
-    assert_eq!(root.objects[0].class, "object.container");
-    assert_eq!(root.objects[0].child_count, Some(2));
-    assert!(root.objects[0].resources.is_empty());
+    assert_eq!(root.objects[0].parent_id(), None);
+    assert_eq!(root.objects[0].class(), "object.container");
+    assert_eq!(root.objects[0].child_count(), Some(2));
+    assert!(root.objects[0].resources().is_empty());
     assert_eq!(root.update_id, 2);
 
     let metadata = fixture
@@ -398,7 +398,7 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
 
     assert_eq!(metadata.update_id, 0);
     assert_eq!(metadata.total_matches, 1);
-    assert!(metadata.objects[0].child_count.is_none());
+    assert!(metadata.objects[0].child_count().is_none());
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
     fixture.expire(Scope::Root);
     fixture.fake.upstream.lock().unwrap().outage = true;
@@ -1596,7 +1596,7 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
 
     let result = children_waiter.await.unwrap();
     assert_eq!(result.total_matches, 1);
-    assert_eq!(result.objects[0].id, appearance);
+    assert_eq!(result.objects[0].id().to_string(), appearance);
     assert_eq!(result.objects[0].title, "Photo 1");
     assert_eq!(result.update_id, album_id);
 
@@ -1672,9 +1672,9 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
         .await
         .unwrap();
 
-    assert_eq!(removed.objects[0].child_count, Some(1));
+    assert_eq!(removed.objects[0].child_count(), Some(1));
     let old_root = root_waiter.await.unwrap();
-    assert_eq!(old_root.objects[0].child_count, Some(2));
+    assert_eq!(old_root.objects[0].child_count(), Some(2));
     assert_eq!(old_root.update_id, before.1.system_update_id);
     let old_album = album_waiter.await.unwrap();
 

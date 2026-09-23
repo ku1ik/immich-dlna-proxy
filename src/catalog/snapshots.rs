@@ -11,7 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{MAX_ALBUMS, Object, Resource, SNAPSHOT_BYTES};
+use super::{MAX_ALBUMS, Object, ObjectKind, Resource, SNAPSHOT_BYTES};
 use crate::{
     immich::{Asset, Client},
     media::{Representation, asset_url},
@@ -106,7 +106,7 @@ impl Source {
             if encoded
                 && !items
                     .values()
-                    .any(|item| item.object.class == "object.item.videoItem")
+                    .any(|item| matches!(item.object.kind, ObjectKind::Video { .. }))
             {
                 break;
             }
@@ -187,12 +187,13 @@ impl Source {
         }
 
         for id in encoded_ids {
-            if let Some(item) = items.get_mut(&id)
-                && item.object.class == "object.item.videoItem"
-            {
+            if let Some(item) = items.get_mut(&id) {
                 let old_size = encoded_size(item, SNAPSHOT_BYTES)?;
+                let ObjectKind::Video { resources, .. } = &mut item.object.kind else {
+                    continue;
+                };
 
-                item.object.resources.push(Resource {
+                resources.push(Resource {
                     uri: asset_url(self.http_address, id, Representation::Playback),
                     mime: "video/mp4".into(),
                     duration: None,
@@ -234,14 +235,10 @@ fn project_root(
     bad_dates: &mut usize,
 ) -> Result<Root> {
     let root_object = Object {
-        id: "0".into(),
-        parent_id: "-1".into(),
+        kind: ObjectKind::Root { child_count: None },
         title: friendly_name.to_owned(),
-        class: "object.container".into(),
         date: None,
         art: None,
-        child_count: None,
-        resources: Vec::new(),
     };
 
     let mut albums = BTreeMap::new();
@@ -253,16 +250,15 @@ fn project_root(
         let mut album = Album {
             id: dto.id,
             object: Object {
-                id: format!("album:{}", dto.id),
-                parent_id: "0".into(),
+                kind: ObjectKind::Album {
+                    id: dto.id,
+                    child_count: None,
+                },
                 title: title(&dto.album_name, dto.id),
-                class: "object.container.album".into(),
                 date: created_at.map(|date| date.format("%Y-%m-%d").to_string()),
                 art: dto
                     .album_thumbnail_asset_id
                     .map(|id| asset_url(http_address, id, Representation::Preview)),
-                child_count: None,
-                resources: Vec::new(),
             },
             created_at,
             end_date: parse_date(dto.end_date.as_deref(), bad_dates),
@@ -397,19 +393,22 @@ fn project_item(
     Ok(Some(Item {
         id: dto.id,
         object: Object {
-            id: format!("album:{album}:asset:{}", dto.id),
-            parent_id: format!("album:{album}"),
-            title: title(&name, dto.id),
-            class: if video {
-                "object.item.videoItem"
+            kind: if video {
+                ObjectKind::Video {
+                    album,
+                    asset: dto.id,
+                    resources,
+                }
             } else {
-                "object.item.imageItem.photo"
-            }
-            .into(),
+                ObjectKind::Photo {
+                    album,
+                    asset: dto.id,
+                    resources,
+                }
+            },
+            title: title(&name, dto.id),
             date,
             art: Some(asset_url(http_address, dto.id, Representation::Preview)),
-            child_count: None,
-            resources,
         },
         capture,
         is_edited: dto.is_edited,

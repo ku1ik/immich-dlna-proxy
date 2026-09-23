@@ -1,7 +1,9 @@
 use std::net::SocketAddrV4;
 
 use immich_dlna_proxy::{
-    catalog::{BrowseQuery, BrowseResult, Catalog, Object, ObjectId, Resource, parse_id},
+    catalog::{
+        BrowseQuery, BrowseResult, Catalog, Object, ObjectId, ObjectKind, Resource, parse_id,
+    },
     media::{
         Representation,
         Representation::{Display, Original, Playback, Preview},
@@ -32,7 +34,7 @@ impl Catalog for FixtureCatalog {
         let object = self
             .0
             .iter()
-            .find(|object| object.id == id)
+            .find(|object| object.id().to_string() == id)
             .ok_or(Fault::NoSuchObject)?;
 
         tracing::info!(object = %id, metadata = args.metadata, "fixture Browse selection");
@@ -45,14 +47,21 @@ impl Catalog for FixtureCatalog {
             });
         }
 
-        if object.class.starts_with("object.item") {
+        if matches!(
+            object.kind,
+            ObjectKind::Photo { .. } | ObjectKind::Video { .. }
+        ) {
             return Err(Fault::NoSuchContainer);
         }
 
         let mut children: Vec<_> = self
             .0
             .iter()
-            .filter(|object| object.parent_id == id)
+            .filter(|object| {
+                object
+                    .parent_id()
+                    .is_some_and(|parent| parent.to_string() == id)
+            })
             .collect();
 
         children.sort_by(|a, b| {
@@ -63,7 +72,7 @@ impl Catalog for FixtureCatalog {
                 dates
             };
 
-            dates.then_with(|| a.id.cmp(&b.id))
+            dates.then_with(|| a.id().to_string().cmp(&b.id().to_string()))
         });
 
         let total_matches = children.len() as u32;
@@ -89,39 +98,39 @@ impl Catalog for FixtureCatalog {
 }
 
 pub fn objects(address: SocketAddrV4) -> Vec<Object> {
+    let ObjectId::Album(album) = parse_id(ALBUM_ID).unwrap() else {
+        unreachable!();
+    };
+
     let media = |asset: &str, representation: Representation| {
         asset_url(address, asset.parse().unwrap(), representation)
     };
 
     let mut objects = vec![
         Object {
-            id: "0".into(),
-            parent_id: "-1".into(),
+            kind: ObjectKind::Root {
+                child_count: Some(1),
+            },
             title: "DLNA Fixture Baseline".into(),
-            class: "object.container".into(),
             date: None,
             art: None,
-            child_count: Some(1),
-            resources: Vec::new(),
         },
         Object {
-            id: ALBUM_ID.into(),
-            parent_id: "0".into(),
+            kind: ObjectKind::Album {
+                id: album,
+                child_count: None,
+            },
             title: "Mixed JPEG and H264 AAC".into(),
-            class: "object.container.album".into(),
             date: Some("2024-01-01".into()),
             art: Some(media(ORIGINAL_JPEG_ID, Preview)),
-            child_count: None,
-            resources: Vec::new(),
         },
     ];
 
-    for (asset, title, date, class, mime, representations) in [
+    for (asset, title, date, mime, representations) in [
         (
             ORIGINAL_JPEG_ID,
             "original.jpg",
             "2024-01-01",
-            "object.item.imageItem.photo",
             "image/jpeg",
             [Original, Preview],
         ),
@@ -129,7 +138,6 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             GENERATED_JPEG_ID,
             "generated-display.jpg",
             "2024-01-02",
-            "object.item.imageItem.photo",
             "image/jpeg",
             [Display, Preview],
         ),
@@ -137,7 +145,6 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             VIDEO_ID,
             "video-original.mp4",
             "2024-01-03",
-            "object.item.videoItem",
             "video/mp4",
             [Original, Playback],
         ),
@@ -154,31 +161,39 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             .collect();
 
         objects.push(Object {
-            id: format!("{ALBUM_ID}:asset:{asset}"),
-            parent_id: ALBUM_ID.into(),
+            kind: if asset == VIDEO_ID {
+                ObjectKind::Video {
+                    album,
+                    asset: asset.parse().unwrap(),
+                    resources,
+                }
+            } else {
+                ObjectKind::Photo {
+                    album,
+                    asset: asset.parse().unwrap(),
+                    resources,
+                }
+            },
             title: title.into(),
-            class: class.into(),
             date: Some(date.into()),
             art: (mime == "image/jpeg").then(|| media(asset, Preview)),
-            child_count: None,
-            resources,
         });
     }
 
     objects.push(Object {
-        id: format!("{ALBUM_ID}:asset:20000000-0000-4000-8000-000000000008"),
-        parent_id: ALBUM_ID.into(),
         title: "Playback Only - H264 AAC.mp4".into(),
-        class: "object.item.videoItem".into(),
         date: Some("2024-01-03".into()),
         art: None,
-        child_count: None,
-        resources: vec![Resource {
-            uri: media(VIDEO_ID, Playback),
-            mime: "video/mp4".into(),
-            duration: None,
-            byte_seek: true,
-        }],
+        kind: ObjectKind::Video {
+            album,
+            asset: "20000000-0000-4000-8000-000000000008".parse().unwrap(),
+            resources: vec![Resource {
+                uri: media(VIDEO_ID, Playback),
+                mime: "video/mp4".into(),
+                duration: None,
+                byte_seek: true,
+            }],
+        },
     });
 
     objects

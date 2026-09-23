@@ -42,14 +42,12 @@ impl Catalog for TestCatalog {
 
         Ok(BrowseResult {
             objects: vec![Object {
-                id: "0".into(),
-                parent_id: "-1".into(),
+                kind: crate::catalog::ObjectKind::Root {
+                    child_count: Some(9),
+                },
                 title: "A&B".into(),
-                class: "object.container".into(),
                 date: Some("2024-01-01".into()),
                 art: None,
-                child_count: Some(9),
-                resources: Vec::new(),
             }],
             total_matches: 9,
             update_id: 7,
