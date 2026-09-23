@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::{config::Config, eventing::Subscriptions, immich, protocol::Fault};
 
 mod browse;
+mod digest;
 mod revisions;
 mod snapshots;
 

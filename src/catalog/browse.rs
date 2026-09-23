@@ -164,7 +164,9 @@ impl View {
                         object
                     }
 
-                    ObjectId::Album(id) => root.albums.get(&id).ok_or(MISSING)?.object.clone(),
+                    ObjectId::Album(id) => {
+                        root.albums.get(&id).ok_or(MISSING)?.metadata.object.clone()
+                    }
 
                     ObjectId::Item { album, asset } => self
                         .contents(album)?
@@ -237,7 +239,7 @@ impl ResolvedBrowse<'_> {
 
         let rows: Vec<&Object> = match rows {
             Rows::Albums(root) => {
-                let mut rows: Vec<_> = root.albums.values().collect();
+                let mut rows: Vec<_> = root.albums.values().map(|album| &album.metadata).collect();
 
                 rows.sort_unstable_by(|a, b| match sort {
                     SortOrder::Catalog => b
@@ -309,7 +311,7 @@ impl ResolvedBrowse<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::snapshots::Album;
+    use crate::catalog::snapshots::{Album, AlbumMetadata};
 
     #[test]
     fn albums_default_to_latest_date_with_title_ties_and_missing_dates_last() {
@@ -336,19 +338,21 @@ mod tests {
             let id = Uuid::from_u128(number);
 
             let album = Album {
-                id,
-                object: Object {
-                    kind: super::super::ObjectKind::Album {
-                        id,
-                        child_count: None,
+                metadata: AlbumMetadata {
+                    id,
+                    object: Object {
+                        kind: super::super::ObjectKind::Album {
+                            id,
+                            child_count: None,
+                        },
+                        title: title.into(),
+                        date: Some(created.into()),
+                        ..root_object.clone()
                     },
-                    title: title.into(),
-                    date: Some(created.into()),
-                    ..root_object.clone()
+                    created_at: Some(format!("{created}T00:00:00Z").parse().unwrap()),
+                    end_date: end.map(|date| format!("{date}T00:00:00Z").parse().unwrap()),
                 },
-                created_at: Some(format!("{created}T00:00:00Z").parse().unwrap()),
-                end_date: end.map(|date| format!("{date}T00:00:00Z").parse().unwrap()),
-                digest: format!("{number:064x}"),
+                digest: format!("{number:064x}").parse().unwrap(),
             };
 
             (id, album)
@@ -358,7 +362,7 @@ mod tests {
         let root = Root {
             object: root_object,
             albums,
-            digest: "a".repeat(64),
+            digest: "a".repeat(64).parse().unwrap(),
             bytes: 0,
         };
 

@@ -1257,7 +1257,7 @@ async fn unrelated_root_and_album_changes_do_not_invalidate_prepared_contents() 
     assert_eq!(*view.ledger, before.1);
 
     assert_eq!(
-        view.root.albums[&Uuid::from_u128(2)].object.title,
+        view.root.albums[&Uuid::from_u128(2)].metadata.object.title,
         "Other rename"
     );
 
@@ -1324,6 +1324,7 @@ async fn publication_failure_worker() {
 
         assert_eq!(
             state.cache.root.as_ref().unwrap().snapshot.albums[&Uuid::from_u128(1)]
+                .metadata
                 .object
                 .title,
             "Album"
@@ -1655,8 +1656,8 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
     assert_eq!(
         album_hit.ledger.albums[&Uuid::from_u128(1)]
             .contents_digest
-            .as_deref(),
-        Some(contents.digest.as_str())
+            .as_ref(),
+        Some(&contents.digest)
     );
 
     fixture.expire(Scope::Root);
@@ -1693,7 +1694,7 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
 
     assert_eq!(
         old_album.objects[0],
-        album_hit.root.albums[&Uuid::from_u128(1)].object
+        album_hit.root.albums[&Uuid::from_u128(1)].metadata.object
     );
 
     assert_eq!(
@@ -1702,8 +1703,8 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
     );
 
     assert_eq!(
-        album_hit.ledger.root_digest.as_deref(),
-        Some(album_hit.root.digest.as_str())
+        album_hit.ledger.root_digest.as_ref(),
+        Some(&album_hit.root.digest)
     );
 
     assert!(album_hit.ledger.albums[&Uuid::from_u128(1)].present);

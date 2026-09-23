@@ -16,6 +16,7 @@ use uuid::Uuid;
 use super::MAX_ALBUMS;
 #[cfg(test)]
 use super::SPAWN_OR_REOPEN;
+use super::digest::Digest;
 
 const RETAINED_ALBUMS: usize = 16_384;
 const REVISION_BYTES: usize = 8 * 1024 * 1024;
@@ -27,7 +28,7 @@ pub(super) struct Ledger {
     pub(super) server_uuid: Uuid,
     pub(super) system_update_id: u32,
     #[serde(deserialize_with = "Option::deserialize")]
-    pub(super) root_digest: Option<String>,
+    pub(super) root_digest: Option<Digest>,
     #[serde(deserialize_with = "deserialize_albums")]
     pub(super) albums: BTreeMap<Uuid, AlbumRevision>,
 }
@@ -37,9 +38,9 @@ pub(super) struct Ledger {
 pub(super) struct AlbumRevision {
     pub(super) update_id: u32,
     pub(super) present: bool,
-    pub(super) metadata_digest: String,
+    pub(super) metadata_digest: Digest,
     #[serde(deserialize_with = "Option::deserialize")]
-    pub(super) contents_digest: Option<String>,
+    pub(super) contents_digest: Option<Digest>,
 }
 
 fn deserialize_albums<'de, D>(deserializer: D) -> Result<BTreeMap<Uuid, AlbumRevision>, D::Error>
@@ -82,18 +83,6 @@ where
     deserializer.deserialize_map(Albums)
 }
 
-fn validate_digest(digest: &str) -> anyhow::Result<()> {
-    ensure!(
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-        "revision digest must be 64 lowercase hexadecimal characters"
-    );
-
-    Ok(())
-}
-
 impl Ledger {
     fn validate(&self, uuid: Uuid) -> anyhow::Result<()> {
         ensure!(!uuid.is_nil(), "server UUID must not be nil");
@@ -118,18 +107,6 @@ impl Ledger {
             "revision state with retained albums requires a root digest"
         );
 
-        if let Some(digest) = &self.root_digest {
-            validate_digest(digest)?;
-        }
-
-        for album in self.albums.values() {
-            validate_digest(&album.metadata_digest)?;
-
-            if let Some(digest) = &album.contents_digest {
-                validate_digest(digest)?;
-            }
-        }
-
         Ok(())
     }
 
@@ -148,8 +125,8 @@ impl Ledger {
     /// `None` means no revision write, even when a snapshot needs a cache refill.
     pub(super) fn root_transition(
         &self,
-        root_digest: &str,
-        albums: &BTreeMap<Uuid, String>,
+        root_digest: &Digest,
+        albums: &BTreeMap<Uuid, Digest>,
     ) -> anyhow::Result<Option<Self>> {
         ensure!(
             albums.len() <= MAX_ALBUMS,
@@ -167,7 +144,7 @@ impl Ledger {
         );
 
         let mut next = self.clone();
-        let mut changed = self.root_digest.as_deref() != Some(root_digest);
+        let mut changed = self.root_digest.as_ref() != Some(root_digest);
 
         for (id, album) in &mut next.albums {
             let metadata = albums.get(id);
@@ -214,12 +191,12 @@ impl Ledger {
     pub(super) fn contents_transition(
         &self,
         id: Uuid,
-        digest: &str,
+        digest: &Digest,
     ) -> anyhow::Result<Option<Self>> {
         let album = self.albums.get(&id).filter(|album| album.present);
         let album = album.context("contents transition requires a present album")?;
 
-        if album.contents_digest.as_deref() == Some(digest) {
+        if album.contents_digest.as_ref() == Some(digest) {
             return Ok(None);
         }
 

@@ -308,8 +308,13 @@ fn root_duplicates_titles_covers_and_canonical_digests() {
     let second = root("Photos", vec![other, empty.clone()]).unwrap();
     assert_eq!(first.digest, second.digest);
     assert_eq!(first.bytes, second.bytes);
-    assert_eq!(first.albums[&ALBUM].object.title, ALBUM.to_string());
-    assert!(first.albums[&ALBUM].object.art.is_none());
+
+    assert_eq!(
+        first.albums[&ALBUM].metadata.object.title,
+        ALBUM.to_string()
+    );
+
+    assert!(first.albums[&ALBUM].metadata.object.art.is_none());
 
     assert!(
         root(
@@ -348,7 +353,7 @@ fn album_latest_dates_are_optional_and_independent_of_advertised_dates() {
         }
 
         let root = root("Photos", vec![dto]).unwrap();
-        let album = &root.albums[&ALBUM];
+        let album = &root.albums[&ALBUM].metadata;
         assert_eq!(album.end_date, expected.map(|date| date.parse().unwrap()));
         assert_eq!(album.object.date.as_deref(), Some("2023-12-31"));
 
@@ -379,7 +384,7 @@ async fn contents_hashes_canonical_order_and_exact_bytes() {
     assert_eq!(baseline.bytes, serialized.len());
 
     assert_eq!(
-        baseline.digest,
+        baseline.digest.to_string(),
         format!("{:x}", Sha256::digest(&serialized))
     );
 }
@@ -484,7 +489,7 @@ fn projected_root_encoding_is_stable_across_refactors() {
     assert_eq!(root.bytes, expected.len());
 
     assert_eq!(
-        root.digest,
+        root.digest.to_string(),
         format!("{:x}", Sha256::digest(expected.as_bytes()))
     );
 
@@ -494,7 +499,7 @@ fn projected_root_encoding_is_stable_across_refactors() {
     );
 
     assert_eq!(
-        root.albums[&id].digest,
+        root.albums[&id].digest.to_string(),
         format!("{:x}", Sha256::digest(expected_album.as_bytes()))
     );
 }

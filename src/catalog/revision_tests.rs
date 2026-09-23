@@ -65,8 +65,8 @@ fn id(number: u128) -> Uuid {
     Uuid::from_u128(number)
 }
 
-fn digest(number: u32) -> String {
-    format!("{number:064x}")
+fn digest(number: u32) -> Digest {
+    format!("{number:064x}").parse().unwrap()
 }
 
 fn empty() -> Ledger {
@@ -701,14 +701,33 @@ fn decoding_rejects_corruption_unknown_missing_fields_and_duplicate_uuid_aliases
 
 #[test]
 fn validation_rejects_invalid_digests_and_identity() {
-    let mut ledger = populated();
-    ledger.albums.get_mut(&id(2)).unwrap().contents_digest = Some("BAD".into());
-    assert!(ledger.validate(id(1)).is_err());
+    for digest in [
+        String::new(),
+        "BAD".into(),
+        "A".repeat(64),
+        "g".repeat(64),
+        "a".repeat(63),
+        "a".repeat(65),
+        "é".repeat(32),
+    ] {
+        assert!(digest.parse::<Digest>().is_err());
 
-    for digest in ["A".repeat(64), "g".repeat(64), "a".repeat(63)] {
-        let mut ledger = populated();
-        ledger.albums.get_mut(&id(2)).unwrap().metadata_digest = digest.clone();
-        assert!(ledger.validate(id(1)).is_err(), "accepted {digest}");
+        for field in ["root_digest", "metadata_digest", "contents_digest"] {
+            let mut json = serde_json::to_value(populated()).unwrap();
+
+            let slot = if field == "root_digest" {
+                &mut json[field]
+            } else {
+                &mut json["albums"][id(2).to_string()][field]
+            };
+
+            *slot = serde_json::Value::String(digest.clone());
+
+            assert!(
+                serde_json::from_value::<Ledger>(json).is_err(),
+                "accepted {field}: {digest}"
+            );
+        }
     }
 
     let ledger = populated();
@@ -731,9 +750,9 @@ fn load_rejects_invalid_state_without_disclosing_json_or_removing_tmp() {
             "invalid revision JSON at line ",
         ),
         (
-            valid.replace(&digest(2), "private-state-content"),
+            valid.replace(&digest(2).to_string(), "private-state-content"),
             id(1),
-            "revision digest must be 64 lowercase hexadecimal characters",
+            "invalid revision JSON at line ",
         ),
         (
             valid.clone(),
@@ -1027,7 +1046,7 @@ fn subprocess_worker() {
     };
 
     if mode == "invalid" {
-        ledger.root_digest = Some("invalid".into());
+        ledger.server_uuid = Uuid::nil();
     }
 
     if mode == "temp-collision" {
@@ -1143,7 +1162,7 @@ fn persistence_diagnostics_exclude_error_payloads() {
                 "ledger=",
                 directory.path().to_str().unwrap(),
                 &old.server_uuid.to_string(),
-                &digest(1),
+                &digest(1).to_string(),
             ] {
                 assert!(!diagnostic.contains(private), "{diagnostic}");
             }

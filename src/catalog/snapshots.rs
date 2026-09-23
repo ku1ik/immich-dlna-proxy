@@ -8,9 +8,10 @@ use std::{
 use anyhow::{Result, anyhow, ensure};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as ShaDigest, Sha256};
 use uuid::Uuid;
 
+use super::digest::Digest;
 use super::{MAX_ALBUMS, Object, ObjectKind, Resource, SNAPSHOT_BYTES};
 use crate::{
     immich::{Asset, Client},
@@ -30,12 +31,18 @@ pub(super) struct Source {
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
 pub(super) struct Album {
+    #[serde(flatten)]
+    pub(super) metadata: AlbumMetadata,
+    #[serde(skip)]
+    pub(super) digest: Digest,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+pub(super) struct AlbumMetadata {
     pub(super) id: Uuid,
     pub(super) object: Object,
     pub(super) created_at: Option<DateTime<Utc>>,
     pub(super) end_date: Option<DateTime<Utc>>,
-    #[serde(skip)]
-    pub(super) digest: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -53,14 +60,14 @@ pub(super) struct Item {
 pub(super) struct Root {
     pub(super) object: Object,
     pub(super) albums: BTreeMap<Uuid, Album>,
-    pub(super) digest: String,
+    pub(super) digest: Digest,
     pub(super) bytes: usize,
 }
 
 #[derive(Debug)]
 pub(super) struct Contents {
     pub(super) items: BTreeMap<Uuid, Item>,
-    pub(super) digest: String,
+    pub(super) digest: Digest,
     pub(super) bytes: usize,
 }
 
@@ -247,7 +254,7 @@ fn project_root(
     for dto in records {
         let created_at = parse_date(dto.created_at.as_deref(), bad_dates);
 
-        let mut album = Album {
+        let metadata = AlbumMetadata {
             id: dto.id,
             object: Object {
                 kind: ObjectKind::Album {
@@ -262,15 +269,14 @@ fn project_root(
             },
             created_at,
             end_date: parse_date(dto.end_date.as_deref(), bad_dates),
-            digest: String::new(),
         };
 
         let mut projection = Projection::new(SNAPSHOT_BYTES);
-        projection.json(&album)?;
+        projection.json(&metadata)?;
         let (digest, size) = projection.finish();
-        album.digest = digest;
+        let album = Album { metadata, digest };
 
-        if let Some(previous) = albums.get(&album.id) {
+        if let Some(previous) = albums.get(&album.metadata.id) {
             ensure!(previous == &album, "conflicting duplicate Immich album");
             continue;
         }
@@ -284,7 +290,7 @@ fn project_root(
             "Immich root exceeds projected byte limit"
         );
 
-        albums.insert(album.id, album);
+        albums.insert(album.metadata.id, album);
     }
 
     let mut projection = Projection::new(SNAPSHOT_BYTES);
@@ -494,8 +500,11 @@ impl Projection {
             .map_err(|_| anyhow!("catalog projected byte limit exceeded"))
     }
 
-    fn finish(self) -> (String, usize) {
-        (format!("{:x}", self.hash.finalize()), self.count.bytes)
+    fn finish(self) -> (Digest, usize) {
+        (
+            Digest::from_bytes(self.hash.finalize().into()),
+            self.count.bytes,
+        )
     }
 }
 
