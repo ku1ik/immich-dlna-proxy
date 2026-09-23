@@ -7,7 +7,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::mpsc,
     task::{JoinHandle, JoinSet},
 };
@@ -151,6 +151,24 @@ fn request_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
         .lines()
         .filter_map(|line| line.split_once(':'))
         .find_map(|(key, value)| key.eq_ignore_ascii_case(name).then_some(value.trim()))
+}
+
+fn proxy_for(listener: &TcpListener) -> MediaProxy {
+    MediaProxy::new(
+        format!("http://{}/api/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap(),
+        HeaderValue::from_static("test-secret"),
+    )
+    .unwrap()
+}
+
+async fn read_request_headers(socket: &mut TcpStream) {
+    let mut request = Vec::new();
+
+    while !request.ends_with(b"\r\n\r\n") {
+        request.push(socket.read_u8().await.unwrap());
+    }
 }
 
 #[tokio::test]
@@ -1094,15 +1112,7 @@ async fn ready_headers_at_or_after_deadline_are_rejected_without_an_extra_hop() 
         (true, 16, StatusCode::GATEWAY_TIMEOUT),
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-
-        let proxy = MediaProxy::new(
-            format!("http://{}/api/", listener.local_addr().unwrap())
-                .parse()
-                .unwrap(),
-            HeaderValue::from_static("test-secret"),
-        )
-        .unwrap();
-
+        let proxy = proxy_for(&listener);
         tokio::time::pause();
 
         // Keep network waits from automatically advancing the paused clock.
@@ -1123,13 +1133,7 @@ async fn ready_headers_at_or_after_deadline_are_rejected_without_an_extra_hop() 
         tokio::select! {
             _ = &mut serve => panic!("response before upstream headers"),
 
-            _ = async {
-                let mut request = Vec::new();
-
-                while !request.ends_with(b"\r\n\r\n") {
-                    request.push(socket.read_u8().await.unwrap());
-                }
-            } => {}
+            _ = read_request_headers(&mut socket) => {}
         }
 
         let wake = Arc::new(WakeSignal(tokio::sync::Notify::new()));
@@ -1172,15 +1176,7 @@ async fn ready_headers_at_or_after_deadline_are_rejected_without_an_extra_hop() 
 async fn chunk_reads_allow_backpressure_but_time_out_when_upstream_stalls() {
     for (eof, elapsed) in [(false, 59), (true, 59), (false, 60), (false, 61)] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-
-        let proxy = MediaProxy::new(
-            format!("http://{}/api/", listener.local_addr().unwrap())
-                .parse()
-                .unwrap(),
-            HeaderValue::from_static("test-secret"),
-        )
-        .unwrap();
-
+        let proxy = proxy_for(&listener);
         tokio::time::pause();
 
         let clock_guard = tokio::spawn(async {
@@ -1200,13 +1196,7 @@ async fn chunk_reads_allow_backpressure_but_time_out_when_upstream_stalls() {
         tokio::select! {
             _ = &mut serve => panic!("response before upstream headers"),
 
-            _ = async {
-                let mut request = Vec::new();
-
-                while !request.ends_with(b"\r\n\r\n") {
-                    request.push(socket.read_u8().await.unwrap());
-                }
-            } => {}
+            _ = read_request_headers(&mut socket) => {}
         }
 
         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n").await.unwrap();
