@@ -1,6 +1,5 @@
 use std::{collections::VecDeque, sync::Arc, sync::Mutex};
 
-use crate::config::ApiBase;
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -13,6 +12,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
 
 use super::Client;
+use crate::config::ApiBase;
 
 pub(crate) struct Received {
     pub(crate) method: Method,

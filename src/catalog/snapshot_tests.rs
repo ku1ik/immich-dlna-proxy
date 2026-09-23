@@ -414,6 +414,7 @@ fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
     }
 
     let mut reversed = item.clone();
+
     let ObjectKind::Photo { resources, .. } = &mut reversed.object.kind else {
         panic!("expected photo");
     };

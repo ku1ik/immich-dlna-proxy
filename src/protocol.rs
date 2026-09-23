@@ -710,11 +710,13 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
         xml.raw(" id=\"")?;
         xml.text(&object.id().to_string())?;
         xml.raw("\" parentID=\"")?;
+
         xml.text(
             &object
                 .parent_id()
                 .map_or_else(|| "-1".into(), |id| id.to_string()),
         )?;
+
         xml.raw("\" restricted=\"1\"")?;
 
         if container

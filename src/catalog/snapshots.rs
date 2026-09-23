@@ -196,6 +196,7 @@ impl Source {
         for id in encoded_ids {
             if let Some(item) = items.get_mut(&id) {
                 let old_size = encoded_size(item, SNAPSHOT_BYTES)?;
+
                 let ObjectKind::Video { resources, .. } = &mut item.object.kind else {
                     continue;
                 };

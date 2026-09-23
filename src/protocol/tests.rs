@@ -150,6 +150,7 @@ fn event_propertyset_namespaces_and_static_values_are_correct() {
 #[test]
 fn byte_seek_is_explicit_per_resource_and_does_not_add_other_dlna_claims() {
     let mut item = object();
+
     let ObjectKind::Video { resources, .. } = &mut item.kind else {
         panic!("expected video");
     };
@@ -809,6 +810,7 @@ fn serialization_sanitizes_xml_and_escapes_exactly_two_layers() {
 
     let mut object = object();
     object.title = "A&B <title> Łódź 東京 𐐀\u{1}".into();
+
     let ObjectKind::Video { resources, .. } = &mut object.kind else {
         panic!("expected video");
     };

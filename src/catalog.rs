@@ -119,6 +119,7 @@ impl Object {
         match self.kind {
             ObjectKind::Root { .. } => ObjectId::Root,
             ObjectKind::Album { id, .. } => ObjectId::Album(id),
+
             ObjectKind::Photo { album, asset, .. } | ObjectKind::Video { album, asset, .. } => {
                 ObjectId::Item { album, asset }
             }
@@ -164,12 +165,14 @@ impl Serialize for Object {
 
         let mut object = serializer.serialize_struct("Object", 8)?;
         object.serialize_field("id", &self.id().to_string())?;
+
         object.serialize_field(
             "parent_id",
             &self
                 .parent_id()
                 .map_or_else(|| "-1".into(), |id| id.to_string()),
         )?;
+
         object.serialize_field("title", &self.title)?;
         object.serialize_field("class", self.class())?;
         object.serialize_field("date", &self.date)?;
