@@ -2,7 +2,7 @@ use super::*;
 use axum::{Router, body::to_bytes};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::mpsc,
     task::JoinHandle,
 };
@@ -528,25 +528,55 @@ impl Callback {
             .unwrap()
     }
 
+    async fn assert_quiet(&mut self) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), self.received.recv())
+                .await
+                .is_err()
+        );
+    }
+
     fn register(&self, subscriptions: &Subscriptions, service: Service, paths: &[&str]) -> Uuid {
         let callbacks: String = paths.iter().map(|path| self.url(path)).collect();
 
-        let response = subscriptions.request(
-            service,
-            Ipv4Addr::LOCALHOST,
-            &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-            &headers(&[
-                ("nt", "upnp:event"),
-                ("callback", &callbacks),
-                ("cookie", "private"),
-                ("authorization", "private"),
-            ]),
-        );
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        response_sid(&response)
+        register_callback(subscriptions, service, &callbacks)
     }
+}
+
+fn register_callback(subscriptions: &Subscriptions, service: Service, callbacks: &str) -> Uuid {
+    let response = subscriptions.request(
+        service,
+        Ipv4Addr::LOCALHOST,
+        &Method::from_bytes(b"SUBSCRIBE").unwrap(),
+        &headers(&[
+            ("nt", "upnp:event"),
+            ("callback", callbacks),
+            ("cookie", "private"),
+            ("authorization", "private"),
+        ]),
+    );
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    response_sid(&response)
+}
+
+async fn read_notify(socket: &mut BufReader<TcpStream>, expected_body: &str) -> String {
+    let mut request = String::new();
+
+    loop {
+        assert_ne!(socket.read_line(&mut request).await.unwrap(), 0);
+
+        if request.ends_with("\r\n\r\n") {
+            break;
+        }
+    }
+
+    let mut body = vec![0; expected_body.len()];
+    socket.read_exact(&mut body).await.unwrap();
+    assert_eq!(body, expected_body.as_bytes());
+
+    request
 }
 
 async fn abort_scheduler(task: JoinHandle<anyhow::Result<()>>) {
@@ -629,11 +659,7 @@ async fn initial_event_is_immediately_eligible_and_renewal_does_not_replay() {
         StatusCode::OK
     );
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), callback.received.recv())
-            .await
-            .is_err()
-    );
+    callback.assert_quiet().await;
 
     abort_scheduler(task).await;
 }
@@ -698,11 +724,7 @@ async fn pending_during_initial_coalesces_and_final_event_flushes_on_timer() {
     tokio::time::resume();
 
     // Even an overdue change cannot overlap the still-running initial attempt.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), callback.received.recv())
-            .await
-            .is_err()
-    );
+    callback.assert_quiet().await;
 
     callback.release.add_permits(1);
     let (request, body) = callback.next().await;
@@ -723,11 +745,7 @@ async fn pending_during_initial_coalesces_and_final_event_flushes_on_timer() {
         .unwrap()
         .next_attempt;
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), callback.received.recv())
-            .await
-            .is_err()
-    );
+    callback.assert_quiet().await;
 
     // No publication or request wakes the scheduler after this point.
     let (request, body) = callback.next().await;
@@ -793,11 +811,7 @@ async fn failed_attempts_allocate_sequence_once_wrap_and_preserve_future_pending
         if seq == 0 {
             subscriptions.publish(8);
 
-            assert!(
-                tokio::time::timeout(Duration::from_millis(30), callback.received.recv())
-                    .await
-                    .is_err()
-            );
+            callback.assert_quiet().await;
         }
 
         tokio::time::pause();
@@ -805,11 +819,7 @@ async fn failed_attempts_allocate_sequence_once_wrap_and_preserve_future_pending
         tokio::time::resume();
     }
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), callback.received.recv())
-            .await
-            .is_err()
-    );
+    callback.assert_quiet().await;
 
     abort_scheduler(task).await;
 }
@@ -861,11 +871,7 @@ async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
 
     subscriptions.publish(2);
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), callback.received.recv())
-            .await
-            .is_err()
-    );
+    callback.assert_quiet().await;
 
     {
         let state = subscriptions.state.lock().unwrap();
@@ -1164,11 +1170,7 @@ async fn delivery_concurrency_is_bounded_and_scheduler_is_single_run() {
         callback.next().await;
     }
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), callback.received.recv())
-            .await
-            .is_err()
-    );
+    callback.assert_quiet().await;
 
     {
         let state = subscriptions.state.lock().unwrap();
@@ -1237,15 +1239,7 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
             callback.url("/unused")
         );
 
-        let response = subscriptions.request(
-            SERVICE,
-            Ipv4Addr::LOCALHOST,
-            &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-            &headers(&[("nt", "upnp:event"), ("callback", &urls)]),
-        );
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let sid = response_sid(&response);
+        let sid = register_callback(&subscriptions, SERVICE, &urls);
         let scheduler = subscriptions.clone().run();
         tokio::pin!(scheduler);
         let wake = Arc::new(CallbackWake(Notify::new()));
@@ -1267,30 +1261,14 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
             let mut socket = BufReader::new(socket);
             let expected_body = protocol::event_body(SERVICE, id);
 
-            let read_request = async {
-                let mut request = String::new();
-
-                loop {
-                    assert_ne!(socket.read_line(&mut request).await.unwrap(), 0);
-
-                    if request.ends_with("\r\n\r\n") {
-                        break;
-                    }
-                }
-
-                assert!(request.starts_with("NOTIFY /first HTTP/1.1\r\n"));
-                assert!(request.contains(&format!("\r\nseq: {seq}\r\n")));
-                assert!(request.contains(&format!("\r\nsid: uuid:{sid}\r\n")));
-                let mut body = vec![0; expected_body.len()];
-                socket.read_exact(&mut body).await.unwrap();
-                assert_eq!(body, expected_body.as_bytes());
+            let request = tokio::select! {
+                _ = &mut scheduler => panic!("scheduler ended"),
+                request = read_notify(&mut socket, &expected_body) => request,
             };
 
-            tokio::select! {
-                _ = &mut scheduler => panic!("scheduler ended"),
-                _ = read_request => {}
-            }
-
+            assert!(request.starts_with("NOTIFY /first HTTP/1.1\r\n"));
+            assert!(request.contains(&format!("\r\nseq: {seq}\r\n")));
+            assert!(request.contains(&format!("\r\nsid: uuid:{sid}\r\n")));
             assert!(scheduler.as_mut().poll(&mut context).is_pending());
             let _ = wake.0.notified().now_or_never();
 
@@ -1406,36 +1384,14 @@ async fn callback_port_churn_closes_keep_alive_sockets_after_delivery() {
     for listener in &listeners {
         let callback = format!("<http://{}/events>", listener.local_addr().unwrap());
 
-        let response = subscriptions.request(
-            SERVICE,
-            Ipv4Addr::LOCALHOST,
-            &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-            &headers(&[("nt", "upnp:event"), ("callback", &callback)]),
-        );
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let sid = response_sid(&response);
+        let sid = register_callback(&subscriptions, SERVICE, &callback);
 
         let socket = tokio::time::timeout(Duration::from_secs(3), async {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = BufReader::new(socket);
-            let mut line = String::new();
-            socket.read_line(&mut line).await.unwrap();
-            assert_eq!(line, "NOTIFY /events HTTP/1.1\r\n");
-
-            loop {
-                line.clear();
-                assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
-
-                if line == "\r\n" {
-                    break;
-                }
-            }
-
             let expected = protocol::event_body(SERVICE, 0);
-            let mut body = vec![0; expected.len()];
-            socket.read_exact(&mut body).await.unwrap();
-            assert_eq!(body, expected.as_bytes());
+            let request = read_notify(&mut socket, &expected).await;
+            assert!(request.starts_with("NOTIFY /events HTTP/1.1\r\n"));
 
             socket
                 .get_mut()
@@ -1500,9 +1456,11 @@ async fn expired_initial_obligations_drain_and_release_all_capacity() {
 
     for _ in 0..SUBSCRIPTIONS {
         let (request, _) = callback.next().await;
+
         let sid = expected
             .remove(request.headers["sid"].to_str().unwrap())
             .unwrap();
+
         assert_eq!(request.headers["seq"], "0");
         finished(&subscriptions, sid).await;
     }
