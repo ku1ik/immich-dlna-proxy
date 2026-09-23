@@ -187,15 +187,16 @@ fn action_arguments(
     let starting_index = number("StartingIndex")?;
     let requested_count = number("RequestedCount")?;
 
-    let metadata = match arguments["BrowseFlag"].as_str() {
-        "BrowseMetadata" => true,
-        "BrowseDirectChildren" => false,
+    let mode = match arguments["BrowseFlag"].as_str() {
+        "BrowseMetadata" if starting_index == 0 => BrowseMode::Metadata,
+
+        "BrowseDirectChildren" => BrowseMode::DirectChildren {
+            starting_index,
+            requested_count,
+        },
+
         _ => return Err(invalid),
     };
-
-    if metadata && starting_index != 0 {
-        return Err(invalid);
-    }
 
     let sort = match arguments["SortCriteria"].as_str() {
         "" => SortOrder::Catalog,
@@ -209,14 +210,7 @@ fn action_arguments(
     Ok(Action::Browse {
         query: BrowseArguments {
             object_id: arguments.remove("ObjectID").ok_or(invalid)?,
-            mode: if metadata {
-                BrowseMode::Metadata
-            } else {
-                BrowseMode::DirectChildren {
-                    starting_index,
-                    requested_count,
-                }
-            },
+            mode,
             sort,
         },
         filter,
@@ -719,8 +713,7 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
 
         xml.raw("\" restricted=\"1\"")?;
 
-        if container
-            && filter.child_count
+        if filter.child_count
             && let Some(count) = object.child_count()
         {
             xml.raw(" childCount=\"")?;

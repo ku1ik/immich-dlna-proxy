@@ -327,21 +327,11 @@ async fn execute<C: Catalog>(
 
     match action {
         Action::Browse { query, filter } => {
-            let object = crate::catalog::parse_id(&query.object_id).ok();
-
-            let (starting_index, requested_count) = match query.mode {
-                crate::catalog::BrowseMode::Metadata => (0, 0),
-                crate::catalog::BrowseMode::DirectChildren {
-                    starting_index,
-                    requested_count,
-                } => (starting_index, requested_count),
-            };
+            let object = crate::catalog::parse_id(&query.object_id);
 
             tracing::debug!(
-                %peer, ?object,
+                %peer, object = ?object.as_ref().ok(),
                 mode = ?query.mode,
-                starting_index,
-                requested_count,
                 sort = ?query.sort,
                 resources_selected = filter.res(),
                 "Browse request"
@@ -349,7 +339,7 @@ async fn execute<C: Catalog>(
 
             let result = catalog
                 .browse(crate::catalog::BrowseQuery {
-                    object_id: object.ok_or(Fault::NoSuchObject)?,
+                    object_id: object?,
                     mode: query.mode,
                     sort: query.sort,
                 })
@@ -363,7 +353,7 @@ async fn execute<C: Catalog>(
                 ("UpdateID", &result.update_id.to_string()),
             ])?;
 
-            tracing::debug!(%peer, ?object, returned = result.objects.len(), total = result.total_matches, update_id = result.update_id, "Browse response");
+            tracing::debug!(%peer, object = ?object.as_ref().ok(), returned = result.objects.len(), total = result.total_matches, update_id = result.update_id, "Browse response");
 
             Ok(envelope)
         }
