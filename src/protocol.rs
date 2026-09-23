@@ -6,7 +6,7 @@ use quick_xml::{
     name::{Namespace, NamespaceResolver, PrefixDeclaration, ResolveResult},
 };
 
-use crate::catalog::{BrowseQuery, Object};
+use crate::catalog::{BrowseMode, Object, SortOrder};
 
 pub(crate) const SOAP_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -107,13 +107,24 @@ pub fn device_description(friendly_name: &str, uuid: uuid::Uuid) -> String {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Action {
-    Browse { query: BrowseQuery, filter: Filter },
+    Browse {
+        query: BrowseArguments,
+        filter: Filter,
+    },
     GetSearchCapabilities,
     GetSortCapabilities,
     GetSystemUpdateId,
     GetProtocolInfo,
     GetCurrentConnectionIds,
     GetCurrentConnectionInfo(i32),
+}
+
+// Wire arguments retain ObjectID text until request admission and catalog resolution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BrowseArguments {
+    pub(crate) object_id: String,
+    pub(crate) mode: BrowseMode,
+    pub(crate) sort: SortOrder,
 }
 
 impl Action {
@@ -187,20 +198,25 @@ fn action_arguments(
     }
 
     let sort = match arguments["SortCriteria"].as_str() {
-        "" => None,
-        "+dc:date" => Some(false),
-        "-dc:date" => Some(true),
+        "" => SortOrder::Catalog,
+        "+dc:date" => SortOrder::DateAscending,
+        "-dc:date" => SortOrder::DateDescending,
         _ => return Err(Fault::InvalidSortCriteria),
     };
 
     let filter = Filter::parse(&arguments["Filter"])?;
 
     Ok(Action::Browse {
-        query: BrowseQuery {
+        query: BrowseArguments {
             object_id: arguments.remove("ObjectID").ok_or(invalid)?,
-            metadata,
-            starting_index,
-            requested_count,
+            mode: if metadata {
+                BrowseMode::Metadata
+            } else {
+                BrowseMode::DirectChildren {
+                    starting_index,
+                    requested_count,
+                }
+            },
             sort,
         },
         filter,

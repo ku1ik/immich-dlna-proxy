@@ -329,17 +329,32 @@ async fn execute<C: Catalog>(
         Action::Browse { query, filter } => {
             let object = crate::catalog::parse_id(&query.object_id).ok();
 
+            let (starting_index, requested_count) = match query.mode {
+                crate::catalog::BrowseMode::Metadata => (0, 0),
+                crate::catalog::BrowseMode::DirectChildren {
+                    starting_index,
+                    requested_count,
+                } => (starting_index, requested_count),
+            };
+
             tracing::debug!(
                 %peer, ?object,
-                metadata = query.metadata,
-                starting_index = query.starting_index,
-                requested_count = query.requested_count,
+                mode = ?query.mode,
+                starting_index,
+                requested_count,
                 sort = ?query.sort,
                 resources_selected = filter.res(),
                 "Browse request"
             );
 
-            let result = catalog.browse(query).await?;
+            let result = catalog
+                .browse(crate::catalog::BrowseQuery {
+                    object_id: object.ok_or(Fault::NoSuchObject)?,
+                    mode: query.mode,
+                    sort: query.sort,
+                })
+                .await?;
+
             let didl = protocol::didl(&result.objects, &filter)?;
             let envelope = response(&[
                 ("Result", &didl),

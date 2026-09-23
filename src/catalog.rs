@@ -30,8 +30,8 @@ mod browse;
 mod revisions;
 mod snapshots;
 
-use browse::View;
 pub use browse::{ObjectId, parse_id};
+use browse::{Payload, View};
 use revisions::{AlbumRevision, Ledger, Store};
 use snapshots::{Contents, Root, Source};
 
@@ -56,12 +56,25 @@ pub trait Catalog: Send + Sync + 'static {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrowseQuery {
-    pub object_id: String,
-    pub metadata: bool,
-    pub starting_index: u32,
-    pub requested_count: u32,
-    /// None uses catalog order; Some(true) sorts dates descending.
-    pub sort: Option<bool>,
+    pub object_id: ObjectId,
+    pub mode: BrowseMode,
+    pub sort: SortOrder,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowseMode {
+    Metadata,
+    DirectChildren {
+        starting_index: u32,
+        requested_count: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SortOrder {
+    Catalog,
+    DateAscending,
+    DateDescending,
 }
 
 pub struct BrowseResult {
@@ -227,14 +240,18 @@ type RefreshResult = Result<View, Fault>;
 
 impl State {
     fn view(&self, scope: Scope) -> RefreshResult {
-        let contents = match scope {
-            Scope::Root => None,
-            Scope::Album(id) => Some(self.cache.albums.get(&id).ok_or(FAILED)?.snapshot.clone()),
+        let payload = match scope {
+            Scope::Root => Payload::Root,
+
+            Scope::Album(id) => Payload::Album {
+                id,
+                contents: self.cache.albums.get(&id).ok_or(FAILED)?.snapshot.clone(),
+            },
         };
 
         Ok(View {
             root: self.cache.root.as_ref().ok_or(FAILED)?.snapshot.clone(),
-            contents,
+            payload,
             ledger: self.ledger.clone(),
         })
     }
@@ -775,11 +792,11 @@ impl Catalog for ImmichCatalog {
     }
 
     async fn browse(&self, query: BrowseQuery) -> Result<BrowseResult, Fault> {
-        let id = parse_id(&query.object_id)?;
+        let id = query.object_id;
         let mut view = self.fresh(Scope::Root).await?;
 
         match id {
-            ObjectId::Album(album) if !query.metadata => {
+            ObjectId::Album(album) if matches!(query.mode, BrowseMode::DirectChildren { .. }) => {
                 view = self.fresh(Scope::Album(album)).await?
             }
 
@@ -788,7 +805,7 @@ impl Catalog for ImmichCatalog {
             _ => {}
         }
 
-        view.browse(id, query, &self.inner.collator)
+        view.browse(query, &self.inner.collator)
     }
 }
 

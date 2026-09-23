@@ -214,9 +214,42 @@ async fn browse_serializes_snapshot_and_releases_permit_with_response() {
 
     let actions = server.catalog.actions.lock().unwrap();
     assert_eq!(actions.len(), 1);
-    assert_eq!(actions[0].starting_index, 3);
-    assert_eq!(actions[0].requested_count, 2);
-    assert_eq!(actions[0].sort, Some(true));
+
+    assert_eq!(
+        actions[0].mode,
+        crate::catalog::BrowseMode::DirectChildren {
+            starting_index: 3,
+            requested_count: 2
+        }
+    );
+
+    assert_eq!(actions[0].sort, crate::catalog::SortOrder::DateDescending);
+}
+
+#[tokio::test]
+async fn invalid_object_id_fails_before_catalog_access_and_after_argument_validation() {
+    let server = server(TestCatalog::default());
+
+    for (sort, expected) in [("", 701), ("bad", 709)] {
+        let request = action(
+            CDS,
+            "Browse",
+            &format!(
+                "<ObjectID>asset:bad</ObjectID><BrowseFlag>BrowseMetadata</BrowseFlag><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>0</RequestedCount><SortCriteria>{sort}</SortCriteria>"
+            ),
+        );
+
+        let response = server.route(request, Ipv4Addr::LOCALHOST).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        assert!(
+            body(response)
+                .await
+                .contains(&format!("<errorCode>{expected}</errorCode>"))
+        );
+    }
+
+    assert!(server.catalog.actions.lock().unwrap().is_empty());
 }
 
 #[test]

@@ -5,7 +5,7 @@ use icu_collator::CollatorBorrowed;
 use uuid::Uuid;
 
 use super::{
-    BrowseQuery, BrowseResult, FAILED, MISSING, Object,
+    BrowseMode, BrowseQuery, BrowseResult, FAILED, MISSING, Object, SortOrder,
     revisions::Ledger,
     snapshots::{Contents, Root},
 };
@@ -15,8 +15,34 @@ use crate::protocol::Fault;
 #[derive(Clone)]
 pub(super) struct View {
     pub(super) root: Arc<Root>,
-    pub(super) contents: Option<Arc<Contents>>,
+    pub(super) payload: Payload,
     pub(super) ledger: Arc<Ledger>,
+}
+
+#[derive(Clone)]
+pub(super) enum Payload {
+    Root,
+    Album { id: Uuid, contents: Arc<Contents> },
+}
+
+enum Rows<'a> {
+    Albums(&'a Root),
+    Items(&'a Contents),
+}
+
+enum Selection<'a> {
+    Metadata(Object),
+    Children {
+        rows: Rows<'a>,
+        starting_index: u32,
+        requested_count: u32,
+        sort: SortOrder,
+    },
+}
+
+struct ResolvedBrowse<'a> {
+    selection: Selection<'a>,
+    update_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -91,15 +117,23 @@ fn compare_dates(
 impl View {
     pub(super) fn browse(
         &self,
-        id: ObjectId,
         query: BrowseQuery,
         collator: &CollatorBorrowed<'_>,
     ) -> Result<BrowseResult, Fault> {
-        let Self {
-            root,
-            contents,
-            ledger,
-        } = self;
+        Ok(self.resolve(query)?.browse(collator))
+    }
+
+    fn contents(&self, album: Uuid) -> Result<&Contents, Fault> {
+        match &self.payload {
+            Payload::Album { id, contents } if *id == album => Ok(contents),
+            _ => Err(FAILED),
+        }
+    }
+
+    fn resolve(&self, query: BrowseQuery) -> Result<ResolvedBrowse<'_>, Fault> {
+        let root = &self.root;
+        let ledger = &self.ledger;
+        let id = query.object_id;
 
         let update_id = match id {
             ObjectId::Root => ledger.system_update_id,
@@ -117,86 +151,137 @@ impl View {
             }
         };
 
-        if query.metadata {
-            let object = match id {
-                ObjectId::Root => {
-                    let mut object = root.object.clone();
+        let selection = match query.mode {
+            BrowseMode::Metadata => {
+                let object = match id {
+                    ObjectId::Root => {
+                        let mut object = root.object.clone();
 
-                    object.kind = super::ObjectKind::Root {
-                        child_count: Some(root.albums.len()),
-                    };
+                        object.kind = super::ObjectKind::Root {
+                            child_count: Some(root.albums.len()),
+                        };
 
-                    object
+                        object
+                    }
+
+                    ObjectId::Album(id) => root.albums.get(&id).ok_or(MISSING)?.object.clone(),
+
+                    ObjectId::Item { album, asset } => self
+                        .contents(album)?
+                        .items
+                        .get(&asset)
+                        .map(|item| &item.object)
+                        .ok_or(MISSING)?
+                        .clone(),
+                };
+
+                Selection::Metadata(object)
+            }
+
+            BrowseMode::DirectChildren {
+                starting_index,
+                requested_count,
+            } => {
+                let rows = match id {
+                    ObjectId::Root => Rows::Albums(root),
+                    ObjectId::Album(album) => Rows::Items(self.contents(album)?),
+
+                    ObjectId::Item { album, asset } => {
+                        if !self.contents(album)?.items.contains_key(&asset) {
+                            return Err(MISSING);
+                        }
+
+                        return Err(Fault::NoSuchContainer);
+                    }
+                };
+
+                Selection::Children {
+                    rows,
+                    starting_index,
+                    requested_count,
+                    sort: query.sort,
                 }
+            }
+        };
 
-                ObjectId::Album(id) => root.albums.get(&id).ok_or(MISSING)?.object.clone(),
+        Ok(ResolvedBrowse {
+            selection,
+            update_id,
+        })
+    }
+}
 
-                ObjectId::Item { asset, .. } => contents
-                    .as_ref()
-                    .ok_or(FAILED)?
-                    .items
-                    .get(&asset)
-                    .map(|item| &item.object)
-                    .ok_or(MISSING)?
-                    .clone(),
-            };
+impl ResolvedBrowse<'_> {
+    fn browse(self, collator: &CollatorBorrowed<'_>) -> BrowseResult {
+        let Self {
+            selection,
+            update_id,
+        } = self;
 
-            return Ok(BrowseResult {
-                objects: vec![object],
-                total_matches: 1,
-                update_id,
-            });
-        }
+        let (rows, starting_index, requested_count, sort) = match selection {
+            Selection::Metadata(object) => {
+                return BrowseResult {
+                    objects: vec![object],
+                    total_matches: 1,
+                    update_id,
+                };
+            }
 
-        let rows: Vec<&Object> = match id {
-            ObjectId::Root => {
+            Selection::Children {
+                rows,
+                starting_index,
+                requested_count,
+                sort,
+            } => (rows, starting_index, requested_count, sort),
+        };
+
+        let rows: Vec<&Object> = match rows {
+            Rows::Albums(root) => {
                 let mut rows: Vec<_> = root.albums.values().collect();
 
-                rows.sort_unstable_by(|a, b| match query.sort {
-                    None => b
+                rows.sort_unstable_by(|a, b| match sort {
+                    SortOrder::Catalog => b
                         .end_date
                         .cmp(&a.end_date)
                         .then_with(|| collator.compare(&a.object.title, &b.object.title))
                         .then_with(|| a.id.cmp(&b.id)),
 
-                    Some(descending) => compare_dates(
+                    order => compare_dates(
                         a.object.date.as_deref(),
                         a.created_at.as_ref(),
                         a.id,
                         b.object.date.as_deref(),
                         b.created_at.as_ref(),
                         b.id,
-                        descending,
+                        order == SortOrder::DateDescending,
                     ),
                 });
 
                 rows.into_iter().map(|album| &album.object).collect()
             }
 
-            ObjectId::Album(_) => {
-                let mut rows: Vec<_> = contents.as_ref().ok_or(FAILED)?.items.values().collect();
+            Rows::Items(contents) => {
+                let mut rows: Vec<_> = contents.items.values().collect();
 
                 rows.sort_unstable_by(|a, b| {
                     compare_dates(
-                        query.sort.and(a.object.date.as_deref()),
+                        a.object
+                            .date
+                            .as_deref()
+                            .filter(|_| sort != SortOrder::Catalog),
                         a.capture.as_ref(),
                         a.id,
-                        query.sort.and(b.object.date.as_deref()),
+                        b.object
+                            .date
+                            .as_deref()
+                            .filter(|_| sort != SortOrder::Catalog),
                         b.capture.as_ref(),
                         b.id,
-                        query.sort.unwrap_or(false),
+                        sort == SortOrder::DateDescending,
                     )
                 });
 
                 rows.into_iter().map(|item| &item.object).collect()
-            }
-
-            ObjectId::Item { asset, .. } => {
-                if !contents.as_ref().ok_or(FAILED)?.items.contains_key(&asset) {
-                    return Err(MISSING);
-                }
-
-                return Err(Fault::NoSuchContainer);
             }
         };
 
@@ -204,20 +289,20 @@ impl View {
 
         let objects = rows
             .into_iter()
-            .skip(query.starting_index as usize)
-            .take(if query.requested_count == 0 {
+            .skip(starting_index as usize)
+            .take(if requested_count == 0 {
                 usize::MAX
             } else {
-                query.requested_count as usize
+                requested_count as usize
             })
             .cloned()
             .collect();
 
-        Ok(BrowseResult {
+        BrowseResult {
             objects,
             total_matches,
             update_id,
-        })
+        }
     }
 }
 
@@ -286,28 +371,27 @@ mod tests {
 
         let view = View {
             root: Arc::new(root),
-            contents: None,
+            payload: Payload::Root,
             ledger: Arc::new(ledger),
         };
 
         let collator = crate::config::collator("pl").unwrap();
 
         for (sort, expected) in [
-            (None, [3, 4, 5, 1, 2, 6, 7, 8, 9]),
-            (Some(false), [1, 3, 4, 5, 6, 7, 8, 9, 2]),
-            (Some(true), [2, 3, 4, 5, 6, 7, 8, 9, 1]),
+            (SortOrder::Catalog, [3, 4, 5, 1, 2, 6, 7, 8, 9]),
+            (SortOrder::DateAscending, [1, 3, 4, 5, 6, 7, 8, 9, 2]),
+            (SortOrder::DateDescending, [2, 3, 4, 5, 6, 7, 8, 9, 1]),
         ] {
             let query = BrowseQuery {
-                object_id: "0".into(),
-                metadata: false,
-                starting_index: 0,
-                requested_count: 0,
+                object_id: ObjectId::Root,
+                mode: BrowseMode::DirectChildren {
+                    starting_index: 0,
+                    requested_count: 0,
+                },
                 sort,
             };
 
-            let full = view
-                .browse(ObjectId::Root, query.clone(), &collator)
-                .unwrap();
+            let full = view.browse(query.clone(), &collator).unwrap();
 
             let expected: Vec<_> = expected
                 .into_iter()
@@ -328,10 +412,11 @@ mod tests {
             for start in [0, 3, 6, 9] {
                 let page = view
                     .browse(
-                        ObjectId::Root,
                         BrowseQuery {
-                            starting_index: start,
-                            requested_count: 3,
+                            mode: BrowseMode::DirectChildren {
+                                starting_index: start,
+                                requested_count: 3,
+                            },
                             ..query.clone()
                         },
                         &collator,

@@ -473,10 +473,15 @@ fn soap_browse_validates_shape_and_fault_precedence() {
     };
 
     assert_eq!(query.object_id, "0");
-    assert!(!query.metadata);
-    assert_eq!(query.starting_index, 0);
-    assert_eq!(query.requested_count, 0);
-    assert_eq!(query.sort, None);
+    assert_eq!(
+        query.mode,
+        BrowseMode::DirectChildren {
+            starting_index: 0,
+            requested_count: 0
+        }
+    );
+
+    assert_eq!(query.sort, SortOrder::Catalog);
     assert_eq!(filter, Filter::parse("*").unwrap());
 
     for argument in [
@@ -527,8 +532,13 @@ fn soap_browse_validates_shape_and_fault_precedence() {
     };
 
     assert_eq!(query.object_id, "not-an-id");
-    assert_eq!(query.starting_index, u32::MAX);
-    assert_eq!(query.requested_count, u32::MAX);
+    assert_eq!(
+        query.mode,
+        BrowseMode::DirectChildren {
+            starting_index: u32::MAX,
+            requested_count: u32::MAX
+        }
+    );
 }
 
 #[test]
@@ -558,9 +568,9 @@ fn soap_validates_action_inputs_and_sort_syntax() {
     }
 
     for (sort, expected) in [
-        ("", None),
-        ("+dc:date", Some(false)),
-        ("-dc:date", Some(true)),
+        ("", SortOrder::Catalog),
+        ("+dc:date", SortOrder::DateAscending),
+        ("-dc:date", SortOrder::DateDescending),
     ] {
         let args = BROWSE_ARGS.replace(
             "<SortCriteria/>",

@@ -2,7 +2,8 @@ use std::net::SocketAddrV4;
 
 use immich_dlna_proxy::{
     catalog::{
-        BrowseQuery, BrowseResult, Catalog, Object, ObjectId, ObjectKind, Resource, parse_id,
+        BrowseMode, BrowseQuery, BrowseResult, Catalog, Object, ObjectId, ObjectKind, Resource,
+        SortOrder, parse_id,
     },
     media::{
         Representation,
@@ -25,27 +26,27 @@ impl Catalog for FixtureCatalog {
     }
 
     async fn browse(&self, args: BrowseQuery) -> Result<BrowseResult, Fault> {
-        let id = match parse_id(&args.object_id)? {
-            ObjectId::Root => "0".to_owned(),
-            ObjectId::Album(album) => format!("album:{album}"),
-            ObjectId::Item { album, asset } => format!("album:{album}:asset:{asset}"),
-        };
+        let id = args.object_id;
 
         let object = self
             .0
             .iter()
-            .find(|object| object.id().to_string() == id)
+            .find(|object| object.id() == id)
             .ok_or(Fault::NoSuchObject)?;
 
-        tracing::info!(object = %id, metadata = args.metadata, "fixture Browse selection");
+        tracing::info!(object = %id, metadata = (args.mode == BrowseMode::Metadata), "fixture Browse selection");
 
-        if args.metadata {
+        let BrowseMode::DirectChildren {
+            starting_index,
+            requested_count,
+        } = args.mode
+        else {
             return Ok(BrowseResult {
                 objects: vec![object.clone()],
                 total_matches: 1,
                 update_id: 0,
             });
-        }
+        };
 
         if matches!(
             object.kind,
@@ -57,34 +58,30 @@ impl Catalog for FixtureCatalog {
         let mut children: Vec<_> = self
             .0
             .iter()
-            .filter(|object| {
-                object
-                    .parent_id()
-                    .is_some_and(|parent| parent.to_string() == id)
-            })
+            .filter(|object| object.parent_id().is_some_and(|parent| parent == id))
             .collect();
 
         children.sort_by(|a, b| {
             let dates = a.date.cmp(&b.date);
-            let dates = if args.sort == Some(true) {
+            let dates = if args.sort == SortOrder::DateDescending {
                 dates.reverse()
             } else {
                 dates
             };
 
-            dates.then_with(|| a.id().to_string().cmp(&b.id().to_string()))
+            dates.then_with(|| a.id().cmp(&b.id()))
         });
 
         let total_matches = children.len() as u32;
-        let count = if args.requested_count == 0 {
+        let count = if requested_count == 0 {
             usize::MAX
         } else {
-            args.requested_count as usize
+            requested_count as usize
         };
 
         let objects = children
             .into_iter()
-            .skip(args.starting_index as usize)
+            .skip(starting_index as usize)
             .take(count)
             .cloned()
             .collect();

@@ -313,11 +313,20 @@ fn item(id: u128, capture: Option<&str>, date: Option<&str>) -> Value {
 
 fn action(id: &str, metadata: bool, start: u32, count: u32, sort: Option<bool>) -> BrowseQuery {
     BrowseQuery {
-        object_id: id.into(),
-        metadata,
-        starting_index: start,
-        requested_count: count,
-        sort,
+        object_id: parse_id(id).unwrap(),
+        mode: if metadata {
+            BrowseMode::Metadata
+        } else {
+            BrowseMode::DirectChildren {
+                starting_index: start,
+                requested_count: count,
+            }
+        },
+        sort: match sort {
+            None => SortOrder::Catalog,
+            Some(false) => SortOrder::DateAscending,
+            Some(true) => SortOrder::DateDescending,
+        },
     }
 }
 
@@ -408,22 +417,6 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
     events.abort();
     assert!(events.await.unwrap_err().is_cancelled());
     fixture.abort(task).await;
-}
-
-#[tokio::test]
-async fn invalid_object_id_fails_before_fetch() {
-    let fixture = Fixture::new(0).await;
-
-    assert_eq!(
-        fixture
-            .library
-            .browse(action("asset:bad", true, 0, 0, None))
-            .await
-            .err(),
-        Some(MISSING)
-    );
-
-    assert!(fixture.fake.upstream.lock().unwrap().requests.is_empty());
 }
 
 #[tokio::test]
@@ -573,7 +566,13 @@ async fn album_browse_counts_eligible_items_and_sorts_before_pagination() {
         (true, ["Photo 2", "Photo 1", "Photo 3"]),
     ] {
         let mut request = children(1);
-        request.sort = Some(sort);
+
+        request.sort = if sort {
+            SortOrder::DateDescending
+        } else {
+            SortOrder::DateAscending
+        };
+
         let rows = fixture.library.browse(request).await.unwrap();
         assert_eq!(rows.total_matches, 3);
 
@@ -1637,13 +1636,27 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
 
     assert!(Arc::ptr_eq(&root_hit.ledger, &album_hit.ledger));
     assert!(Arc::ptr_eq(&root_hit.root, &album_hit.root));
-    assert!(root_hit.contents.is_none());
+    assert!(matches!(root_hit.payload, Payload::Root));
+
+    let Payload::Album { id, contents } = &album_hit.payload else {
+        panic!("expected album payload");
+    };
+
+    assert_eq!(*id, Uuid::from_u128(1));
+
+    // Resolution rejects a payload from another scope before rendering any rows.
+    for (view, query) in [(&root_hit, children(1)), (&album_hit, children(2))] {
+        assert_eq!(
+            view.browse(query, &fixture.library.inner.collator).err(),
+            Some(FAILED)
+        );
+    }
 
     assert_eq!(
         album_hit.ledger.albums[&Uuid::from_u128(1)]
             .contents_digest
             .as_deref(),
-        Some(album_hit.contents.as_ref().unwrap().digest.as_str())
+        Some(contents.digest.as_str())
     );
 
     fixture.expire(Scope::Root);
