@@ -717,12 +717,29 @@ fn soap_returns_typed_static_actions_and_rejects_wrong_service_actions() {
 fn filters_select_only_requested_available_properties() {
     assert_eq!(Filter::parse(" \t ").unwrap(), Filter::default());
     let all = Filter::parse("*").unwrap();
-    assert!(all.date && all.art && all.res() && all.duration && all.child_count);
+    assert!(all.date && all.art && all.res() && all.child_count);
+    assert_eq!(all.resources, ResourceSelection::WithDuration);
 
     for selector in ["res", "res@protocolInfo", "res@size", "res@resolution"] {
         let filter = Filter::parse(selector).unwrap();
         assert!(filter.res());
-        assert!(!filter.duration);
+        assert_eq!(filter.resources, ResourceSelection::Basic);
+
+        for selectors in [
+            format!("{selector},res@duration"),
+            format!("res@duration,{selector}"),
+            format!("res@duration,{selector},res@duration,{selector}"),
+        ] {
+            assert_eq!(
+                Filter::parse(&selectors).unwrap(),
+                Filter::parse("res@duration").unwrap(),
+                "{selectors}"
+            );
+        }
+
+        for selectors in [format!("*,{selector}"), format!("{selector},*")] {
+            assert_eq!(Filter::parse(&selectors).unwrap(), all, "{selectors}");
+        }
     }
 
     let filter = Filter::parse(" dc:date, upnp:albumArtURI , res@duration , @childCount ").unwrap();

@@ -632,9 +632,16 @@ fn action_response_bounded(
 pub struct Filter {
     date: bool,
     art: bool,
-    res: bool,
-    duration: bool,
+    resources: ResourceSelection,
     child_count: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ResourceSelection {
+    #[default]
+    None,
+    Basic,
+    WithDuration,
 }
 
 impl Filter {
@@ -650,8 +657,7 @@ impl Filter {
                 filter = Self {
                     date: true,
                     art: true,
-                    res: true,
-                    duration: true,
+                    resources: ResourceSelection::WithDuration,
                     child_count: true,
                 };
 
@@ -678,11 +684,14 @@ impl Filter {
                 ("", Some("childCount")) => filter.child_count = true,
 
                 ("res", Some("duration")) => {
-                    filter.res = true;
-                    filter.duration = true;
+                    filter.resources = ResourceSelection::WithDuration;
                 }
 
-                ("res", None | Some("protocolInfo" | "size" | "resolution")) => filter.res = true,
+                ("res", None | Some("protocolInfo" | "size" | "resolution"))
+                    if filter.resources == ResourceSelection::None =>
+                {
+                    filter.resources = ResourceSelection::Basic;
+                }
 
                 _ => {}
             }
@@ -692,7 +701,7 @@ impl Filter {
     }
 
     pub(crate) fn res(&self) -> bool {
-        self.res
+        self.resources != ResourceSelection::None
     }
 }
 
@@ -759,7 +768,7 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
                     ":*\""
                 })?;
 
-                if filter.duration
+                if filter.resources == ResourceSelection::WithDuration
                     && let Some(duration) = &resource.duration
                 {
                     xml.raw(" duration=\"")?;
