@@ -506,6 +506,37 @@ fn projected_root_encoding_is_stable_across_refactors() {
 }
 
 #[tokio::test]
+async fn projected_video_encoding_with_playback_is_stable_across_refactors() {
+    let mut dto = asset(1, "VIDEO");
+    dto["originalFileName"] = json!("video.mov");
+    dto["originalMimeType"] = json!("video/quicktime");
+    dto["duration"] = json!(3_661_007);
+
+    let fake =
+        SnapshotFixture::new(vec![page(vec![dto.clone()], None), page(vec![dto], None)]).await;
+
+    let contents = fake.source.contents(Uuid::from_u128(2)).await.unwrap();
+    let item = &contents.items[&Uuid::from_u128(1)];
+
+    let expected = concat!(
+        r#"{"id":"00000000-0000-0000-0000-000000000001","object":{"id":"album:00000000-0000-0000-0000-000000000002:asset:00000000-0000-0000-0000-000000000001","parent_id":"album:00000000-0000-0000-0000-000000000002","title":"video.mov","class":"object.item.videoItem","date":"2024-01-01","art":"http://192.0.2.1:8200/media/assets/00000000-0000-0000-0000-000000000001/preview","child_count":null,"resources":["#,
+        r#"{"uri":"http://192.0.2.1:8200/media/assets/00000000-0000-0000-0000-000000000001/original","mime":"video/quicktime","duration":"1:01:01.007","byte_seek":true},"#,
+        r#"{"uri":"http://192.0.2.1:8200/media/assets/00000000-0000-0000-0000-000000000001/playback","mime":"video/mp4","duration":null,"byte_seek":true}]},"#,
+        r#""capture":"2023-12-31T22:30:00Z","is_edited":false,"checksum":null,"updated_at":null,"thumbhash":null}"#,
+    );
+
+    assert_eq!(serde_json::to_string(item).unwrap(), expected);
+    assert_eq!(encoded_size(item, expected.len()).unwrap(), expected.len());
+    assert!(encoded_size(item, expected.len() - 1).is_err());
+    assert_eq!(contents.bytes, expected.len() + 2);
+
+    assert_eq!(
+        contents.digest.to_string(),
+        format!("{:x}", Sha256::digest(format!("[{expected}]").as_bytes()))
+    );
+}
+
+#[tokio::test]
 async fn traversal_progress_and_combined_page_budget() {
     for items in [vec![], vec![asset(1, "IMAGE")]] {
         let fake = SnapshotFixture::new(vec![
