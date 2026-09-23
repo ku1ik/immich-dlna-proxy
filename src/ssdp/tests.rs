@@ -1,6 +1,23 @@
 use super::*;
 
 const UUID: Uuid = Uuid::from_u128(0x7b37df49775d4bcb89a60c917a934643);
+const UDN: &str = "uuid:7b37df49-775d-4bcb-89a6-0c917a934643";
+const TARGETS: [(Target, &str); 5] = [
+    (Target::RootDevice, "upnp:rootdevice"),
+    (Target::Uuid, UDN),
+    (
+        Target::MediaServer,
+        "urn:schemas-upnp-org:device:MediaServer:1",
+    ),
+    (
+        Target::ContentDirectory,
+        "urn:schemas-upnp-org:service:ContentDirectory:1",
+    ),
+    (
+        Target::ConnectionManager,
+        "urn:schemas-upnp-org:service:ConnectionManager:1",
+    ),
+];
 const LOCAL: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8200);
 
 fn search(target: &str, mx: &str) -> String {
@@ -20,18 +37,16 @@ fn loopback() -> Discovery {
         socket: UdpSocket::from_std(socket.into()).unwrap(),
         address: Ipv4Addr::LOCALHOST,
         interface_index,
-        targets: targets(UUID),
+        udn: format!("uuid:{UUID}"),
         location: format!("http://{LOCAL}/device.xml"),
     }
 }
 
 #[test]
 fn parses_all_and_each_exact_target_and_clamps_mx() {
-    let targets = targets(UUID);
-
-    for (kind, target) in Target::ALL.into_iter().zip(&targets) {
+    for (kind, target) in TARGETS {
         assert_eq!(
-            parse_search(search(target, "2").as_bytes(), &targets),
+            parse_search(search(target, "2").as_bytes(), UDN),
             Some(Search {
                 target: Some(kind),
                 mx: Duration::from_secs(2),
@@ -40,7 +55,7 @@ fn parses_all_and_each_exact_target_and_clamps_mx() {
     }
 
     assert_eq!(
-        parse_search(search("ssdp:all", "4294967295").as_bytes(), &targets),
+        parse_search(search("ssdp:all", "4294967295").as_bytes(), UDN),
         Some(Search {
             target: None,
             mx: Duration::from_secs(5),
@@ -52,12 +67,11 @@ fn parses_all_and_each_exact_target_and_clamps_mx() {
         .replace("MAN:", "man:\t")
         .replace("MX: 1", "mx: 01\t");
 
-    assert!(parse_search(mixed_case.as_bytes(), &targets).is_some());
+    assert!(parse_search(mixed_case.as_bytes(), UDN).is_some());
 }
 
 #[test]
 fn rejects_malformed_searches_and_unsupported_targets() {
-    let targets = targets(UUID);
     let valid = search("ssdp:all", "1");
 
     for invalid in [
@@ -85,7 +99,7 @@ fn rejects_malformed_searches_and_unsupported_targets() {
         search("uuid:00000000-0000-0000-0000-000000000000", "1"),
     ] {
         assert!(
-            parse_search(invalid.as_bytes(), &targets).is_none(),
+            parse_search(invalid.as_bytes(), UDN).is_none(),
             "{invalid:?}"
         );
     }
@@ -99,7 +113,7 @@ fn rejects_malformed_searches_and_unsupported_targets() {
         "4294967296",
         "999999999999999999999",
     ] {
-        assert!(parse_search(search("ssdp:all", mx).as_bytes(), &targets).is_none());
+        assert!(parse_search(search("ssdp:all", mx).as_bytes(), UDN).is_none());
     }
 }
 
@@ -110,8 +124,8 @@ fn parser_enforces_exact_datagram_bound() {
     let padding = "a".repeat(DATAGRAM_BYTES - prefix.len() - 7);
     let packet = format!("{prefix}X: {padding}\r\n\r\n");
     assert_eq!(packet.len(), DATAGRAM_BYTES);
-    assert!(parse_search(packet.as_bytes(), &targets(UUID)).is_some());
-    assert!(parse_search(packet.replace("X: ", "X: aa").as_bytes(), &targets(UUID)).is_none());
+    assert!(parse_search(packet.as_bytes(), UDN).is_some());
+    assert!(parse_search(packet.replace("X: ", "X: aa").as_bytes(), UDN).is_none());
 }
 
 #[test]
@@ -263,17 +277,16 @@ fn ingress_rejects_wrong_interface_destination_and_non_unicast_source() {
 
 #[test]
 fn all_wire_messages_have_exact_target_usn_and_framing() {
-    let targets = targets(UUID);
     let location = format!("http://{LOCAL}/device.xml");
 
-    for target in 0..5 {
+    for (target, name) in TARGETS {
         for kind in [Message::Alive, Message::Response] {
-            let message = message(&targets, &location, Target::ALL[target], kind);
+            let message = message(UDN, &location, target, kind);
 
-            let usn = if target == 1 {
-                targets[1].clone()
+            let usn = if target == Target::Uuid {
+                UDN.to_owned()
             } else {
-                format!("{}::{}", targets[1], targets[target])
+                format!("{UDN}::{name}")
             };
 
             assert!(message.contains(&format!("USN: {usn}\r\n")));
@@ -285,11 +298,11 @@ fn all_wire_messages_have_exact_target_usn_and_framing() {
 
             if matches!(kind, Message::Response) {
                 assert!(message.starts_with("HTTP/1.1 200 OK\r\nEXT:\r\n"));
-                assert!(message.contains(&format!("ST: {}\r\n", targets[target])));
+                assert!(message.contains(&format!("ST: {name}\r\n")));
             } else {
                 assert!(message.starts_with("NOTIFY * HTTP/1.1\r\n"));
                 assert!(message.contains(&format!("HOST: {MULTICAST}\r\n")));
-                assert!(message.contains(&format!("NT: {}\r\n", targets[target])));
+                assert!(message.contains(&format!("NT: {name}\r\n")));
                 assert!(message.contains("NTS: ssdp:alive\r\n"));
             }
 
@@ -449,7 +462,7 @@ async fn isolated_search_round_trip_returns_all_targets_from_selected_source() {
     .unwrap();
 
     received.sort();
-    let mut expected = targets(UUID);
+    let mut expected = TARGETS.map(|(_, name)| name);
     expected.sort();
     assert_eq!(received, expected);
     task.abort();

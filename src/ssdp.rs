@@ -23,7 +23,6 @@ const MULTICAST: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 2
 const STARTUP_REPEAT: Duration = Duration::from_secs(1);
 const RESPONSE_SPACING: Duration =
     Duration::from_nanos(1_000_000_000 / RESPONSES_PER_SECOND as u64);
-const TARGET_COUNT: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
@@ -35,20 +34,30 @@ enum Target {
 }
 
 impl Target {
-    const ALL: [Self; TARGET_COUNT] = [
+    const ALL: [Self; 5] = [
         Self::RootDevice,
         Self::Uuid,
         Self::MediaServer,
         Self::ContentDirectory,
         Self::ConnectionManager,
     ];
+
+    fn name(self, udn: &str) -> &str {
+        match self {
+            Self::RootDevice => "upnp:rootdevice",
+            Self::Uuid => udn,
+            Self::MediaServer => crate::protocol::MEDIA_SERVER,
+            Self::ContentDirectory => crate::protocol::CONTENT_DIRECTORY,
+            Self::ConnectionManager => crate::protocol::CONNECTION_MANAGER,
+        }
+    }
 }
 
 pub struct Discovery {
     socket: UdpSocket,
     address: Ipv4Addr,
     interface_index: u32,
-    targets: [String; TARGET_COUNT],
+    udn: String,
     location: String,
 }
 
@@ -94,7 +103,7 @@ impl Discovery {
             socket,
             address,
             interface_index,
-            targets: targets(uuid),
+            udn: format!("uuid:{uuid}"),
             location: format!("http://{http_address}/device.xml"),
         })
     }
@@ -136,7 +145,7 @@ impl Discovery {
                 {
                     if let Some(response) = responses.pop_due(Instant::now()) {
                         let message = message(
-                            &self.targets,
+                            &self.udn,
                             &self.location,
                             response.target,
                             Message::Response,
@@ -165,7 +174,7 @@ impl Discovery {
                         continue;
                     }
 
-                    if let Some(search) = parse_search(&buffer[..packet.length], &self.targets) {
+                    if let Some(search) = parse_search(&buffer[..packet.length], &self.udn) {
                         responses.enqueue(search, packet.source, Instant::now(), || {
                             rand::random_range(0..search.mx.as_nanos() as u64)
                         });
@@ -189,7 +198,7 @@ impl Discovery {
         let mut result = Ok(());
 
         for target in Target::ALL {
-            let message = message(&self.targets, &self.location, target, Message::Alive);
+            let message = message(&self.udn, &self.location, target, Message::Alive);
 
             if let Err(error) = self.send(message.as_bytes(), destination) {
                 if error.kind() == io::ErrorKind::WouldBlock {
@@ -210,18 +219,13 @@ enum Message {
     Response,
 }
 
-fn message(
-    targets: &[String; TARGET_COUNT],
-    location: &str,
-    target: Target,
-    kind: Message,
-) -> String {
-    let name = &targets[target as usize];
+fn message(udn: &str, location: &str, target: Target, kind: Message) -> String {
+    let name = target.name(udn);
 
     let usn = if target == Target::Uuid {
-        targets[Target::Uuid as usize].clone()
+        udn.to_owned()
     } else {
-        format!("{}::{name}", targets[Target::Uuid as usize])
+        format!("{udn}::{name}")
     };
 
     let mut message = match kind {
@@ -244,23 +248,13 @@ fn message(
     message
 }
 
-fn targets(uuid: Uuid) -> [String; TARGET_COUNT] {
-    [
-        "upnp:rootdevice".into(),
-        format!("uuid:{uuid}"),
-        crate::protocol::MEDIA_SERVER.into(),
-        crate::protocol::CONTENT_DIRECTORY.into(),
-        crate::protocol::CONNECTION_MANAGER.into(),
-    ]
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Search {
     target: Option<Target>,
     mx: Duration,
 }
 
-fn parse_search(bytes: &[u8], targets: &[String; TARGET_COUNT]) -> Option<Search> {
+fn parse_search(bytes: &[u8], udn: &str) -> Option<Search> {
     if bytes.len() > DATAGRAM_BYTES || !bytes.is_ascii() {
         return None;
     }
@@ -329,7 +323,7 @@ fn parse_search(bytes: &[u8], targets: &[String; TARGET_COUNT]) -> Option<Search
         Some(
             Target::ALL
                 .into_iter()
-                .find(|&target| targets[target as usize] == st)?,
+                .find(|&target| target.name(udn) == st)?,
         )
     };
 
@@ -374,7 +368,7 @@ impl Responses {
         let count = if search.target.is_some() {
             1
         } else {
-            TARGET_COUNT
+            Target::ALL.len()
         };
 
         if self.pending.len() + count > PENDING_RESPONSES {
