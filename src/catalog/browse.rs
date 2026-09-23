@@ -133,76 +133,70 @@ impl View {
     fn resolve(&self, query: BrowseQuery) -> Result<ResolvedBrowse<'_>, Fault> {
         let root = &self.root;
         let ledger = &self.ledger;
-        let id = query.object_id;
 
-        let update_id = match id {
-            ObjectId::Root => ledger.system_update_id,
-
-            ObjectId::Album(album) | ObjectId::Item { album, .. } => {
-                if !root.albums.contains_key(&album) {
-                    return Err(MISSING);
-                }
-
-                if matches!(id, ObjectId::Item { .. }) {
-                    ledger.system_update_id
-                } else {
-                    ledger.albums.get(&album).ok_or(MISSING)?.update_id
-                }
-            }
-        };
-
-        let selection = match query.mode {
-            BrowseMode::Metadata => {
-                let object = match id {
-                    ObjectId::Root => {
+        let (selection, update_id) = match query.object_id {
+            ObjectId::Root => {
+                let selection = match query.mode {
+                    BrowseMode::Metadata => {
                         let mut object = root.object.clone();
 
                         object.kind = super::ObjectKind::Root {
                             child_count: Some(root.albums.len()),
                         };
 
-                        object
+                        Selection::Metadata(object)
                     }
 
-                    ObjectId::Album(id) => {
-                        root.albums.get(&id).ok_or(MISSING)?.metadata.object.clone()
-                    }
-
-                    ObjectId::Item { album, asset } => self
-                        .contents(album)?
-                        .items
-                        .get(&asset)
-                        .map(|item| &item.object)
-                        .ok_or(MISSING)?
-                        .clone(),
+                    BrowseMode::DirectChildren {
+                        starting_index,
+                        requested_count,
+                    } => Selection::Children {
+                        rows: Rows::Albums(root),
+                        starting_index,
+                        requested_count,
+                        sort: query.sort,
+                    },
                 };
 
-                Selection::Metadata(object)
+                (selection, ledger.system_update_id)
             }
 
-            BrowseMode::DirectChildren {
-                starting_index,
-                requested_count,
-            } => {
-                let rows = match id {
-                    ObjectId::Root => Rows::Albums(root),
-                    ObjectId::Album(album) => Rows::Items(self.contents(album)?),
+            ObjectId::Album(id) => {
+                let album = root.albums.get(&id).ok_or(MISSING)?;
+                let revision = ledger.albums.get(&id).ok_or(MISSING)?;
 
-                    ObjectId::Item { album, asset } => {
-                        if !self.contents(album)?.items.contains_key(&asset) {
-                            return Err(MISSING);
-                        }
+                let selection = match query.mode {
+                    BrowseMode::Metadata => Selection::Metadata(album.metadata.object.clone()),
 
-                        return Err(Fault::NoSuchContainer);
-                    }
+                    BrowseMode::DirectChildren {
+                        starting_index,
+                        requested_count,
+                    } => Selection::Children {
+                        rows: Rows::Items(self.contents(id)?),
+                        starting_index,
+                        requested_count,
+                        sort: query.sort,
+                    },
                 };
 
-                Selection::Children {
-                    rows,
-                    starting_index,
-                    requested_count,
-                    sort: query.sort,
+                (selection, revision.update_id)
+            }
+
+            ObjectId::Item { album, asset } => {
+                if !root.albums.contains_key(&album) {
+                    return Err(MISSING);
                 }
+
+                let item = self.contents(album)?.items.get(&asset).ok_or(MISSING)?;
+
+                if matches!(query.mode, BrowseMode::DirectChildren { .. }) {
+                    return Err(Fault::NoSuchContainer);
+                }
+
+                (
+                    Selection::Metadata(item.object.clone()),
+                    ledger.system_update_id,
+                )
             }
         };
 
