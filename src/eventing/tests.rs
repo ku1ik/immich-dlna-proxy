@@ -105,7 +105,7 @@ async fn leases_are_bounded_and_responses_are_framed() {
             Some(Instant::now() + Duration::from_secs(expected))
         );
 
-        assert_eq!(state.entries[0].initial_update_id, Some(42));
+        assert_eq!(state.entries[0].delivery, Delivery::Initial(42));
     }
 }
 
@@ -131,9 +131,9 @@ fn publication_and_registration_share_capture_without_old_replay() {
             .iter()
             .find(|entry| entry.sid == second)
             .unwrap();
-        assert_eq!(first.initial_update_id, Some(0));
+        assert_eq!(first.delivery, Delivery::Initial(0));
         assert_eq!(first.pending, Some(u32::MAX));
-        assert_eq!(second.initial_update_id, Some(u32::MAX));
+        assert_eq!(second.delivery, Delivery::Initial(u32::MAX));
         assert_eq!(second.pending, None);
     }
 
@@ -170,8 +170,8 @@ fn concurrent_registration_captures_either_side_of_publication_atomically() {
             let entry = &state.entries[0];
 
             assert!(matches!(
-                (entry.initial_update_id, entry.pending),
-                (Some(7), Some(8)) | (Some(8), None)
+                (entry.delivery, entry.pending),
+                (Delivery::Initial(7), Some(8)) | (Delivery::Initial(8), None)
             ));
         }
     }
@@ -414,7 +414,7 @@ async fn renewal_and_unsubscribe_require_live_same_peer_same_service_sid() {
 
     {
         let state = subscriptions.state.lock().unwrap();
-        assert_eq!(state.entries[0].initial_update_id, Some(42));
+        assert_eq!(state.entries[0].delivery, Delivery::Initial(42));
 
         assert_eq!(
             state.entries[0].expires,
@@ -593,9 +593,7 @@ async fn finished(subscriptions: &Subscriptions, sid: Uuid) {
                 .unwrap()
                 .entries
                 .iter()
-                .all(|entry| {
-                    entry.sid != sid || (entry.initial_update_id.is_none() && !entry.delivering)
-                })
+                .all(|entry| entry.sid != sid || entry.delivery == Delivery::Idle)
             {
                 return;
             }
@@ -714,8 +712,7 @@ async fn pending_during_initial_coalesces_and_final_event_flushes_on_timer() {
         let entry = state.entries.iter().find(|entry| entry.sid == sid).unwrap();
         let cm = state.entries.iter().find(|entry| entry.sid == cm).unwrap();
         assert_eq!(entry.pending, Some(14));
-        assert!(entry.initial_update_id.is_none());
-        assert!(entry.delivering);
+        assert_eq!(entry.delivery, Delivery::InFlight);
         assert_eq!(cm.pending, None);
     }
 
@@ -880,7 +877,7 @@ async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
             state
                 .entries
                 .iter()
-                .filter(|entry| entry.delivering)
+                .filter(|entry| entry.delivery == Delivery::InFlight)
                 .count(),
             DELIVERIES
         );
@@ -908,7 +905,7 @@ async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
                 .unwrap()
                 .entries
                 .iter()
-                .filter(|entry| entry.delivering)
+                .filter(|entry| entry.delivery == Delivery::InFlight)
                 .count(),
             DELIVERIES
         );
@@ -1023,7 +1020,7 @@ async fn inactive_inflight_attempts_finish_but_drop_all_future_changes() {
                 let state = subscriptions.state.lock().unwrap();
                 let entry = &state.entries[0];
                 assert!(entry.expires.is_none());
-                assert!(entry.delivering);
+                assert_eq!(entry.delivery, Delivery::InFlight);
                 assert_eq!(entry.pending, None);
             }
 
@@ -1180,7 +1177,7 @@ async fn delivery_concurrency_is_bounded_and_scheduler_is_single_run() {
             state
                 .entries
                 .iter()
-                .filter(|entry| entry.delivering)
+                .filter(|entry| entry.delivery == Delivery::InFlight)
                 .count(),
             DELIVERIES
         );
@@ -1311,11 +1308,17 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
                 .unwrap()
                 .entries
                 .first()
-                .map(|entry| (entry.expires.is_some(), entry.delivering, entry.next_seq));
+                .map(|entry| (entry.expires.is_some(), entry.delivery, entry.next_seq));
+
+            let delivery = if expired {
+                Delivery::InFlight
+            } else {
+                Delivery::Idle
+            };
 
             assert_eq!(
                 entry,
-                (!rejected).then_some((true, expired, seq + 1)),
+                (!rejected).then_some((true, delivery, seq + 1)),
                 "body_pending={body_pending}, status={status}, elapsed={elapsed:?}, seq={seq}"
             );
 
@@ -1335,7 +1338,8 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
                 assert_eq!(alternative.headers["seq"], seq.to_string());
                 assert_eq!(body, expected_body);
 
-                while subscriptions.state.lock().unwrap().entries[0].delivering {
+                while subscriptions.state.lock().unwrap().entries[0].delivery == Delivery::InFlight
+                {
                     assert!(scheduler.as_mut().poll(&mut context).is_pending());
                     tokio::task::yield_now().await;
                 }
@@ -1359,7 +1363,7 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
             let state = subscriptions.state.lock().unwrap();
             let entry = &state.entries[0];
             assert!(entry.expires.is_some());
-            assert!(entry.initial_update_id.is_none());
+            assert_eq!(entry.delivery, Delivery::Idle);
             assert_eq!(entry.next_seq, seq + 1);
             assert_eq!(entry.pending, None);
         }
@@ -1474,7 +1478,7 @@ async fn expired_initial_obligations_drain_and_release_all_capacity() {
 async fn scheduler_expires_idle_leases_without_requests() {
     let subscriptions = Subscriptions::new().unwrap();
     let (_, sid) = subscribe(&subscriptions, None);
-    subscriptions.state.lock().unwrap().entries[0].initial_update_id = None;
+    subscriptions.state.lock().unwrap().entries[0].delivery = Delivery::Idle;
     let task = tokio::spawn(subscriptions.clone().run());
     tokio::task::yield_now().await;
 

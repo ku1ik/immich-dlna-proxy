@@ -47,23 +47,30 @@ struct Subscription {
     callbacks: Vec<Url>,
     lease: Duration,
     expires: Option<Instant>,
-    initial_update_id: Option<u32>,
+    delivery: Delivery,
     pending: Option<u32>,
-    delivering: bool,
     next_seq: u32,
     next_attempt: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Delivery {
+    Initial(u32),
+    Idle,
+    InFlight,
+}
+
 impl Subscription {
-    fn next_delivery_at(&self) -> Option<Instant> {
-        if self.delivering {
-            return None;
-        }
+    fn next_delivery(&self) -> Option<(Instant, u32)> {
+        let id = match self.delivery {
+            Delivery::Initial(id) => id,
+            Delivery::Idle if self.expires.is_some() => self.pending?,
+            Delivery::Idle | Delivery::InFlight => return None,
+        };
 
         // The initial obligation survives lease expiry. Its next_attempt is the
         // registration time; moderation starts only when an attempt is prepared.
-        (self.initial_update_id.is_some() || (self.expires.is_some() && self.pending.is_some()))
-            .then_some(self.next_attempt)
+        Some((self.next_attempt, id))
     }
 }
 
@@ -78,7 +85,7 @@ impl State {
                 entry.pending = None;
             }
 
-            entry.expires.is_some() || entry.initial_update_id.is_some() || entry.delivering
+            entry.expires.is_some() || entry.delivery != Delivery::Idle
         });
     }
 }
@@ -246,7 +253,7 @@ impl Subscriptions {
         }
 
         let sid = Uuid::new_v4();
-        let initial_update_id = Some(state.system_update_id);
+        let delivery = Delivery::Initial(state.system_update_id);
 
         // Registration and publication share this lock; older changes are not replayed.
         state.entries.push(Subscription {
@@ -256,9 +263,8 @@ impl Subscriptions {
             callbacks,
             lease,
             expires: Some(now + lease),
-            initial_update_id,
+            delivery,
             pending: None,
-            delivering: false,
             next_seq: 0,
             next_attempt: now,
         });
@@ -288,27 +294,27 @@ impl Subscriptions {
                 state.expire(now);
 
                 while deliveries.len() < DELIVERIES {
-                    let Some(index) = state
-                        .entries
-                        .iter()
-                        .position(|entry| entry.next_delivery_at().is_some_and(|at| at <= now))
+                    let Some((index, id)) =
+                        state.entries.iter().enumerate().find_map(|(index, entry)| {
+                            let (at, id) = entry.next_delivery()?;
+
+                            (at <= now).then_some((index, id))
+                        })
                     else {
                         break;
                     };
 
                     let mut entry = state.entries.remove(index);
 
-                    let id = if let Some(id) = entry.initial_update_id.take() {
-                        id
-                    } else {
-                        entry.pending.take().expect("eligible pending event")
-                    };
+                    if entry.delivery == Delivery::Idle {
+                        entry.pending = None;
+                    }
 
                     // Allocate once at preparation, including failures and the initial attempt.
                     let seq = entry.next_seq;
                     entry.next_seq = seq.wrapping_add(1).max(1);
                     entry.next_attempt = now + MODERATION;
-                    entry.delivering = true;
+                    entry.delivery = Delivery::InFlight;
 
                     deliveries.push(deliver(
                         self.client.clone(),
@@ -328,7 +334,7 @@ impl Subscriptions {
                     .flat_map(|entry| {
                         // A ready event waits on completion when all delivery slots are full.
                         let delivery = if deliveries.len() < DELIVERIES {
-                            entry.next_delivery_at()
+                            entry.next_delivery().map(|(at, _)| at)
                         } else {
                             None
                         };
@@ -356,7 +362,7 @@ impl Subscriptions {
                         .find(|entry| entry.sid == sid)
                         .expect("in-flight subscription is retained");
 
-                    entry.delivering = false;
+                    entry.delivery = Delivery::Idle;
 
                     if deactivate {
                         entry.expires = None;
