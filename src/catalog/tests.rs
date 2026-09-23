@@ -604,6 +604,7 @@ async fn album_browse_counts_eligible_items_and_sorts_before_pagination() {
             .unwrap();
 
         assert_eq!(result.total_matches, 3);
+        assert_eq!(result.update_id, baseline.update_id);
 
         assert_eq!(
             result

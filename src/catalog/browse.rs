@@ -231,7 +231,20 @@ impl ResolvedBrowse<'_> {
             } => (rows, starting_index, requested_count, sort),
         };
 
-        let rows: Vec<&Object> = match rows {
+        let total_matches = match &rows {
+            Rows::Albums(root) => root.albums.len(),
+            Rows::Items(contents) => contents.items.len(),
+        } as u32;
+
+        if starting_index >= total_matches {
+            return BrowseResult {
+                objects: Vec::new(),
+                total_matches,
+                update_id,
+            };
+        }
+
+        let objects = match rows {
             Rows::Albums(root) => {
                 let mut rows: Vec<_> = root.albums.values().map(|album| &album.metadata).collect();
 
@@ -253,7 +266,11 @@ impl ResolvedBrowse<'_> {
                     ),
                 });
 
-                rows.into_iter().map(|album| &album.object).collect()
+                paginate(
+                    rows.into_iter().map(|album| &album.object),
+                    starting_index,
+                    requested_count,
+                )
             }
 
             Rows::Items(contents) => {
@@ -277,22 +294,13 @@ impl ResolvedBrowse<'_> {
                     )
                 });
 
-                rows.into_iter().map(|item| &item.object).collect()
+                paginate(
+                    rows.into_iter().map(|item| &item.object),
+                    starting_index,
+                    requested_count,
+                )
             }
         };
-
-        let total_matches = rows.len() as u32;
-
-        let objects = rows
-            .into_iter()
-            .skip(starting_index as usize)
-            .take(if requested_count == 0 {
-                usize::MAX
-            } else {
-                requested_count as usize
-            })
-            .cloned()
-            .collect();
 
         BrowseResult {
             objects,
@@ -300,6 +308,21 @@ impl ResolvedBrowse<'_> {
             update_id,
         }
     }
+}
+
+fn paginate<'a>(
+    rows: impl Iterator<Item = &'a Object>,
+    starting_index: u32,
+    requested_count: u32,
+) -> Vec<Object> {
+    rows.skip(starting_index as usize)
+        .take(if requested_count == 0 {
+            usize::MAX
+        } else {
+            requested_count as usize
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
