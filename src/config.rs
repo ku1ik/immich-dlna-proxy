@@ -195,13 +195,12 @@ fn read_key(path: &Path) -> anyhow::Result<HeaderValue> {
 
     let mut bytes = Vec::new();
 
-    (&file)
-        .take(KEY_BYTES)
+    file.take(KEY_BYTES + 1)
         .read_to_end(&mut bytes)
         .context("cannot read API key file")?;
 
     ensure!(
-        file.metadata()?.len() <= KEY_BYTES,
+        bytes.len() <= KEY_BYTES as usize,
         "API key file exceeds 8 KiB"
     );
 
