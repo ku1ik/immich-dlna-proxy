@@ -49,6 +49,7 @@ mod tests {
                 SocketAddrV4::new(Ipv4Addr::LOCALHOST, bound.http.local_addr().unwrap().port());
 
             let task = tokio::spawn(bound.run(None));
+
             let client = reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(5))

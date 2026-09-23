@@ -258,6 +258,7 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let config = config(fake.address, directory.path());
+
         let library = ImmichCatalog::open(config, Subscriptions::new().unwrap())
             .await
             .unwrap();
@@ -1299,6 +1300,7 @@ async fn publication_failure_worker() {
     let mut fake = Fake::new().await;
     fake.upstream.lock().unwrap().albums = vec![album(1, "Album")];
     let config = config(fake.address, Path::new(&directory));
+
     let library = ImmichCatalog::open(config, Subscriptions::new().unwrap())
         .await
         .unwrap();

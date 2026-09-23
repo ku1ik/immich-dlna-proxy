@@ -146,6 +146,7 @@ fn normalize_api_base(value: &str) -> anyhow::Result<Url> {
     );
 
     let path = url.path().trim_end_matches('/');
+
     let path = if path.rsplit('/').next() == Some("api") {
         format!("{path}/")
     } else {
@@ -228,6 +229,7 @@ pub fn resolve_interface(address: Ipv4Addr) -> anyhow::Result<u32> {
         is_non_loopback_unicast(address),
         "LAN address must be non-loopback unicast"
     );
+
     let mut list = std::ptr::null_mut();
 
     // SAFETY: getifaddrs initializes list on success; it is freed exactly once below.
@@ -400,6 +402,7 @@ state_directory = "/var/lib/immich-dlna-proxy"
             let base: ApiBase = input.parse().unwrap();
             let base = base.as_url();
             assert_eq!(base.as_str(), expected);
+
             assert_eq!(
                 base.join("albums").unwrap().as_str(),
                 format!("{expected}albums")

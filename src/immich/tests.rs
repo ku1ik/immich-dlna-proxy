@@ -450,9 +450,11 @@ async fn stalled_headers_time_out_and_close_the_connection() {
     let now = Instant::now();
     let error = fetch.await.unwrap_err();
     assert_eq!(Instant::now(), now);
+
     assert_eq!(
         error.to_string(),
         "Immich response-header deadline exceeded"
     );
+
     assert_eq!(socket.read(&mut [0; 1]).await.unwrap(), 0);
 }

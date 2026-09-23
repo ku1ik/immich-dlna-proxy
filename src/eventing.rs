@@ -356,6 +356,7 @@ impl Subscriptions {
                 finished = deliveries.next(), if !deliveries.is_empty() => {
                     let (sid, deactivate) = finished.expect("nonempty delivery set");
                     let mut state = self.state.lock().unwrap();
+
                     let entry = state
                         .entries
                         .iter_mut()
@@ -544,6 +545,7 @@ async fn deliver(
 
                 return (sid, true);
             }
+
             _ => {}
         }
     }

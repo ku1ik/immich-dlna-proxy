@@ -474,6 +474,7 @@ fn soap_browse_validates_shape_and_fault_precedence() {
     };
 
     assert_eq!(query.object_id, "0");
+
     assert_eq!(
         query.mode,
         BrowseMode::DirectChildren {
@@ -533,6 +534,7 @@ fn soap_browse_validates_shape_and_fault_precedence() {
     };
 
     assert_eq!(query.object_id, "not-an-id");
+
     assert_eq!(
         query.mode,
         BrowseMode::DirectChildren {

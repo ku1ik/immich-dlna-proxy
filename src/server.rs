@@ -94,6 +94,7 @@ impl<C: Catalog> Server<C> {
 
     pub async fn run(self, listener: TcpListener) -> anyhow::Result<()> {
         let server = Arc::new(self);
+
         let app = Router::new().fallback(move |peer: ConnectInfo<SocketAddr>, request: Request| {
             let server = server.clone();
 
@@ -342,6 +343,7 @@ async fn execute<C: Catalog>(catalog: &C, action: Action, peer: Ipv4Addr) -> Res
                 .await?;
 
             let didl = protocol::didl(&result.objects, &filter)?;
+
             let envelope = response(&[
                 ("Result", &didl),
                 ("NumberReturned", &result.objects.len().to_string()),

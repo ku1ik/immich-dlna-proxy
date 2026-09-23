@@ -63,6 +63,7 @@ impl Catalog for FixtureCatalog {
 
         children.sort_by(|a, b| {
             let dates = a.date.cmp(&b.date);
+
             let dates = if args.sort == SortOrder::DateDescending {
                 dates.reverse()
             } else {
@@ -73,6 +74,7 @@ impl Catalog for FixtureCatalog {
         });
 
         let total_matches = children.len() as u32;
+
         let count = if requested_count == 0 {
             usize::MAX
         } else {
