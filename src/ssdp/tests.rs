@@ -433,7 +433,8 @@ async fn isolated_search_round_trip_returns_all_targets_from_selected_source() {
         panic!("IPv4 socket");
     };
 
-    let task = tokio::spawn(discovery.run_to(destination));
+    // Exercise socket routing without random delays near expiry; queue tests cover timing.
+    let task = tokio::spawn(discovery.run_to(destination, |_| 0));
     let mut buffer = [0; DATAGRAM_BYTES];
 
     peer.send_to(search("ssdp:all", "1").as_bytes(), address)
@@ -478,7 +479,7 @@ async fn sends_startup_repeat_and_periodic_alive_announcements() {
         panic!("IPv4 socket");
     };
 
-    let task = tokio::spawn(discovery.run_to(destination));
+    let task = tokio::spawn(discovery.run_to(destination, |_| 0));
     let mut buffer = [0; DATAGRAM_BYTES];
 
     for advance in [

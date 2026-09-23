@@ -109,10 +109,15 @@ impl Discovery {
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
-        self.run_to(MULTICAST).await
+        self.run_to(MULTICAST, |mx| rand::random_range(0..mx.as_nanos() as u64))
+            .await
     }
 
-    async fn run_to(self, announcement_destination: SocketAddrV4) -> anyhow::Result<()> {
+    async fn run_to(
+        self,
+        announcement_destination: SocketAddrV4,
+        mut delay_nanos: impl FnMut(Duration) -> u64,
+    ) -> anyhow::Result<()> {
         self.announce(announcement_destination)?;
 
         let start = Instant::now();
@@ -176,7 +181,7 @@ impl Discovery {
 
                     if let Some(search) = parse_search(&buffer[..packet.length], &self.udn) {
                         responses.enqueue(search, packet.source, Instant::now(), || {
-                            rand::random_range(0..search.mx.as_nanos() as u64)
+                            delay_nanos(search.mx)
                         });
                     }
                 }
