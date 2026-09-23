@@ -358,6 +358,60 @@ async fn fault(task: JoinHandle<Result<BrowseResult, Fault>>, code: u16) {
 }
 
 #[tokio::test]
+async fn shared_asset_keeps_album_identity_and_asset_only_resources() {
+    let fixture = Fixture::new(2).await;
+    let asset = Uuid::from_u128(42);
+
+    for id in [1, 2] {
+        fixture.fake.upstream.lock().unwrap().contents.insert(
+            Uuid::from_u128(id),
+            vec![item(42, Some("2024-01-01T00:00:00Z"), None)],
+        );
+    }
+
+    let task = fixture.run();
+    let first = fixture.library.browse(children(1)).await.unwrap();
+    let second = fixture.library.browse(children(2)).await.unwrap();
+
+    for (id, result) in [(1, &first), (2, &second)] {
+        let album = Uuid::from_u128(id);
+        assert_eq!(result.total_matches, 1);
+        assert_eq!(result.objects.len(), 1);
+        let object = &result.objects[0];
+        assert_eq!(object.id(), ObjectId::Item { album, asset });
+        assert_eq!(object.parent_id(), Some(ObjectId::Album(album)));
+
+        let metadata = fixture
+            .library
+            .browse(metadata_query(&format!("album:{album}:asset:{asset}")))
+            .await
+            .unwrap();
+
+        assert_eq!(metadata.objects, result.objects);
+    }
+
+    assert_eq!(first.objects[0].resources(), second.objects[0].resources());
+
+    assert_eq!(
+        first.objects[0]
+            .resources()
+            .iter()
+            .map(|resource| resource.uri.as_str())
+            .collect::<Vec<_>>(),
+        [
+            format!("http://192.0.2.1:8200/media/assets/{asset}/original"),
+            format!("http://192.0.2.1:8200/media/assets/{asset}/preview"),
+        ]
+    );
+
+    let (_, ledger) = fixture.disk();
+    let first_digest = ledger.albums[&Uuid::from_u128(1)].contents_digest.unwrap();
+    let second_digest = ledger.albums[&Uuid::from_u128(2)].contents_digest.unwrap();
+    assert_ne!(first_digest, second_digest);
+    fixture.abort(task).await;
+}
+
+#[tokio::test]
 async fn local_id_startup_event_outage_and_metadata_scopes() {
     let mut fixture = Fixture::new(2).await;
     let task = fixture.run();
