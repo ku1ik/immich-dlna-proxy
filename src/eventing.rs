@@ -54,6 +54,19 @@ struct Subscription {
     next_attempt: Instant,
 }
 
+impl Subscription {
+    fn next_delivery_at(&self) -> Option<Instant> {
+        if self.delivering {
+            return None;
+        }
+
+        // The initial obligation survives lease expiry. Its next_attempt is the
+        // registration time; moderation starts only when an attempt is prepared.
+        (self.initial_update_id.is_some() || (self.expires.is_some() && self.pending.is_some()))
+            .then_some(self.next_attempt)
+    }
+}
+
 impl State {
     fn expire(&mut self, now: Instant) {
         self.entries.retain_mut(|entry| {
@@ -275,13 +288,11 @@ impl Subscriptions {
                 state.expire(now);
 
                 while deliveries.len() < DELIVERIES {
-                    let Some(index) = state.entries.iter().position(|entry| {
-                        !entry.delivering
-                            && (entry.initial_update_id.is_some()
-                                || (entry.expires.is_some()
-                                    && entry.next_attempt <= now
-                                    && entry.pending.is_some()))
-                    }) else {
+                    let Some(index) = state
+                        .entries
+                        .iter()
+                        .position(|entry| entry.next_delivery_at().is_some_and(|at| at <= now))
+                    else {
                         break;
                     };
 
@@ -316,14 +327,13 @@ impl Subscriptions {
                     .iter()
                     .flat_map(|entry| {
                         // A ready event waits on completion when all delivery slots are full.
-                        let moderation = (entry.expires.is_some()
-                            && deliveries.len() < DELIVERIES
-                            && entry.initial_update_id.is_none()
-                            && !entry.delivering
-                            && entry.pending.is_some())
-                        .then_some(entry.next_attempt);
+                        let delivery = if deliveries.len() < DELIVERIES {
+                            entry.next_delivery_at()
+                        } else {
+                            None
+                        };
 
-                        entry.expires.into_iter().chain(moderation)
+                        entry.expires.into_iter().chain(delivery)
                     })
                     .min()
             };
