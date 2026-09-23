@@ -648,23 +648,23 @@ async fn pending_during_initial_coalesces_and_final_event_flushes_on_timer() {
     subscriptions.publish(12);
     let cm = callback.register(&subscriptions, Service::ConnectionManager, &["/cm"]);
     let task = tokio::spawn(subscriptions.clone().run());
-    let mut initial = std::collections::BTreeSet::new();
+
+    let mut initial = std::collections::BTreeMap::from([
+        (format!("uuid:{sid}"), protocol::event_body(SERVICE, 10)),
+        (
+            format!("uuid:{cm}"),
+            protocol::event_body(Service::ConnectionManager, 12),
+        ),
+    ]);
 
     for _ in 0..2 {
         let (request, body) = callback.next().await;
         let sid_header = request.headers["sid"].to_str().unwrap();
         assert_eq!(request.headers["seq"], "0");
-
-        if sid_header == format!("uuid:{sid}") {
-            assert_eq!(body, protocol::event_body(SERVICE, 10));
-            assert!(initial.insert(sid));
-        } else {
-            assert_eq!(sid_header, format!("uuid:{cm}"));
-            assert_eq!(body, protocol::event_body(Service::ConnectionManager, 12));
-            assert!(initial.insert(cm));
-        }
+        assert_eq!(body, initial.remove(sid_header).unwrap());
     }
 
+    assert!(initial.is_empty());
     finished(&subscriptions, cm).await;
 
     assert_eq!(
@@ -841,9 +841,9 @@ async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
     tokio::time::advance(MODERATION).await;
     tokio::time::resume();
 
-    let mut sequences: std::collections::BTreeMap<_, u32> = tokens
+    let mut expected_sequences: std::collections::BTreeMap<_, u32> = tokens
         .iter()
-        .map(|sid| (format!("uuid:{sid}"), 0))
+        .map(|sid| (format!("uuid:{sid}"), 1))
         .collect();
 
     for _ in 0..DELIVERIES {
@@ -851,12 +851,12 @@ async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
         assert_eq!(request.headers["seq"], "1");
         assert_eq!(body, protocol::event_body(SERVICE, 1));
 
-        let seq = sequences
+        let seq = expected_sequences
             .get_mut(request.headers["sid"].to_str().unwrap())
             .unwrap();
 
-        assert_eq!(*seq, 0);
-        *seq = 1;
+        assert_eq!(*seq, 1);
+        *seq = 2;
     }
 
     subscriptions.publish(2);
@@ -886,15 +886,12 @@ async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
     tokio::time::pause();
     tokio::time::advance(MODERATION).await;
     tokio::time::resume();
-    let mut seen = std::collections::BTreeSet::new();
 
     for _ in &tokens {
         callback.release.add_permits(1);
         let (request, body) = callback.next().await;
         let sid = request.headers["sid"].to_str().unwrap();
-        assert!(seen.insert(sid.to_owned()));
-        let seq = sequences.get_mut(sid).unwrap();
-        *seq += 1;
+        let seq = expected_sequences.remove(sid).unwrap();
         assert_eq!(request.headers["seq"], seq.to_string());
         assert_eq!(body, protocol::event_body(SERVICE, 2));
 
@@ -911,6 +908,7 @@ async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
         );
     }
 
+    assert!(expected_sequences.is_empty());
     abort_scheduler(task).await;
 }
 
