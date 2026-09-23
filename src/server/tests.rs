@@ -179,6 +179,20 @@ async fn local_actions_and_faults_do_not_browse() {
         ),
         (
             "/upnp/connection-manager/control",
+            "GetCurrentConnectionIDs",
+            "",
+            200,
+            "<ConnectionIDs>0</ConnectionIDs>",
+        ),
+        (
+            "/upnp/connection-manager/control",
+            "GetCurrentConnectionInfo",
+            "<ConnectionID>0</ConnectionID>",
+            200,
+            "<Status>Unknown</Status>",
+        ),
+        (
+            "/upnp/connection-manager/control",
             "GetCurrentConnectionInfo",
             "<ConnectionID>1</ConnectionID>",
             500,
@@ -192,7 +206,18 @@ async fn local_actions_and_faults_do_not_browse() {
 
         assert_eq!(response.status().as_u16(), status);
         assert_eq!(response.headers()["ext"], "");
-        assert!(body(response).await.contains(fragment));
+        let document = body(response).await;
+        assert!(document.contains(fragment));
+
+        if status == 200 {
+            let namespace = if path == CDS {
+                protocol::CONTENT_DIRECTORY
+            } else {
+                protocol::CONNECTION_MANAGER
+            };
+
+            assert!(document.contains(&format!("<u:{name}Response xmlns:u=\"{namespace}\">")));
+        }
     }
 
     assert!(server.catalog.actions.lock().unwrap().is_empty());
@@ -207,6 +232,12 @@ async fn browse_serializes_snapshot_and_releases_permit_with_response() {
     assert_eq!(server.browses.available_permits(), BROWSES);
 
     let document = body(response).await;
+
+    assert!(document.contains(&format!(
+        "<u:BrowseResponse xmlns:u=\"{}\">",
+        protocol::CONTENT_DIRECTORY
+    )));
+
     assert!(document.contains("<NumberReturned>1</NumberReturned>"));
     assert!(document.contains("<TotalMatches>9</TotalMatches>"));
     assert!(document.contains("<UpdateID>7</UpdateID>"));

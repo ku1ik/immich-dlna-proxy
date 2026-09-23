@@ -128,6 +128,19 @@ pub(crate) struct BrowseArguments {
 }
 
 impl Action {
+    pub(crate) fn service(&self) -> Service {
+        match self {
+            Self::Browse { .. }
+            | Self::GetSearchCapabilities
+            | Self::GetSortCapabilities
+            | Self::GetSystemUpdateId => Service::ContentDirectory,
+
+            Self::GetProtocolInfo
+            | Self::GetCurrentConnectionIds
+            | Self::GetCurrentConnectionInfo(_) => Service::ConnectionManager,
+        }
+    }
+
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Browse { .. } => "Browse",

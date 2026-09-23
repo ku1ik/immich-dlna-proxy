@@ -298,7 +298,7 @@ impl<C: Catalog> Server<C> {
             None
         };
 
-        let result = timeout_at(deadline, execute(&self.catalog, service, action, peer))
+        let result = timeout_at(deadline, execute(&self.catalog, action, peer))
             .await
             .unwrap_or(Err(Fault::ActionFailed));
 
@@ -316,12 +316,8 @@ impl<C: Catalog> Server<C> {
     }
 }
 
-async fn execute<C: Catalog>(
-    catalog: &C,
-    service: Service,
-    action: Action,
-    peer: Ipv4Addr,
-) -> Result<String, Fault> {
+async fn execute<C: Catalog>(catalog: &C, action: Action, peer: Ipv4Addr) -> Result<String, Fault> {
+    let service = action.service();
     let name = action.name();
     let response = |args: &[(&'static str, &str)]| protocol::action_response(service, name, args);
 
