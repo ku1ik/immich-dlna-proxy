@@ -277,6 +277,13 @@ enum Token {
 }
 
 impl Token {
+    fn scope(&self) -> Scope {
+        match self {
+            Self::Root => Scope::Root,
+            Self::Album(id, _) => Scope::Album(*id),
+        }
+    }
+
     fn applicable(&self, ledger: &Ledger) -> bool {
         match self {
             // One root flight exists at a time; only it can change the root digest.
@@ -506,7 +513,7 @@ impl ImmichCatalog {
                 supervisor.tasks.spawn(async move {
                     flight.result = flight
                         .catalog
-                        .refresh(scope, token, deadline)
+                        .refresh(token, deadline)
                         .await
                         .inspect(|view| {
                             tracing::debug!(?scope, update_id = view.ledger.system_update_id, elapsed_ms = now.elapsed().as_millis(), "catalog refresh completed");
@@ -536,7 +543,9 @@ impl ImmichCatalog {
         }
     }
 
-    async fn refresh(&self, scope: Scope, token: Token, preparation: Instant) -> Result<View> {
+    async fn refresh(&self, token: Token, preparation: Instant) -> Result<View> {
+        let scope = token.scope();
+
         ensure!(
             !self.inner.failure.is_cancelled() && Instant::now() < preparation,
             "catalog preparation failed or expired"
