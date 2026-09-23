@@ -195,21 +195,25 @@ impl Source {
 
         for id in encoded_ids {
             if let Some(item) = items.get_mut(&id) {
-                let old_size = encoded_size(item, SNAPSHOT_BYTES)?;
-
                 let ObjectKind::Video { resources, .. } = &mut item.object.kind else {
                     continue;
                 };
 
-                resources.push(Resource {
+                let resource = Resource {
                     uri: asset_url(self.http_address, id, Representation::Playback),
                     mime: "video/mp4".into(),
                     duration: None,
                     byte_seek: true,
-                });
+                };
 
-                bytes -= old_size;
-                bytes += encoded_size(item, SNAPSHOT_BYTES - bytes)?;
+                let separator = usize::from(!resources.is_empty());
+
+                let remaining = (SNAPSHOT_BYTES - bytes)
+                    .checked_sub(separator)
+                    .ok_or_else(|| anyhow!("catalog projected byte limit exceeded"))?;
+
+                bytes += separator + encoded_size(&resource, remaining)?;
+                resources.push(resource);
             }
         }
 
@@ -320,18 +324,9 @@ fn project_item(
     dto: Asset,
     bad_dates: &mut usize,
 ) -> Result<Option<Item>> {
-    if !matches!(dto.kind.as_str(), "IMAGE" | "VIDEO")
-        || !matches!(dto.visibility.as_str(), "timeline" | "archive")
-        || dto.is_trashed
-    {
+    if !matches!(dto.visibility.as_str(), "timeline" | "archive") || dto.is_trashed {
         return Ok(None);
     }
-
-    let name = dto
-        .original_file_name
-        .ok_or_else(|| anyhow!("eligible Immich asset is missing originalFileName"))?;
-
-    let video = dto.kind == "VIDEO";
 
     let mime = dto
         .original_mime_type
@@ -339,53 +334,68 @@ fn project_item(
         .and_then(crate::mime::parse)
         .map(str::to_ascii_lowercase);
 
-    let (representation, mime) = if video {
-        (
-            Representation::Original,
-            mime.unwrap_or_else(|| "application/octet-stream".into()),
-        )
-    } else if !dto.is_edited
-        && mime
-            .as_deref()
-            .is_some_and(|mime| matches!(mime, "image/jpeg" | "image/png" | "image/gif"))
-    {
-        (
-            Representation::Original,
-            mime.expect("checked original image MIME"),
-        )
-    } else {
-        (Representation::Display, "image/jpeg".into())
+    let kind = match dto.kind.as_str() {
+        "IMAGE" => {
+            let (representation, mime) = match mime {
+                Some(mime)
+                    if !dto.is_edited
+                        && matches!(mime.as_str(), "image/jpeg" | "image/png" | "image/gif") =>
+                {
+                    (Representation::Original, mime)
+                }
+
+                _ => (Representation::Display, "image/jpeg".into()),
+            };
+
+            ObjectKind::Photo {
+                album,
+                asset: dto.id,
+                resources: vec![
+                    Resource {
+                        uri: asset_url(http_address, dto.id, representation),
+                        mime,
+                        duration: None,
+                        byte_seek: false,
+                    },
+                    Resource {
+                        uri: asset_url(http_address, dto.id, Representation::Preview),
+                        mime: "image/jpeg".into(),
+                        duration: None,
+                        byte_seek: false,
+                    },
+                ],
+            }
+        }
+
+        "VIDEO" => {
+            let duration = dto.duration.filter(|ms| *ms >= 0).map(|ms| {
+                format!(
+                    "{}:{:02}:{:02}.{:03}",
+                    ms / 3_600_000,
+                    ms / 60_000 % 60,
+                    ms / 1000 % 60,
+                    ms % 1000
+                )
+            });
+
+            ObjectKind::Video {
+                album,
+                asset: dto.id,
+                resources: vec![Resource {
+                    uri: asset_url(http_address, dto.id, Representation::Original),
+                    mime: mime.unwrap_or_else(|| "application/octet-stream".into()),
+                    duration,
+                    byte_seek: true,
+                }],
+            }
+        }
+
+        _ => return Ok(None),
     };
 
-    let duration = dto
-        .duration
-        .filter(|ms| *ms >= 0)
-        .filter(|_| video)
-        .map(|ms| {
-            format!(
-                "{}:{:02}:{:02}.{:03}",
-                ms / 3_600_000,
-                ms / 60_000 % 60,
-                ms / 1000 % 60,
-                ms % 1000
-            )
-        });
-
-    let mut resources = vec![Resource {
-        uri: asset_url(http_address, dto.id, representation),
-        mime,
-        duration,
-        byte_seek: video,
-    }];
-
-    if !video {
-        resources.push(Resource {
-            uri: asset_url(http_address, dto.id, Representation::Preview),
-            mime: "image/jpeg".into(),
-            duration: None,
-            byte_seek: false,
-        });
-    }
+    let name = dto
+        .original_file_name
+        .ok_or_else(|| anyhow!("eligible Immich asset is missing originalFileName"))?;
 
     let capture = parse_date(dto.file_created_at.as_deref(), bad_dates);
 
@@ -400,19 +410,7 @@ fn project_item(
     Ok(Some(Item {
         id: dto.id,
         object: Object {
-            kind: if video {
-                ObjectKind::Video {
-                    album,
-                    asset: dto.id,
-                    resources,
-                }
-            } else {
-                ObjectKind::Photo {
-                    album,
-                    asset: dto.id,
-                    resources,
-                }
-            },
+            kind,
             title: title(&name, dto.id),
             date,
             art: Some(asset_url(http_address, dto.id, Representation::Preview)),

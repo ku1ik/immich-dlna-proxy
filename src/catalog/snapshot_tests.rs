@@ -628,3 +628,57 @@ fn root_album_limit_is_enforced() {
             .contains("album limit")
     );
 }
+
+#[tokio::test]
+async fn playback_append_respects_exact_snapshot_byte_budget() {
+    let mut video = asset(1, "VIDEO");
+    let mut photo = asset(2, "IMAGE");
+    video["checksum"] = json!("");
+    photo["checksum"] = json!("");
+    let mut expected = [project(video.clone()), project(photo.clone())];
+
+    let ObjectKind::Video { resources, .. } = &mut expected[0].object.kind else {
+        panic!("expected video");
+    };
+
+    resources.push(Resource {
+        uri: "http://192.0.2.1:8200/media/assets/00000000-0000-0000-0000-000000000001/playback"
+            .into(),
+        mime: "video/mp4".into(),
+        duration: None,
+        byte_seek: true,
+    });
+
+    let padding = SNAPSHOT_BYTES - serde_json::to_vec(&expected).unwrap().len();
+
+    for extra in [0, 1] {
+        video["checksum"] = json!("x".repeat(padding / 2));
+        photo["checksum"] = json!("y".repeat(padding - padding / 2 + extra));
+
+        let fake = SnapshotFixture::new(vec![
+            page(vec![video.clone()], Some("2")),
+            page(vec![photo.clone()], None),
+            // Non-video IDs in the encoded response must not acquire a resource.
+            page(vec![asset(1, "VIDEO"), asset(2, "IMAGE")], None),
+        ])
+        .await;
+
+        let result = fake.source.contents(ALBUM).await;
+
+        if extra == 0 {
+            let contents = result.unwrap();
+            assert_eq!(contents.bytes, SNAPSHOT_BYTES);
+            let resources = contents.items[&Uuid::from_u128(1)].object.resources();
+            assert_eq!(resources, expected[0].object.resources());
+
+            assert_eq!(
+                contents.items[&Uuid::from_u128(2)].object.resources(),
+                expected[1].object.resources()
+            );
+        } else {
+            assert!(result.unwrap_err().to_string().contains("byte limit"));
+        }
+
+        assert_eq!(fake.api.requests.lock().unwrap().len(), 3);
+    }
+}
