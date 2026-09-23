@@ -157,7 +157,7 @@ impl Ledger {
                 changed = true;
 
                 if let Some(digest) = metadata {
-                    album.metadata_digest.clone_from(digest);
+                    album.metadata_digest = *digest;
                 }
             }
         }
@@ -169,7 +169,7 @@ impl Ledger {
                     AlbumRevision {
                         update_id: 0,
                         present: true,
-                        metadata_digest: metadata_digest.clone(),
+                        metadata_digest: *metadata_digest,
                         contents_digest: None,
                     },
                 );
@@ -182,7 +182,7 @@ impl Ledger {
             return Ok(None);
         }
 
-        next.root_digest = Some(root_digest.to_owned());
+        next.root_digest = Some(*root_digest);
         next.system_update_id = next.system_update_id.wrapping_add(1);
 
         Ok(Some(next))
@@ -208,7 +208,7 @@ impl Ledger {
             .expect("validated album exists in clone");
 
         album.update_id = album.update_id.wrapping_add(1);
-        album.contents_digest = Some(digest.to_owned());
+        album.contents_digest = Some(*digest);
         next.system_update_id = next.system_update_id.wrapping_add(1);
 
         Ok(Some(next))

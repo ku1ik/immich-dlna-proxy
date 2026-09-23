@@ -708,7 +708,7 @@ impl ImmichCatalog {
                 let albums = root
                     .albums
                     .iter()
-                    .map(|(id, album)| (*id, album.digest.clone()))
+                    .map(|(id, album)| (*id, album.digest))
                     .collect();
 
                 ledger.root_transition(&root.digest, &albums)?

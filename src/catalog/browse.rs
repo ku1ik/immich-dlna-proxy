@@ -369,7 +369,7 @@ mod tests {
         let ledger = Ledger {
             server_uuid: Uuid::from_u128(999),
             system_update_id: 42,
-            root_digest: Some(root.digest.clone()),
+            root_digest: Some(root.digest),
             albums: Default::default(),
         };
 
