@@ -311,27 +311,32 @@ fn item(id: u128, capture: Option<&str>, date: Option<&str>) -> Value {
     })
 }
 
-fn action(id: &str, metadata: bool, start: u32, count: u32, sort: Option<bool>) -> BrowseQuery {
+fn metadata_query(id: &str) -> BrowseQuery {
     BrowseQuery {
         object_id: parse_id(id).unwrap(),
-        mode: if metadata {
-            BrowseMode::Metadata
-        } else {
-            BrowseMode::DirectChildren {
-                starting_index: start,
-                requested_count: count,
-            }
+        mode: BrowseMode::Metadata,
+        sort: SortOrder::Catalog,
+    }
+}
+
+fn page_query(id: &str, start: u32, count: u32, sort: SortOrder) -> BrowseQuery {
+    BrowseQuery {
+        object_id: parse_id(id).unwrap(),
+        mode: BrowseMode::DirectChildren {
+            starting_index: start,
+            requested_count: count,
         },
-        sort: match sort {
-            None => SortOrder::Catalog,
-            Some(false) => SortOrder::DateAscending,
-            Some(true) => SortOrder::DateDescending,
-        },
+        sort,
     }
 }
 
 fn children(id: u128) -> BrowseQuery {
-    action(&format!("album:{}", Uuid::from_u128(id)), false, 0, 0, None)
+    page_query(
+        &format!("album:{}", Uuid::from_u128(id)),
+        0,
+        0,
+        SortOrder::Catalog,
+    )
 }
 
 fn spawn_browse(
@@ -369,20 +374,12 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
     assert!(fixture.fake.upstream.lock().unwrap().requests.is_empty());
     fixture.fake.upstream.lock().unwrap().outage = true;
 
-    fault(
-        spawn_browse(&fixture.library, action("0", true, 0, 0, None)),
-        501,
-    )
-    .await;
+    fault(spawn_browse(&fixture.library, metadata_query("0")), 501).await;
 
     assert_eq!(fixture.library.system_update_id(), 1);
     fixture.fake.upstream.lock().unwrap().outage = false;
 
-    let root = fixture
-        .library
-        .browse(action("0", true, 0, 99, None))
-        .await
-        .unwrap();
+    let root = fixture.library.browse(metadata_query("0")).await.unwrap();
 
     assert_eq!(root.total_matches, 1);
     assert_eq!(root.objects.len(), 1);
@@ -395,13 +392,10 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
 
     let metadata = fixture
         .library
-        .browse(action(
-            &format!("album:{}", Uuid::from_u128(1)),
-            true,
-            0,
-            0,
-            Some(true),
-        ))
+        .browse(BrowseQuery {
+            sort: SortOrder::DateDescending,
+            ..metadata_query(&format!("album:{}", Uuid::from_u128(1)))
+        })
         .await
         .unwrap();
 
@@ -431,7 +425,7 @@ async fn album_latest_date_refresh_reorders_and_publishes_without_loading_conten
     }
 
     let task = fixture.run();
-    let request = || action("0", false, 0, 0, None);
+    let request = || page_query("0", 0, 0, SortOrder::Catalog);
     let before = fixture.library.browse(request()).await.unwrap();
     assert_eq!(before.objects[0].title, "Z");
     let disk = fixture.disk().1;
@@ -503,7 +497,7 @@ async fn root_browse_sorts_before_pagination() {
 
     let root = fixture
         .library
-        .browse(action("0", false, 1, 2, None))
+        .browse(page_query("0", 1, 2, SortOrder::Catalog))
         .await
         .unwrap();
 
@@ -562,15 +556,12 @@ async fn album_browse_counts_eligible_items_and_sorts_before_pagination() {
     );
 
     for (sort, titles) in [
-        (false, ["Photo 1", "Photo 2", "Photo 3"]),
-        (true, ["Photo 2", "Photo 1", "Photo 3"]),
+        (SortOrder::DateAscending, ["Photo 1", "Photo 2", "Photo 3"]),
+        (SortOrder::DateDescending, ["Photo 2", "Photo 1", "Photo 3"]),
     ] {
-        let mut request = children(1);
-
-        request.sort = if sort {
-            SortOrder::DateDescending
-        } else {
-            SortOrder::DateAscending
+        let request = BrowseQuery {
+            sort,
+            ..children(1)
         };
 
         let rows = fixture.library.browse(request).await.unwrap();
@@ -593,12 +584,11 @@ async fn album_browse_counts_eligible_items_and_sorts_before_pagination() {
     ] {
         let result = fixture
             .library
-            .browse(action(
+            .browse(page_query(
                 &format!("album:{}", Uuid::from_u128(1)),
-                false,
                 start,
                 count,
-                Some(false),
+                SortOrder::DateAscending,
             ))
             .await
             .unwrap();
@@ -637,7 +627,7 @@ async fn item_browse_validates_album_membership_and_returns_the_system_revision(
 
     let metadata = fixture
         .library
-        .browse(action(&appearance, true, 0, 0, None))
+        .browse(metadata_query(&appearance))
         .await
         .unwrap();
 
@@ -645,7 +635,10 @@ async fn item_browse_validates_album_membership_and_returns_the_system_revision(
     assert_eq!(metadata.total_matches, 1);
 
     fault(
-        spawn_browse(&fixture.library, action(&appearance, false, 0, 0, None)),
+        spawn_browse(
+            &fixture.library,
+            page_query(&appearance, 0, 0, SortOrder::Catalog),
+        ),
         710,
     )
     .await;
@@ -653,13 +646,16 @@ async fn item_browse_validates_album_membership_and_returns_the_system_revision(
     let wrong_album = format!("album:{}:asset:{}", Uuid::from_u128(2), Uuid::from_u128(1));
 
     fault(
-        spawn_browse(&fixture.library, action(&wrong_album, true, 0, 0, None)),
+        spawn_browse(&fixture.library, metadata_query(&wrong_album)),
         701,
     )
     .await;
 
     fault(
-        spawn_browse(&fixture.library, action(&wrong_album, false, 0, 0, None)),
+        spawn_browse(
+            &fixture.library,
+            page_query(&wrong_album, 0, 0, SortOrder::Catalog),
+        ),
         701,
     )
     .await;
@@ -787,11 +783,7 @@ async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
     fixture.fake.upstream.lock().unwrap().albums[0]["albumName"] = json!("Albums");
     fixture.expire(Scope::Root);
 
-    fixture
-        .library
-        .browse(action("0", true, 0, 0, None))
-        .await
-        .unwrap();
+    fixture.library.browse(metadata_query("0")).await.unwrap();
 
     {
         let state = fixture.library.inner.state.lock().unwrap();
@@ -838,13 +830,7 @@ async fn metadata_contents_and_restart_preserve_independent_durable_counters() {
 
     let result = fixture
         .library
-        .browse(action(
-            &format!("album:{}", Uuid::from_u128(1)),
-            true,
-            0,
-            1,
-            None,
-        ))
+        .browse(metadata_query(&format!("album:{}", Uuid::from_u128(1))))
         .await
         .unwrap();
 
@@ -908,11 +894,7 @@ async fn shared_flights_survive_callers_and_four_scopes_reject_without_backlog()
     let fixture = Fixture::new(5).await;
     let task = fixture.run();
 
-    fixture
-        .library
-        .browse(action("0", true, 0, 0, None))
-        .await
-        .unwrap();
+    fixture.library.browse(metadata_query("0")).await.unwrap();
 
     let mut callers = Vec::new();
     let mut gates = Vec::new();
@@ -1114,11 +1096,7 @@ async fn whole_permit_covers_commit_wait_and_preparation_timeout_cleans_flight()
     let fixture = Fixture::new(1).await;
     let task = fixture.run();
 
-    fixture
-        .library
-        .browse(action("0", true, 0, 0, None))
-        .await
-        .unwrap();
+    fixture.library.browse(metadata_query("0")).await.unwrap();
 
     let gate = fixture.library.inner.commit.lock().await;
     let barrier = Barrier::new();
@@ -1172,11 +1150,7 @@ async fn stale_unchanged_album_cannot_survive_root_removal_and_reappearance() {
     fixture.fake.upstream.lock().unwrap().albums.remove(0);
     fixture.expire(Scope::Root);
 
-    fixture
-        .library
-        .browse(action("0", true, 0, 0, None))
-        .await
-        .unwrap();
+    fixture.library.browse(metadata_query("0")).await.unwrap();
 
     assert!(
         !fixture
@@ -1200,11 +1174,7 @@ async fn stale_unchanged_album_cannot_survive_root_removal_and_reappearance() {
 
     fixture.expire(Scope::Root);
 
-    fixture
-        .library
-        .browse(action("0", true, 0, 0, None))
-        .await
-        .unwrap();
+    fixture.library.browse(metadata_query("0")).await.unwrap();
 
     let before = fixture.disk();
     barrier.release.add_permits(1);
@@ -1283,7 +1253,7 @@ async fn publication_failure_worker() {
     let mut supervisor = tokio::spawn(async move { supervised.run().await });
 
     library
-        .browse(action("0", false, 0, 0, None))
+        .browse(page_query("0", 0, 0, SortOrder::Catalog))
         .await
         .unwrap();
 
@@ -1309,7 +1279,7 @@ async fn publication_failure_worker() {
     let mut barrier = Barrier::new();
     Arc::get_mut(&mut barrier).unwrap().panic = mode == "panic";
     *library.inner.publication.lock().unwrap() = Some(barrier.clone());
-    let mut caller = spawn_browse(&library, action("0", false, 0, 0, None));
+    let mut caller = spawn_browse(&library, page_query("0", 0, 0, SortOrder::Catalog));
     barrier.entered().await;
     let directory = Path::new(&directory);
 
@@ -1425,7 +1395,7 @@ async fn publication_failure(mode: &str) {
     .unwrap();
 
     let result = library
-        .browse(action("0", false, 0, 0, None))
+        .browse(page_query("0", 0, 0, SortOrder::Catalog))
         .await
         .unwrap();
 
@@ -1456,7 +1426,7 @@ async fn preparation_panic_is_fatal_and_supervised_even_without_waiters() {
     let mut barrier = Barrier::new();
     Arc::get_mut(&mut barrier).unwrap().panic = true;
     *fixture.library.inner.prepared.lock().unwrap() = Some((Scope::Root, barrier.clone()));
-    let caller = spawn_browse(&fixture.library, action("0", true, 0, 0, None));
+    let caller = spawn_browse(&fixture.library, metadata_query("0"));
     barrier.entered().await;
     caller.abort();
     barrier.release.add_permits(1);
@@ -1500,7 +1470,7 @@ async fn abandoned_refresh_completes_and_expiry_alone_never_does_work() {
         .gates
         .insert(Scope::Root, barrier.clone());
 
-    let caller = spawn_browse(&fixture.library, action("0", true, 0, 0, None));
+    let caller = spawn_browse(&fixture.library, metadata_query("0"));
     barrier.entered().await;
     caller.abort();
     let _ = caller.await;
@@ -1550,22 +1520,13 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
 
     let task = fixture.run();
 
-    fixture
-        .library
-        .browse(action("0", true, 0, 0, None))
-        .await
-        .unwrap();
+    fixture.library.browse(metadata_query("0")).await.unwrap();
 
     let mut children_waiter = Box::pin(fixture.library.browse(children(1)));
     assert!(futures_util::poll!(&mut children_waiter).is_pending());
     let appearance = format!("album:{}:asset:{}", Uuid::from_u128(1), Uuid::from_u128(1));
 
-    let mut metadata_waiter =
-        Box::pin(
-            fixture
-                .library
-                .browse(action(&appearance, true, 0, 0, None)),
-        );
+    let mut metadata_waiter = Box::pin(fixture.library.browse(metadata_query(&appearance)));
 
     assert!(futures_util::poll!(&mut metadata_waiter).is_pending());
 
@@ -1605,11 +1566,7 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
     fixture.fake.upstream.lock().unwrap().albums.remove(0);
     fixture.expire(Scope::Root);
 
-    fixture
-        .library
-        .browse(action("0", true, 0, 0, None))
-        .await
-        .unwrap();
+    fixture.library.browse(metadata_query("0")).await.unwrap();
 
     let metadata = metadata_waiter.await.unwrap();
     assert_eq!(metadata.objects, result.objects);
@@ -1662,16 +1619,14 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
     );
 
     fixture.expire(Scope::Root);
-    let mut root_waiter = Box::pin(fixture.library.browse(action("0", true, 0, 0, None)));
+    let mut root_waiter = Box::pin(fixture.library.browse(metadata_query("0")));
     assert!(futures_util::poll!(&mut root_waiter).is_pending());
 
-    let mut album_waiter = Box::pin(fixture.library.browse(action(
-        &format!("album:{}", Uuid::from_u128(1)),
-        true,
-        0,
-        0,
-        None,
-    )));
+    let mut album_waiter = Box::pin(
+        fixture
+            .library
+            .browse(metadata_query(&format!("album:{}", Uuid::from_u128(1)))),
+    );
 
     assert!(futures_util::poll!(&mut album_waiter).is_pending());
     let mut flight = fixture.library.inner.state.lock().unwrap().flights[&Scope::Root].clone();
@@ -1681,11 +1636,7 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
     fixture.fake.upstream.lock().unwrap().albums.remove(0);
     fixture.expire(Scope::Root);
 
-    let removed = fixture
-        .library
-        .browse(action("0", true, 0, 0, None))
-        .await
-        .unwrap();
+    let removed = fixture.library.browse(metadata_query("0")).await.unwrap();
 
     assert_eq!(removed.objects[0].child_count(), Some(1));
     let old_root = root_waiter.await.unwrap();

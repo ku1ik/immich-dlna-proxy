@@ -543,6 +543,31 @@ fn soap_browse_validates_shape_and_fault_precedence() {
 }
 
 #[test]
+fn metadata_browse_validates_wire_pagination_before_discarding_it() {
+    let metadata = BROWSE_ARGS.replace("BrowseDirectChildren", "BrowseMetadata");
+
+    for count in ["0", "1", "99", "4294967295"] {
+        let args = metadata.replace("<RequestedCount>0", &format!("<RequestedCount>{count}"));
+
+        let Action::Browse { query, .. } = browse(&args).unwrap() else {
+            panic!("expected Browse");
+        };
+
+        assert_eq!(query.mode, BrowseMode::Metadata);
+    }
+
+    for count in ["", "-1", "+1", " 1", "1 ", "4294967296", "1.0"] {
+        let args = metadata.replace("<RequestedCount>0", &format!("<RequestedCount>{count}"));
+        assert_eq!(browse(&args), Err(Fault::InvalidArgs), "{args}");
+    }
+
+    for start in ["1", "4294967295"] {
+        let args = metadata.replace("<StartingIndex>0", &format!("<StartingIndex>{start}"));
+        assert_eq!(browse(&args), Err(Fault::InvalidArgs), "{args}");
+    }
+}
+
+#[test]
 fn soap_validates_action_inputs_and_sort_syntax() {
     assert_eq!(
         parse(&request("Search", ""), "Search"),
