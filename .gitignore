@@ -1,4 +1,4 @@
-/.direnv
-.envrc
+.direnv/
+.envrc.local
 /result
 target/
