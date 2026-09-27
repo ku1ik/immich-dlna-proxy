@@ -215,6 +215,9 @@ Global and per-album update IDs are wrapping 32-bit counters. One random seed in
 each process and its newly observed albums. Full catalog fingerprints detect changes;
 snapshots, counters, and pending notifications are published together in memory. Each
 refresh has one 25-second budget; a timeout fails the refresh without terminating the service.
+One catalog task serves local reads while refreshing one scope at a time. Up to eight
+Browse operations share active work or wait within their original 25-second response
+budget. A caller disconnecting or timing out does not cancel an active refresh.
 Immich outages do not block startup: version checking occurs on first catalog access.
 
 Restarting forgets counters and fingerprints but retains the configured device UUID.

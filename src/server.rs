@@ -299,7 +299,7 @@ impl<C: Catalog> Server<C> {
             None
         };
 
-        let result = timeout_at(deadline, execute(&self.catalog, action, peer))
+        let result = timeout_at(deadline, execute(&self.catalog, action, peer, deadline))
             .await
             .unwrap_or(Err(Fault::ActionFailed));
 
@@ -317,7 +317,12 @@ impl<C: Catalog> Server<C> {
     }
 }
 
-async fn execute<C: Catalog>(catalog: &C, action: Action, peer: Ipv4Addr) -> Result<String, Fault> {
+async fn execute<C: Catalog>(
+    catalog: &C,
+    action: Action,
+    peer: Ipv4Addr,
+    deadline: Instant,
+) -> Result<String, Fault> {
     let service = action.service();
     let name = action.name();
     let response = |args: &[(&'static str, &str)]| protocol::action_response(service, name, args);
@@ -335,11 +340,14 @@ async fn execute<C: Catalog>(catalog: &C, action: Action, peer: Ipv4Addr) -> Res
             );
 
             let result = catalog
-                .browse(crate::catalog::BrowseQuery {
-                    object_id: object?,
-                    mode: query.mode,
-                    sort: query.sort,
-                })
+                .browse(
+                    crate::catalog::BrowseQuery {
+                        object_id: object?,
+                        mode: query.mode,
+                        sort: query.sort,
+                    },
+                    deadline,
+                )
                 .await?;
 
             let didl = protocol::didl(&result.objects, &filter)?;
@@ -360,7 +368,7 @@ async fn execute<C: Catalog>(catalog: &C, action: Action, peer: Ipv4Addr) -> Res
         Action::GetSortCapabilities => response(&[("SortCaps", "dc:date")]),
 
         Action::GetSystemUpdateId => {
-            let id = catalog.system_update_id();
+            let id = catalog.system_update_id().await?;
             tracing::debug!(%peer, id, "published update ID");
             let id = id.to_string();
 

@@ -21,11 +21,15 @@ pub const VIDEO_ID: &str = "20000000-0000-4000-8000-000000000003";
 pub(super) struct FixtureCatalog(pub(super) Vec<Object>);
 
 impl Catalog for FixtureCatalog {
-    fn system_update_id(&self) -> u32 {
-        0
+    async fn system_update_id(&self) -> Result<u32, Fault> {
+        Ok(0)
     }
 
-    async fn browse(&self, args: BrowseQuery) -> Result<BrowseResult, Fault> {
+    async fn browse(
+        &self,
+        args: BrowseQuery,
+        _: tokio::time::Instant,
+    ) -> Result<BrowseResult, Fault> {
         let id = args.object_id;
 
         let object = self

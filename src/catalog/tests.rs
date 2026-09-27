@@ -7,8 +7,15 @@ use axum::{
 };
 use http::{HeaderMap, HeaderValue, Method};
 use serde_json::{Value, json};
-use std::net::{Ipv4Addr, SocketAddr};
-use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Mutex,
+};
+use tokio::{
+    net::TcpListener,
+    sync::{Notify, Semaphore, mpsc},
+    task::JoinHandle,
+};
 
 use crate::protocol::Service;
 
@@ -18,7 +25,6 @@ mod http_tests;
 pub(super) struct Barrier {
     pub(super) entered: Notify,
     pub(super) release: Semaphore,
-    pub(super) panic: bool,
 }
 
 impl Barrier {
@@ -26,7 +32,6 @@ impl Barrier {
         Arc::new(Self {
             entered: Notify::new(),
             release: Semaphore::new(0),
-            panic: false,
         })
     }
 
@@ -172,7 +177,7 @@ impl Fake {
             .count()
     }
 
-    fn subscribe(&self, library: &ImmichCatalog) {
+    fn subscribe(&self, library: &Library) {
         let mut headers = HeaderMap::new();
         headers.insert("nt", HeaderValue::from_static("upnp:event"));
 
@@ -181,7 +186,7 @@ impl Fake {
             format!("<http://{}/events>", self.address).parse().unwrap(),
         );
 
-        let response = library.inner.events.request(
+        let response = library.events.request(
             Service::ContentDirectory,
             Ipv4Addr::LOCALHOST,
             &Method::from_bytes(b"SUBSCRIBE").unwrap(),
@@ -226,9 +231,70 @@ fn config(address: SocketAddr) -> Config {
     }
 }
 
+#[derive(Clone)]
+struct Library {
+    catalog: ImmichCatalog,
+    events: Subscriptions,
+}
+
+impl Library {
+    fn new(config: Config, seed: u32) -> (Self, CatalogTask) {
+        let events = Subscriptions::new().unwrap();
+
+        let (catalog, task) =
+            ImmichCatalog::from_parts(config, Ledger::new(seed), events.clone()).unwrap();
+
+        (Self { catalog, events }, task)
+    }
+
+    async fn browse(&self, query: BrowseQuery) -> Result<BrowseResult, Fault> {
+        self.catalog
+            .browse(query, Instant::now() + REFRESH_TIMEOUT)
+            .await
+    }
+
+    async fn system_update_id(&self) -> u32 {
+        self.catalog.system_update_id().await.unwrap()
+    }
+
+    async fn inspect<T: Send + 'static>(
+        &self,
+        inspect: impl FnOnce(&mut CatalogTask) -> T + Send + 'static,
+    ) -> T {
+        let (reply, receiver) = oneshot::channel();
+
+        self.catalog
+            .commands
+            .try_send(Command::Inspect(Box::new(move |task| {
+                let _ = reply.send(inspect(task));
+            })))
+            .unwrap_or_else(|_| panic!("test catalog unavailable"));
+
+        receiver.await.unwrap()
+    }
+
+    fn enqueue(&self, query: BrowseQuery, deadline: Instant) -> oneshot::Receiver<RefreshResult> {
+        let (reply, receiver) = oneshot::channel();
+
+        self.catalog
+            .commands
+            .try_send(Command::Browse(Pending {
+                query,
+                deadline,
+                reply,
+                needed: Scope::Root,
+                waiting: false,
+            }))
+            .unwrap_or_else(|_| panic!("catalog unavailable"));
+
+        receiver
+    }
+}
+
 struct Fixture {
-    library: ImmichCatalog,
+    library: Library,
     fake: Fake,
+    task: Mutex<Option<CatalogTask>>,
 }
 
 impl Fixture {
@@ -238,43 +304,59 @@ impl Fixture {
         fake.upstream.lock().unwrap().albums =
             (1..=albums).map(|id| album(id as u128, "Album")).collect();
 
-        let library = ImmichCatalog::from_parts(
-            config(fake.address),
-            Ledger::new(1),
-            Subscriptions::new().unwrap(),
-        )
-        .unwrap();
+        let (library, task) = Library::new(config(fake.address), 1);
 
-        Self { library, fake }
-    }
-
-    fn run(&self) -> JoinHandle<Result<()>> {
-        let library = self.library.clone();
-
-        tokio::spawn(async move { library.run().await })
-    }
-
-    fn expire(&self, scope: Scope) {
-        let mut state = self.library.inner.state.lock().unwrap();
-
-        match scope {
-            Scope::Root => state.cache.root.as_mut().unwrap().completed -= FRESHNESS,
-
-            Scope::Album(id) => state.cache.albums.get_mut(&id).unwrap().completed -= FRESHNESS,
+        Self {
+            library,
+            fake,
+            task: Mutex::new(Some(task)),
         }
     }
 
-    fn revisions(&self) -> Arc<Ledger> {
-        self.library.inner.state.lock().unwrap().ledger.clone()
+    fn run(&self) -> JoinHandle<Result<()>> {
+        let task = self.task.lock().unwrap().take().unwrap();
+
+        tokio::spawn(task.run())
+    }
+
+    fn gate(&self, scope: Scope) -> Arc<Barrier> {
+        let barrier = Barrier::new();
+
+        self.fake
+            .upstream
+            .lock()
+            .unwrap()
+            .gates
+            .insert(scope, barrier.clone());
+
+        barrier
+    }
+
+    async fn expire(&self, scope: Scope) {
+        self.library
+            .inspect(move |task| {
+                let state = &mut task.state;
+
+                match scope {
+                    Scope::Root => state.cache.root.as_mut().unwrap().completed -= FRESHNESS,
+
+                    Scope::Album(id) => {
+                        state.cache.albums.get_mut(&id).unwrap().completed -= FRESHNESS
+                    }
+                }
+            })
+            .await;
+    }
+
+    async fn revisions(&self) -> Arc<Ledger> {
+        self.library.inspect(|task| task.state.ledger.clone()).await
     }
 
     async fn abort(&self, task: JoinHandle<Result<()>>) {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
 
-        assert!(self.library.inner.state.lock().unwrap().flights.is_empty());
-
-        assert_eq!(self.library.inner.permits.available_permits(), REFRESHES);
+        assert_eq!(self.library.catalog.system_update_id().await, Err(FAILED));
     }
 }
 
@@ -318,10 +400,7 @@ fn children(id: u128) -> BrowseQuery {
     )
 }
 
-fn spawn_browse(
-    library: &ImmichCatalog,
-    query: BrowseQuery,
-) -> JoinHandle<Result<BrowseResult, Fault>> {
+fn spawn_browse(library: &Library, query: BrowseQuery) -> JoinHandle<Result<BrowseResult, Fault>> {
     let library = library.clone();
 
     tokio::spawn(async move { library.browse(query).await })
@@ -383,7 +462,7 @@ async fn shared_asset_keeps_album_identity_and_asset_only_resources() {
         ]
     );
 
-    let ledger = fixture.revisions();
+    let ledger = fixture.revisions().await;
     let first_digest = ledger.albums[&Uuid::from_u128(1)].contents_digest.unwrap();
     let second_digest = ledger.albums[&Uuid::from_u128(2)].contents_digest.unwrap();
     assert_ne!(first_digest, second_digest);
@@ -395,13 +474,13 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
     let mut fixture = Fixture::new(2).await;
     let task = fixture.run();
 
-    let events = tokio::spawn(fixture.library.inner.events.clone().run());
+    let events = tokio::spawn(fixture.library.events.clone().run());
 
     fixture.fake.subscribe(&fixture.library);
     fixture.fake.event(1).await;
 
     for _ in 0..5 {
-        assert_eq!(fixture.library.system_update_id(), 1);
+        assert_eq!(fixture.library.system_update_id().await, 1);
     }
 
     assert!(fixture.fake.upstream.lock().unwrap().requests.is_empty());
@@ -409,7 +488,7 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
 
     fault(spawn_browse(&fixture.library, metadata_query("0")), 501).await;
 
-    assert_eq!(fixture.library.system_update_id(), 1);
+    assert_eq!(fixture.library.system_update_id().await, 1);
     fixture.fake.upstream.lock().unwrap().outage = false;
 
     let root = fixture.library.browse(metadata_query("0")).await.unwrap();
@@ -436,10 +515,10 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
     assert_eq!(metadata.total_matches, 1);
     assert!(metadata.objects[0].child_count().is_none());
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
-    fixture.expire(Scope::Root);
+    fixture.expire(Scope::Root).await;
     fixture.fake.upstream.lock().unwrap().outage = true;
     fault(spawn_browse(&fixture.library, children(1)), 501).await;
-    assert_eq!(fixture.library.system_update_id(), 2);
+    assert_eq!(fixture.library.system_update_id().await, 2);
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
     events.abort();
     assert!(events.await.unwrap_err().is_cancelled());
@@ -461,9 +540,9 @@ async fn album_latest_date_refresh_reorders_and_publishes_without_loading_conten
     let request = || page_query("0", 0, 0, SortOrder::Catalog);
     let before = fixture.library.browse(request()).await.unwrap();
     assert_eq!(before.objects[0].title, "Z");
-    let revisions = fixture.revisions();
+    let revisions = fixture.revisions().await;
 
-    let events = tokio::spawn(fixture.library.inner.events.clone().run());
+    let events = tokio::spawn(fixture.library.events.clone().run());
 
     fixture.fake.subscribe(&fixture.library);
     fixture.fake.event(before.update_id).await;
@@ -474,13 +553,13 @@ async fn album_latest_date_refresh_reorders_and_publishes_without_loading_conten
     assert_eq!(cached.objects, before.objects);
     assert_eq!(cached.update_id, before.update_id);
     assert_eq!(fixture.fake.calls("/api/albums"), 1);
-    fixture.expire(Scope::Root);
+    fixture.expire(Scope::Root).await;
     let after = fixture.library.browse(request()).await.unwrap();
     assert_eq!(after.objects[0].title, "A");
     assert_eq!(after.objects[1], before.objects[0]);
     assert_eq!(after.update_id, before.update_id + 1);
     fixture.fake.event(after.update_id).await;
-    let changed = fixture.revisions();
+    let changed = fixture.revisions().await;
     assert_eq!(changed.system_update_id, after.update_id);
     let id = Uuid::from_u128(1);
 
@@ -497,11 +576,11 @@ async fn album_latest_date_refresh_reorders_and_publishes_without_loading_conten
     assert!(changed.albums.values().all(|a| a.contents_digest.is_none()));
 
     fixture.fake.upstream.lock().unwrap().albums.reverse();
-    fixture.expire(Scope::Root);
+    fixture.expire(Scope::Root).await;
     let same = fixture.library.browse(request()).await.unwrap();
     assert_eq!(same.objects, after.objects);
     assert_eq!(same.update_id, after.update_id);
-    assert_eq!(fixture.revisions(), changed);
+    assert_eq!(fixture.revisions().await, changed);
     assert_eq!(fixture.fake.calls("/api/albums"), 3);
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
     events.abort();
@@ -658,7 +737,7 @@ async fn item_browse_validates_album_membership_and_returns_the_system_revision(
         .await
         .unwrap();
 
-    assert_eq!(metadata.update_id, fixture.library.system_update_id());
+    assert_eq!(metadata.update_id, fixture.library.system_update_id().await);
     assert_eq!(metadata.total_matches, 1);
 
     fault(
@@ -697,53 +776,45 @@ async fn item_browse_validates_album_membership_and_returns_the_system_revision(
 async fn expiry_and_lru_refill_preserve_revisions_without_events() {
     let mut fixture = Fixture::new(2).await;
 
+    let task = fixture.run();
     fixture
         .library
-        .inner
-        .state
-        .lock()
-        .unwrap()
-        .cache
-        .album_limit = 1;
-
-    let task = fixture.run();
+        .inspect(|task| task.state.cache.album_limit = 1)
+        .await;
     fixture.library.browse(children(1)).await.unwrap();
     fixture.library.browse(children(2)).await.unwrap();
 
-    assert!(
-        !fixture
-            .library
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .cache
-            .albums
-            .contains_key(&Uuid::from_u128(1))
-    );
+    fixture
+        .library
+        .inspect(|task| assert!(!task.state.cache.albums.contains_key(&Uuid::from_u128(1))))
+        .await;
 
-    let before = fixture.revisions();
+    let before = fixture.revisions().await;
 
-    let events = tokio::spawn(fixture.library.inner.events.clone().run());
+    let events = tokio::spawn(fixture.library.events.clone().run());
 
     fixture.fake.subscribe(&fixture.library);
     fixture.fake.event(before.system_update_id).await;
     fixture.library.browse(children(1)).await.unwrap();
-    assert_eq!(fixture.revisions(), before);
-    fixture.expire(Scope::Root);
-    fixture.expire(Scope::Album(Uuid::from_u128(1)));
+    assert_eq!(fixture.revisions().await, before);
+    fixture.expire(Scope::Root).await;
+    fixture.expire(Scope::Album(Uuid::from_u128(1))).await;
 
-    let expired =
-        fixture.library.inner.state.lock().unwrap().cache.albums[&Uuid::from_u128(1)].completed;
+    let expired = fixture
+        .library
+        .inspect(|task| task.state.cache.albums[&Uuid::from_u128(1)].completed)
+        .await;
 
     fixture.library.browse(children(1)).await.unwrap();
 
-    assert!(
-        fixture.library.inner.state.lock().unwrap().cache.albums[&Uuid::from_u128(1)].completed
-            > expired
-    );
+    fixture
+        .library
+        .inspect(move |task| {
+            assert!(task.state.cache.albums[&Uuid::from_u128(1)].completed > expired)
+        })
+        .await;
 
-    assert_eq!(fixture.revisions(), before);
+    assert_eq!(fixture.revisions().await, before);
     let calls = fixture.fake.upstream.lock().unwrap().requests.len();
     fixture.fake.upstream.lock().unwrap().outage = true;
     fixture.library.browse(children(1)).await.unwrap();
@@ -779,55 +850,63 @@ async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
     fixture.library.browse(children(1)).await.unwrap();
     fixture.library.browse(children(2)).await.unwrap();
 
-    let (root_bytes, contents_bytes) = {
-        let mut state = fixture.library.inner.state.lock().unwrap();
-        let root_bytes = state.cache.root.as_ref().unwrap().snapshot.bytes;
-        let contents_bytes = state.cache.albums[&Uuid::from_u128(1)].snapshot.bytes;
-        state.cache.byte_limit = root_bytes + 2 * contents_bytes;
-        assert_eq!(state.cache.albums.len(), 2);
-        assert_eq!(state.ledger.albums.len(), 2);
+    let (root_bytes, contents_bytes) = fixture
+        .library
+        .inspect(|task| {
+            let state = &mut task.state;
+            let root_bytes = state.cache.root.as_ref().unwrap().snapshot.bytes;
+            let contents_bytes = state.cache.albums[&Uuid::from_u128(1)].snapshot.bytes;
+            state.cache.byte_limit = root_bytes + 2 * contents_bytes;
+            assert_eq!(state.cache.albums.len(), 2);
+            assert_eq!(state.ledger.albums.len(), 2);
 
-        assert!(
-            state
-                .cache
-                .albums
-                .values()
-                .all(|a| a.snapshot.bytes == contents_bytes)
-        );
+            assert!(
+                state
+                    .cache
+                    .albums
+                    .values()
+                    .all(|a| a.snapshot.bytes == contents_bytes)
+            );
 
-        assert!(
-            state
-                .ledger
-                .albums
-                .values()
-                .all(|album| album.contents_digest.is_some())
-        );
+            assert!(
+                state
+                    .ledger
+                    .albums
+                    .values()
+                    .all(|album| album.contents_digest.is_some())
+            );
 
-        (root_bytes, contents_bytes)
-    };
+            (root_bytes, contents_bytes)
+        })
+        .await;
 
-    let before = fixture.revisions();
+    let before = fixture.revisions().await;
     fixture.fake.upstream.lock().unwrap().albums[0]["albumName"] = json!("Albums");
-    fixture.expire(Scope::Root);
+    fixture.expire(Scope::Root).await;
 
     fixture.library.browse(metadata_query("0")).await.unwrap();
 
-    {
-        let state = fixture.library.inner.state.lock().unwrap();
-        let grown_bytes = state.cache.root.as_ref().unwrap().snapshot.bytes;
-        assert_eq!(grown_bytes, root_bytes + 1);
-        assert!(grown_bytes + contents_bytes <= state.cache.byte_limit);
-        assert!(grown_bytes + 2 * contents_bytes > state.cache.byte_limit);
-        assert_eq!(state.cache.albums.len(), 1);
-        assert!(!state.cache.albums.contains_key(&Uuid::from_u128(1)));
-        assert_eq!(state.ledger.albums.len(), 2);
+    let retained = before.clone();
 
-        for (id, album) in &state.ledger.albums {
-            assert_eq!(album.contents_digest, before.albums[id].contents_digest);
-        }
-    }
+    fixture
+        .library
+        .inspect(move |task| {
+            let state = &task.state;
+            let grown_bytes = state.cache.root.as_ref().unwrap().snapshot.bytes;
+            assert_eq!(grown_bytes, root_bytes + 1);
+            assert!(grown_bytes + contents_bytes <= state.cache.byte_limit);
+            assert!(grown_bytes + 2 * contents_bytes > state.cache.byte_limit);
+            assert_eq!(state.cache.albums.len(), 1);
+            assert!(!state.cache.albums.contains_key(&Uuid::from_u128(1)));
+            assert_eq!(state.ledger.albums.len(), 2);
 
-    let grown = fixture.revisions();
+            for (id, album) in &state.ledger.albums {
+                assert_eq!(album.contents_digest, retained.albums[id].contents_digest);
+            }
+        })
+        .await;
+
+    let grown = fixture.revisions().await;
     assert_eq!(grown.system_update_id, before.system_update_id + 1);
 
     assert_eq!(
@@ -841,7 +920,7 @@ async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
     );
 
     fixture.library.browse(children(1)).await.unwrap();
-    assert_eq!(fixture.revisions(), grown);
+    assert_eq!(fixture.revisions().await, grown);
     fixture.abort(task).await;
 }
 
@@ -851,9 +930,9 @@ async fn metadata_contents_have_independent_counters_and_restart_forgets_history
     let task = fixture.run();
     fixture.library.browse(children(1)).await.unwrap();
     fixture.library.browse(children(2)).await.unwrap();
-    let before = fixture.revisions();
+    let before = fixture.revisions().await;
     fixture.fake.upstream.lock().unwrap().albums[0]["albumName"] = json!("Renamed");
-    fixture.expire(Scope::Root);
+    fixture.expire(Scope::Root).await;
 
     let result = fixture
         .library
@@ -861,7 +940,7 @@ async fn metadata_contents_have_independent_counters_and_restart_forgets_history
         .await
         .unwrap();
 
-    let renamed = fixture.revisions();
+    let renamed = fixture.revisions().await;
     assert_eq!(result.objects[0].title, "Renamed");
     assert_eq!(renamed.system_update_id, before.system_update_id + 1);
 
@@ -885,82 +964,182 @@ async fn metadata_contents_have_independent_counters_and_restart_forgets_history
         .contents
         .insert(Uuid::from_u128(1), vec![item(1, None, None)]);
 
-    fixture.expire(Scope::Album(Uuid::from_u128(1)));
+    fixture.expire(Scope::Album(Uuid::from_u128(1))).await;
     fixture.library.browse(children(1)).await.unwrap();
     fixture.abort(task).await;
-    fixture.library = ImmichCatalog::from_parts(
-        config(fixture.fake.address),
-        Ledger::new(0),
-        Subscriptions::new().unwrap(),
-    )
-    .unwrap();
+    let (library, task) = Library::new(config(fixture.fake.address), 0);
+    fixture.library = library;
+    *fixture.task.lock().unwrap() = Some(task);
 
     let task = fixture.run();
-    assert_eq!(fixture.library.system_update_id(), 0);
-    assert!(fixture.revisions().albums.is_empty());
+    assert_eq!(fixture.library.system_update_id().await, 0);
+    assert!(fixture.revisions().await.albums.is_empty());
 
     fixture.library.browse(children(1)).await.unwrap();
     fixture.library.browse(children(2)).await.unwrap();
-    assert_eq!(fixture.library.system_update_id(), 3);
-    assert_eq!(fixture.revisions().albums[&Uuid::from_u128(1)].update_id, 1);
+    assert_eq!(fixture.library.system_update_id().await, 3);
+    assert_eq!(
+        fixture.revisions().await.albums[&Uuid::from_u128(1)].update_id,
+        1
+    );
     assert_eq!(fixture.fake.calls("/api/server/version"), 2);
     fixture.abort(task).await;
 }
 
 #[tokio::test]
-async fn shared_flights_survive_callers_and_four_scopes_reject_without_backlog() {
+async fn serial_shared_refreshes_survive_callers_and_keep_local_reads_live() {
     let fixture = Fixture::new(5).await;
     let task = fixture.run();
-
     fixture.library.browse(metadata_query("0")).await.unwrap();
-
-    let mut callers = Vec::new();
-    let mut gates = Vec::new();
-
-    for id in 1..=4 {
-        let barrier = Barrier::new();
-
-        fixture
-            .fake
-            .upstream
-            .lock()
-            .unwrap()
-            .gates
-            .insert(Scope::Album(Uuid::from_u128(id)), barrier.clone());
-
-        callers.push(spawn_browse(&fixture.library, children(id)));
-        barrier.entered().await;
-        gates.push(barrier);
-    }
-
-    let mut short_waiter = Box::pin(fixture.library.browse(children(1)));
-    assert!(futures_util::poll!(&mut short_waiter).is_pending());
+    let barrier = fixture.gate(Scope::Album(Uuid::from_u128(1)));
+    let first = spawn_browse(&fixture.library, children(1));
+    barrier.entered().await;
     let mut independent = Box::pin(fixture.library.browse(children(1)));
     assert!(futures_util::poll!(&mut independent).is_pending());
-    drop(short_waiter);
-    callers.remove(0).abort();
-    assert_eq!(fixture.library.inner.permits.available_permits(), 0);
-    fault(spawn_browse(&fixture.library, children(5)), 501).await;
-    assert_eq!(fixture.fake.calls("/api/search/metadata"), 4);
-
-    for gate in gates {
-        gate.release.add_permits(1);
-    }
-
+    first.abort();
+    assert!(first.await.err().unwrap().is_cancelled());
+    let second = spawn_browse(&fixture.library, children(2));
+    assert_eq!(fixture.library.system_update_id().await, 2);
+    fixture.library.browse(metadata_query("0")).await.unwrap();
+    assert_eq!(fixture.fake.calls("/api/search/metadata"), 1);
+    assert!(!second.is_finished());
+    barrier.release.add_permits(1);
     independent.await.unwrap();
+    second.await.unwrap().unwrap();
+    fixture.library.browse(children(1)).await.unwrap();
+    assert_eq!(fixture.fake.calls("/api/search/metadata"), 2);
+    assert_eq!(fixture.library.system_update_id().await, 4);
+    fixture.abort(task).await;
+}
 
-    for caller in callers {
-        caller.await.unwrap().unwrap();
+#[tokio::test]
+async fn pending_bounds_prune_cancelled_and_expired_demand_without_fetching_it() {
+    let fixture = Fixture::new(3).await;
+    let task = fixture.run();
+    fixture.library.browse(metadata_query("0")).await.unwrap();
+    let gate = fixture.gate(Scope::Album(Uuid::from_u128(1)));
+    let first = spawn_browse(&fixture.library, children(1));
+    gate.entered().await;
+    let mut replies = Vec::new();
+
+    for _ in 1..REQUESTS {
+        replies.push(
+            fixture
+                .library
+                .enqueue(children(2), Instant::now() + REFRESH_TIMEOUT),
+        );
     }
 
-    assert_eq!(fixture.fake.calls("/api/search/metadata"), 4);
-    fixture.library.browse(children(1)).await.unwrap();
-    assert_eq!(fixture.fake.calls("/api/search/metadata"), 4);
-    fixture.library.browse(children(5)).await.unwrap();
-    assert_eq!(fixture.fake.calls("/api/search/metadata"), 5);
-    assert_eq!(fixture.library.system_update_id(), 7);
-
+    assert_eq!(
+        fixture.library.inspect(|task| task.pending.len()).await,
+        REQUESTS
+    );
+    fixture.library.browse(metadata_query("0")).await.unwrap();
+    fault(spawn_browse(&fixture.library, children(3)), 501).await;
+    replies.clear();
+    let expired = fixture.library.enqueue(children(2), Instant::now());
+    assert_eq!(expired.await.unwrap().err(), Some(FAILED));
+    let later = fixture
+        .library
+        .enqueue(children(3), Instant::now() + REFRESH_TIMEOUT);
+    assert_eq!(fixture.library.inspect(|task| task.pending.len()).await, 2);
+    gate.release.add_permits(1);
+    first.await.unwrap().unwrap();
+    assert!(later.await.unwrap().is_ok());
+    assert_eq!(fixture.fake.calls("/api/search/metadata"), 2);
+    assert!(
+        fixture.revisions().await.albums[&Uuid::from_u128(2)]
+            .contents_digest
+            .is_none()
+    );
     fixture.abort(task).await;
+}
+
+#[tokio::test]
+async fn one_failed_attempt_replies_to_all_waiters_and_next_request_can_recover() {
+    let fixture = Fixture::new(1).await;
+    let task = fixture.run();
+    fixture.library.browse(metadata_query("0")).await.unwrap();
+    fixture.fake.upstream.lock().unwrap().outage = true;
+    let gate = fixture.gate(Scope::Album(Uuid::from_u128(1)));
+    let first = spawn_browse(&fixture.library, children(1));
+    gate.entered().await;
+    let joined = fixture
+        .library
+        .enqueue(children(1), Instant::now() + REFRESH_TIMEOUT);
+    assert_eq!(fixture.library.inspect(|task| task.pending.len()).await, 2);
+    gate.release.add_permits(1);
+    fault(first, 501).await;
+    assert_eq!(joined.await.unwrap().err(), Some(FAILED));
+    assert_eq!(fixture.fake.calls("/api/search/metadata"), 1);
+    fixture.fake.upstream.lock().unwrap().outage = false;
+    gate.release.add_permits(1);
+    fixture.library.browse(children(1)).await.unwrap();
+    assert_eq!(fixture.fake.calls("/api/search/metadata"), 2);
+    fixture.abort(task).await;
+}
+
+#[tokio::test]
+async fn caller_deadline_does_not_cancel_shared_work_or_start_expired_queued_work() {
+    let fixture = Fixture::new(2).await;
+    let task = fixture.run();
+    fixture.library.browse(metadata_query("0")).await.unwrap();
+    let gate = fixture.gate(Scope::Album(Uuid::from_u128(1)));
+    let short = fixture
+        .library
+        .enqueue(children(1), Instant::now() + Duration::from_secs(1));
+    gate.entered().await;
+    let queued = fixture
+        .library
+        .enqueue(children(2), Instant::now() + Duration::from_secs(1));
+    let joined = fixture
+        .library
+        .enqueue(children(1), Instant::now() + REFRESH_TIMEOUT);
+    assert_eq!(fixture.library.inspect(|task| task.pending.len()).await, 3);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(short.await.unwrap().err(), Some(FAILED));
+    assert_eq!(queued.await.unwrap().err(), Some(FAILED));
+    tokio::time::resume();
+    gate.release.add_permits(1);
+    assert!(joined.await.unwrap().is_ok());
+    assert_eq!(fixture.fake.calls("/api/search/metadata"), 1);
+    fixture.abort(task).await;
+}
+
+#[tokio::test]
+async fn full_or_closed_mailbox_fails_without_waiting_to_enqueue() {
+    let fake = Fake::new().await;
+    let (library, task) = Library::new(config(fake.address), 1);
+    let mut replies = Vec::new();
+
+    for _ in 0..REQUESTS {
+        replies.push(library.enqueue(metadata_query("0"), Instant::now() + REFRESH_TIMEOUT));
+    }
+
+    assert_eq!(library.catalog.system_update_id().await, Err(FAILED));
+    assert_eq!(
+        library.browse(metadata_query("0")).await.err(),
+        Some(FAILED)
+    );
+    drop(task);
+
+    for reply in replies {
+        assert!(reply.await.is_err());
+    }
+
+    assert_eq!(library.catalog.system_update_id().await, Err(FAILED));
+    assert!(fake.upstream.lock().unwrap().requests.is_empty());
+}
+
+#[tokio::test]
+async fn expired_publication_leaves_snapshot_and_revisions_untouched() {
+    let fake = Fake::new().await;
+    let (_, mut task) = Library::new(config(fake.address), 1);
+    let candidate = Candidate::Root(task.source.root().await.unwrap());
+    assert!(task.publish(candidate, Instant::now()).is_err());
+    assert!(task.state.cache.root.is_none());
+    assert_eq!(task.state.ledger.system_update_id, 1);
 }
 
 #[tokio::test]
@@ -1018,12 +1197,7 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
     // Stall version checking, album listing, or a later search page.
     for (stage, body_pending) in [(0, true), (1, false), (1, true), (2, false), (2, true)] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let library = ImmichCatalog::from_parts(
-            config(listener.local_addr().unwrap()),
-            Ledger::new(1),
-            Subscriptions::new().unwrap(),
-        )
-        .unwrap();
+        let (library, task) = Library::new(config(listener.local_addr().unwrap()), 1);
 
         tokio::time::pause();
 
@@ -1034,8 +1208,7 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
             }
         });
 
-        let supervised = library.clone();
-        let task = tokio::spawn(async move { supervised.run().await });
+        let task = tokio::spawn(task.run());
         let caller = spawn_browse(&library, children(1));
         let (mut socket, _) = request(&listener, "/api/server/version").await;
 
@@ -1074,7 +1247,7 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
         }
 
         assert!(!caller.is_finished());
-        let before = library.inner.state.lock().unwrap().ledger.clone();
+        let before = library.inspect(|task| task.state.ledger.clone()).await;
 
         // Earlier requests consumed six seconds; a new page gets no new window.
         tokio::time::advance(Duration::from_secs(if stage == 0 { 26 } else { 20 })).await;
@@ -1082,10 +1255,10 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
         clock_guard.abort();
         assert!(clock_guard.await.unwrap_err().is_cancelled());
         fault(caller, 501).await;
-        assert_eq!(library.inner.state.lock().unwrap().ledger, before);
-        assert_eq!(library.inner.permits.available_permits(), REFRESHES);
-
-        assert!(library.inner.state.lock().unwrap().flights.is_empty());
+        assert_eq!(
+            library.inspect(|task| task.state.ledger.clone()).await,
+            before
+        );
 
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), socket.read(&mut [0; 1]))
@@ -1097,233 +1270,82 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
 
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        assert!(library.inner.state.lock().unwrap().flights.is_empty());
-        assert_eq!(library.inner.permits.available_permits(), REFRESHES);
+        assert_eq!(library.catalog.system_update_id().await, Err(FAILED));
         tokio::time::resume();
     }
 }
 
 #[tokio::test]
-async fn whole_permit_covers_projection_and_refresh_timeout_cleans_flight() {
-    let fixture = Fixture::new(1).await;
-    let task = fixture.run();
-
-    fixture.library.browse(metadata_query("0")).await.unwrap();
-
-    let barrier = Barrier::new();
-
-    *fixture.library.inner.prepared.lock().unwrap() =
-        Some((Scope::Album(Uuid::from_u128(1)), barrier.clone()));
-
-    let caller = spawn_browse(&fixture.library, children(1));
-    barrier.entered().await;
-    tokio::time::pause();
-    assert_eq!(fixture.library.inner.permits.available_permits(), 3);
-    let before = fixture.revisions();
-    tokio::time::advance(REFRESH_TIMEOUT + Duration::from_millis(1)).await;
-    tokio::time::resume();
-    fault(caller, 501).await;
-    assert_eq!(fixture.revisions(), before);
-    assert_eq!(fixture.library.inner.permits.available_permits(), 4);
-
-    assert!(
-        fixture
-            .library
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .flights
-            .is_empty()
-    );
-
-    *fixture.library.inner.prepared.lock().unwrap() = None;
-    fixture.library.browse(children(1)).await.unwrap();
-    fixture.abort(task).await;
-}
-
-#[tokio::test]
-async fn stale_unchanged_album_cannot_survive_root_removal_and_reappearance() {
-    let fixture = Fixture::new(1).await;
-    let task = fixture.run();
-    fixture.library.browse(children(1)).await.unwrap();
-    fixture.expire(Scope::Album(Uuid::from_u128(1)));
-    let barrier = Barrier::new();
-
-    *fixture.library.inner.prepared.lock().unwrap() =
-        Some((Scope::Album(Uuid::from_u128(1)), barrier.clone()));
-
-    let caller = spawn_browse(&fixture.library, children(1));
-    barrier.entered().await;
-    fixture.fake.upstream.lock().unwrap().albums.remove(0);
-    fixture.expire(Scope::Root);
-
-    fixture.library.browse(metadata_query("0")).await.unwrap();
-
-    assert!(
-        !fixture
-            .library
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .cache
-            .albums
-            .contains_key(&Uuid::from_u128(1))
-    );
-
-    fixture
-        .fake
-        .upstream
-        .lock()
-        .unwrap()
-        .albums
-        .push(album(1, "Album"));
-
-    fixture.expire(Scope::Root);
-
-    fixture.library.browse(metadata_query("0")).await.unwrap();
-
-    let before = fixture.revisions();
-    barrier.release.add_permits(1);
-    fault(caller, 501).await;
-    assert_eq!(fixture.revisions(), before);
-
-    assert!(
-        !fixture
-            .library
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .cache
-            .albums
-            .contains_key(&Uuid::from_u128(1))
-    );
-
-    *fixture.library.inner.prepared.lock().unwrap() = None;
-    fixture.library.browse(children(1)).await.unwrap();
-    assert_eq!(fixture.revisions(), before);
-    fixture.abort(task).await;
-}
-
-#[tokio::test]
-async fn unrelated_root_and_album_changes_do_not_invalidate_prepared_contents() {
+async fn queued_album_rechecks_root_membership_after_serial_publication() {
     let fixture = Fixture::new(2).await;
     let task = fixture.run();
     fixture.library.browse(children(1)).await.unwrap();
-    fixture.expire(Scope::Album(Uuid::from_u128(1)));
-    let barrier = Barrier::new();
-
-    *fixture.library.inner.prepared.lock().unwrap() =
-        Some((Scope::Album(Uuid::from_u128(1)), barrier.clone()));
-
+    fixture.expire(Scope::Album(Uuid::from_u128(1))).await;
+    let barrier = fixture.gate(Scope::Album(Uuid::from_u128(1)));
     let caller = spawn_browse(&fixture.library, children(1));
     barrier.entered().await;
-
-    let flight = fixture.library.inner.state.lock().unwrap().flights
-        [&Scope::Album(Uuid::from_u128(1))]
-        .clone();
-
-    fixture.fake.upstream.lock().unwrap().albums[1]["albumName"] = json!("Other rename");
-    fixture.expire(Scope::Root);
-    fixture.library.browse(children(2)).await.unwrap();
-    let before = fixture.revisions();
+    fixture.fake.upstream.lock().unwrap().albums.remove(1);
+    fixture.expire(Scope::Root).await;
+    let removed = spawn_browse(&fixture.library, children(2));
+    assert_eq!(fixture.library.system_update_id().await, 3);
+    assert_eq!(fixture.fake.calls("/api/albums"), 1);
     barrier.release.add_permits(1);
     caller.await.unwrap().unwrap();
-    assert_eq!(fixture.revisions(), before);
-    let view = flight.borrow().as_ref().unwrap().as_ref().unwrap().clone();
-    assert_eq!(view.ledger, before);
-
-    assert_eq!(
-        view.root.albums[&Uuid::from_u128(2)].metadata.object.title,
-        "Other rename"
-    );
-
+    fault(removed, 701).await;
+    assert_eq!(fixture.fake.calls("/api/search/metadata"), 2);
+    assert_eq!(fixture.fake.calls("/api/albums"), 2);
+    assert!(!fixture.revisions().await.albums[&Uuid::from_u128(2)].present);
     fixture.abort(task).await;
 }
 
 #[tokio::test]
-async fn preparation_panic_is_fatal_and_supervised_even_without_waiters() {
+async fn task_panic_closes_handles_and_pending_replies() {
     let fixture = Fixture::new(0).await;
     let task = fixture.run();
-    let mut barrier = Barrier::new();
-    Arc::get_mut(&mut barrier).unwrap().panic = true;
-    *fixture.library.inner.prepared.lock().unwrap() = Some((Scope::Root, barrier.clone()));
+    let barrier = fixture.gate(Scope::Root);
     let caller = spawn_browse(&fixture.library, metadata_query("0"));
     barrier.entered().await;
-    caller.abort();
-    barrier.release.add_permits(1);
 
-    assert!(
-        timeout_at(Instant::now() + Duration::from_secs(3), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_err()
+    fixture
+        .library
+        .catalog
+        .commands
+        .try_send(Command::Inspect(Box::new(|_| {
+            panic!("injected task panic")
+        })))
+        .unwrap_or_else(|_| panic!("catalog unavailable"));
+
+    assert!(task.await.unwrap_err().is_panic());
+    fault(caller, 501).await;
+    assert_eq!(
+        fixture.library.catalog.system_update_id().await,
+        Err(FAILED)
     );
-
-    assert!(fixture.library.inner.failure.is_cancelled());
-    assert_eq!(fixture.library.inner.permits.available_permits(), 4);
-
-    assert!(
-        fixture
-            .library
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .flights
-            .is_empty()
-    );
-
-    assert_eq!(fixture.library.system_update_id(), 1);
 }
 
 #[tokio::test]
 async fn abandoned_refresh_completes_and_expiry_alone_never_does_work() {
     let fixture = Fixture::new(0).await;
     let task = fixture.run();
-    let barrier = Barrier::new();
-
-    fixture
-        .fake
-        .upstream
-        .lock()
-        .unwrap()
-        .gates
-        .insert(Scope::Root, barrier.clone());
+    let barrier = fixture.gate(Scope::Root);
 
     let caller = spawn_browse(&fixture.library, metadata_query("0"));
     barrier.entered().await;
     caller.abort();
     let _ = caller.await;
 
-    let mut flight = fixture.library.inner.state.lock().unwrap().flights[&Scope::Root].clone();
     barrier.release.add_permits(1);
-    flight.changed().await.unwrap();
-    assert!(flight.borrow().as_ref().is_some_and(Result::is_ok));
-    assert_eq!(fixture.library.system_update_id(), 2);
-    let before = fixture.revisions();
+    fixture.library.browse(metadata_query("0")).await.unwrap();
+    assert_eq!(fixture.fake.calls("/api/albums"), 1);
+    assert_eq!(fixture.library.system_update_id().await, 2);
+    let before = fixture.revisions().await;
     let calls = fixture.fake.upstream.lock().unwrap().requests.len();
     tokio::time::pause();
     tokio::time::advance(FRESHNESS).await;
     tokio::time::resume();
-    assert_eq!(fixture.library.system_update_id(), 2);
-    assert_eq!(fixture.revisions(), before);
+    assert_eq!(fixture.library.system_update_id().await, 2);
+    assert_eq!(fixture.revisions().await, before);
     assert_eq!(fixture.fake.upstream.lock().unwrap().requests.len(), calls);
-
-    assert!(
-        fixture
-            .library
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .cache
-            .root
-            .is_some()
-    );
 
     fixture.abort(task).await;
 }
@@ -1354,31 +1376,33 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
 
     assert!(futures_util::poll!(&mut metadata_waiter).is_pending());
 
-    // Observe completion without polling either Browse waiter again.
-    let mut flight = fixture.library.inner.state.lock().unwrap().flights
-        [&Scope::Album(Uuid::from_u128(1))]
-        .clone();
+    // A third waiter observes publication without polling the first two again.
+    fixture.library.browse(children(1)).await.unwrap();
 
-    flight.changed().await.unwrap();
+    let (album_id, system_id) = fixture
+        .library
+        .inspect(|task| {
+            let state = &mut task.state;
+            let bytes = state.cache.albums[&Uuid::from_u128(1)].snapshot.bytes;
+            state.cache.byte_limit = state.cache.root.as_ref().unwrap().snapshot.bytes + bytes;
 
-    let (album_id, system_id) = {
-        let mut state = fixture.library.inner.state.lock().unwrap();
-        let bytes = state.cache.albums[&Uuid::from_u128(1)].snapshot.bytes;
-        state.cache.byte_limit = state.cache.root.as_ref().unwrap().snapshot.bytes + bytes;
-
-        (
-            state.ledger.albums[&Uuid::from_u128(1)].update_id,
-            state.ledger.system_update_id,
-        )
-    };
+            (
+                state.ledger.albums[&Uuid::from_u128(1)].update_id,
+                state.ledger.system_update_id,
+            )
+        })
+        .await;
 
     fixture.library.browse(children(2)).await.unwrap();
 
-    {
-        let state = fixture.library.inner.state.lock().unwrap();
-        assert!(state.cache.albums.contains_key(&Uuid::from_u128(2)));
-        assert!(!state.cache.albums.contains_key(&Uuid::from_u128(1)));
-    }
+    fixture
+        .library
+        .inspect(|task| {
+            let state = &task.state;
+            assert!(state.cache.albums.contains_key(&Uuid::from_u128(2)));
+            assert!(!state.cache.albums.contains_key(&Uuid::from_u128(1)));
+        })
+        .await;
 
     let result = children_waiter.await.unwrap();
     assert_eq!(result.total_matches, 1);
@@ -1388,7 +1412,7 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
 
     // Later root removal cannot change the already completed item view.
     fixture.fake.upstream.lock().unwrap().albums.remove(0);
-    fixture.expire(Scope::Root);
+    fixture.expire(Scope::Root).await;
 
     fixture.library.browse(metadata_query("0")).await.unwrap();
 
@@ -1397,23 +1421,27 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
     assert_eq!(metadata.update_id, system_id);
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 2);
 
-    assert!(
-        !fixture.library.inner.state.lock().unwrap().ledger.albums[&Uuid::from_u128(1)].present
-    );
+    assert!(!fixture.revisions().await.albums[&Uuid::from_u128(1)].present);
 
     fixture.abort(task).await;
 }
 
 #[tokio::test]
-async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
+async fn fresh_hits_and_unchanged_refreshes_pin_coherent_views() {
     let fixture = Fixture::new(2).await;
     let task = fixture.run();
     fixture.library.browse(children(1)).await.unwrap();
-    let root_hit = fixture.library.fresh(Scope::Root).await.unwrap();
+    let root_hit = fixture
+        .library
+        .catalog
+        .view(metadata_query("0"), Instant::now() + REFRESH_TIMEOUT)
+        .await
+        .unwrap();
 
     let album_hit = fixture
         .library
-        .fresh(Scope::Album(Uuid::from_u128(1)))
+        .catalog
+        .view(children(1), Instant::now() + REFRESH_TIMEOUT)
         .await
         .unwrap();
 
@@ -1430,7 +1458,7 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
     // Resolution rejects a payload from another scope before rendering any rows.
     for (view, query) in [(&root_hit, children(1)), (&album_hit, children(2))] {
         assert_eq!(
-            view.browse(query, &fixture.library.inner.collator).err(),
+            view.browse(query, &fixture.library.catalog.collator).err(),
             Some(FAILED)
         );
     }
@@ -1442,7 +1470,7 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
         Some(&contents.digest)
     );
 
-    fixture.expire(Scope::Root);
+    fixture.expire(Scope::Root).await;
     let mut root_waiter = Box::pin(fixture.library.browse(metadata_query("0")));
     assert!(futures_util::poll!(&mut root_waiter).is_pending());
 
@@ -1453,12 +1481,11 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
     );
 
     assert!(futures_util::poll!(&mut album_waiter).is_pending());
-    let mut flight = fixture.library.inner.state.lock().unwrap().flights[&Scope::Root].clone();
-    let before = fixture.revisions();
-    flight.changed().await.unwrap();
-    assert_eq!(fixture.revisions(), before);
+    let before = fixture.revisions().await;
+    fixture.library.browse(metadata_query("0")).await.unwrap();
+    assert_eq!(fixture.revisions().await, before);
     fixture.fake.upstream.lock().unwrap().albums.remove(0);
-    fixture.expire(Scope::Root);
+    fixture.expire(Scope::Root).await;
 
     let removed = fixture.library.browse(metadata_query("0")).await.unwrap();
 
@@ -1487,17 +1514,10 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
     assert_eq!(fixture.fake.calls("/api/albums"), 3);
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 1);
 
-    assert!(
-        !fixture
-            .library
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .cache
-            .albums
-            .contains_key(&Uuid::from_u128(1))
-    );
+    fixture
+        .library
+        .inspect(|task| assert!(!task.state.cache.albums.contains_key(&Uuid::from_u128(1))))
+        .await;
 
     fixture.abort(task).await;
 }
@@ -1516,25 +1536,12 @@ async fn failed_album_keeps_successful_root_and_later_requests_recover() {
         .insert(Uuid::from_u128(1), vec![json!({"id": Uuid::from_u128(1)})]);
 
     fault(spawn_browse(&fixture.library, children(1)), 501).await;
-    let root = fixture.revisions();
+    let root = fixture.revisions().await;
     assert_eq!(root.system_update_id, 2);
     assert!(root.albums[&Uuid::from_u128(1)].contents_digest.is_none());
-    assert_eq!(fixture.library.system_update_id(), 2);
+    assert_eq!(fixture.library.system_update_id().await, 2);
 
-    assert!(
-        fixture
-            .library
-            .inner
-            .state
-            .lock()
-            .unwrap()
-            .flights
-            .is_empty()
-    );
-
-    assert_eq!(fixture.library.inner.permits.available_permits(), 4);
-
-    let events = tokio::spawn(fixture.library.inner.events.clone().run());
+    let events = tokio::spawn(fixture.library.events.clone().run());
 
     fixture.fake.subscribe(&fixture.library);
     fixture.fake.event(2).await;

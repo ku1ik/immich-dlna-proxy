@@ -104,10 +104,9 @@ impl Subscriptions {
         })
     }
 
-    /// Publish only durably committed changes, while holding the short catalog
-    /// publication lock after assigning its ledger/snapshot. Initialize with the
-    /// startup ID before discovery or subscription admission. No I/O occurs here,
-    /// and subscription operations never acquire a catalog lock.
+    /// Update pending events synchronously with catalog publication. Initialize
+    /// with the startup ID before discovery or subscription admission. No I/O
+    /// occurs here; registration and publication share only the event-state lock.
     pub(crate) fn publish(&self, id: u32) {
         let mut state = self.state.lock().unwrap();
 

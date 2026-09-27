@@ -24,11 +24,11 @@ struct TestCatalog {
 }
 
 impl Catalog for TestCatalog {
-    fn system_update_id(&self) -> u32 {
-        42
+    async fn system_update_id(&self) -> Result<u32, Fault> {
+        Ok(42)
     }
 
-    async fn browse(&self, arguments: BrowseQuery) -> Result<BrowseResult, Fault> {
+    async fn browse(&self, arguments: BrowseQuery, _: Instant) -> Result<BrowseResult, Fault> {
         self.actions.lock().unwrap().push(arguments);
         self.entered.notify_one();
 

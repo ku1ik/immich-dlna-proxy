@@ -1,25 +1,14 @@
-//! Browse-driven snapshots and process-local revision history.
-//!
-//! Shared refreshes prepare snapshots concurrently, then publish snapshots,
-//! counters, and pending event state under one short lock. Client deadlines only
-//! stop waiting. Restarting forgets history and randomly seeds new counters.
+//! One catalog owner, serial shared refreshes, and process-local revision history.
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-    task::Poll,
-    time::Duration,
-};
+use std::{collections::BTreeMap, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow, ensure};
 use icu_collator::CollatorBorrowed;
 use serde::Serialize;
 use tokio::{
-    sync::{Notify, OwnedSemaphorePermit, Semaphore, watch},
-    task::JoinSet,
+    sync::{mpsc, oneshot},
     time::{Instant, timeout_at},
 };
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{config::Config, eventing::Subscriptions, immich, protocol::Fault};
@@ -31,7 +20,7 @@ mod snapshots;
 
 pub use browse::{ObjectId, parse_id};
 use browse::{Payload, View};
-use revisions::{AlbumRevision, Ledger};
+use revisions::Ledger;
 use snapshots::{Contents, Root, Source};
 
 const FRESHNESS: Duration = Duration::from_secs(60);
@@ -39,15 +28,16 @@ const RESIDENT_ALBUMS: usize = 32;
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ALBUMS: usize = 4_096;
-const REFRESHES: usize = 4;
+const REQUESTS: usize = 8;
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Select, sort and paginate objects, capturing their revision together.
 pub trait Catalog: Send + Sync + 'static {
-    fn system_update_id(&self) -> u32;
+    fn system_update_id(&self) -> impl Future<Output = Result<u32, Fault>> + Send;
     fn browse(
         &self,
         query: BrowseQuery,
+        deadline: Instant,
     ) -> impl Future<Output = Result<BrowseResult, Fault>> + Send;
 }
 
@@ -174,36 +164,70 @@ const _: () = {
 
 #[derive(Clone)]
 pub(crate) struct ImmichCatalog {
-    inner: Arc<Inner>,
+    commands: mpsc::Sender<Command>,
+    collator: Arc<CollatorBorrowed<'static>>,
 }
 
-struct Inner {
-    source: Source,
-    collator: CollatorBorrowed<'static>,
+pub(crate) struct CatalogTask {
+    commands: mpsc::Receiver<Command>,
+    source: Arc<Source>,
     events: Subscriptions,
-    failure: CancellationToken,
-    state: Mutex<State>,
-    permits: Arc<Semaphore>,
-    supervisor: Mutex<Supervisor>,
-    wake: Notify,
-    #[cfg(test)]
-    prepared: Mutex<Option<(Scope, Arc<tests::Barrier>)>>,
+    state: State,
+    pending: Vec<Pending>,
 }
 
-struct Supervisor {
-    tasks: JoinSet<()>,
-    running: bool,
+enum Command {
+    Browse(Pending),
+    SystemUpdateId(oneshot::Sender<u32>),
+    #[cfg(test)]
+    Inspect(Box<dyn FnOnce(&mut CatalogTask) + Send>),
+}
+
+struct Pending {
+    query: BrowseQuery,
+    deadline: Instant,
+    reply: oneshot::Sender<Result<View, Fault>>,
+    needed: Scope,
+    waiting: bool,
+}
+
+struct Refresh {
+    scope: Scope,
+    deadline: Instant,
+    future: Pin<Box<dyn Future<Output = Result<Candidate>> + Send>>,
 }
 
 struct State {
     ledger: Arc<Ledger>,
     cache: Cache,
-    flights: BTreeMap<Scope, watch::Receiver<Option<RefreshResult>>>,
 }
 
 type RefreshResult = Result<View, Fault>;
 
 impl State {
+    fn needed(&self, query: BrowseQuery, now: Instant) -> Result<Option<Scope>, Fault> {
+        if !self.cache.is_fresh(Scope::Root, now) {
+            return Ok(Some(Scope::Root));
+        }
+
+        if let Scope::Album(id) = query.scope() {
+            if !self
+                .ledger
+                .albums
+                .get(&id)
+                .is_some_and(|album| album.present)
+            {
+                return Err(MISSING);
+            }
+
+            if !self.cache.is_fresh(Scope::Album(id), now) {
+                return Ok(Some(Scope::Album(id)));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn view(&self, scope: Scope) -> RefreshResult {
         let payload = match scope {
             Scope::Root => Payload::Root,
@@ -222,7 +246,17 @@ impl State {
     }
 }
 
-// Snapshot residency and freshness; synchronized with the ledger by State's lock.
+impl BrowseQuery {
+    fn scope(self) -> Scope {
+        match (self.object_id, self.mode) {
+            (ObjectId::Album(id), BrowseMode::DirectChildren { .. })
+            | (ObjectId::Item { album: id, .. }, _) => Scope::Album(id),
+            _ => Scope::Root,
+        }
+    }
+}
+
+// Snapshot residency and freshness, owned alongside the revision ledger.
 struct Cache {
     root: Option<Cached<Root>>,
     albums: BTreeMap<Uuid, Cached<Contents>>,
@@ -240,16 +274,16 @@ impl Cache {
         }
     }
 
-    fn is_fresh(&mut self, scope: Scope, now: Instant) -> bool {
+    fn is_fresh(&self, scope: Scope, now: Instant) -> bool {
         match scope {
             Scope::Root => self
                 .root
-                .as_mut()
+                .as_ref()
                 .is_some_and(|cached| cached.is_fresh(now)),
 
             Scope::Album(id) => self
                 .albums
-                .get_mut(&id)
+                .get(&id)
                 .is_some_and(|cached| cached.is_fresh(now)),
         }
     }
@@ -303,16 +337,11 @@ impl Cache {
         }
     }
 
-    fn mark_completed(&mut self, scope: Scope, completed: Instant) {
-        match scope {
-            Scope::Root => self.root.as_mut().unwrap().completed = completed,
-
-            Scope::Album(id) => {
-                self.albums
-                    .get_mut(&id)
-                    .expect("published album remains cached")
-                    .completed = completed;
-            }
+    fn touch(&mut self, scope: Scope, now: Instant) {
+        if let Scope::Album(id) = scope
+            && let Some(cached) = self.albums.get_mut(&id)
+        {
+            cached.used = now;
         }
     }
 }
@@ -324,9 +353,7 @@ struct Cached<T> {
 }
 
 impl<T> Cached<T> {
-    fn is_fresh(&mut self, now: Instant) -> bool {
-        self.used = now;
-
+    fn is_fresh(&self, now: Instant) -> bool {
         now.duration_since(self.completed) < FRESHNESS
     }
 }
@@ -337,77 +364,21 @@ enum Scope {
     Album(Uuid),
 }
 
-enum Token {
-    Root,
-    Album(Uuid, AlbumRevision),
-}
-
-impl Token {
-    fn scope(&self) -> Scope {
-        match self {
-            Self::Root => Scope::Root,
-            Self::Album(id, _) => Scope::Album(*id),
-        }
-    }
-
-    fn applicable(&self, ledger: &Ledger) -> bool {
-        match self {
-            // One root flight exists at a time; only it can change the root digest.
-            Self::Root => true,
-
-            Self::Album(id, revision) => {
-                ledger.albums.get(id) == Some(revision) && revision.present
-            }
-        }
-    }
-}
-
 enum Candidate {
     Root(Root),
     Album(Uuid, Contents),
 }
 
-// Created before spawning, so even cancellation before the first poll cleans up.
-struct Flight {
-    catalog: ImmichCatalog,
-    scope: Scope,
-    sender: watch::Sender<Option<RefreshResult>>,
-    permit: Option<OwnedSemaphorePermit>,
-    result: RefreshResult,
-}
-
-impl Drop for Flight {
-    fn drop(&mut self) {
-        let mut state = self
-            .catalog
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        state.flights.remove(&self.scope);
-        drop(self.permit.take());
-        let result = std::mem::replace(&mut self.result, Err(FAILED));
-        self.sender.send_replace(Some(result));
-        drop(state);
-        self.catalog.inner.wake.notify_one();
-    }
-}
-
-struct Running(ImmichCatalog);
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        self.0.inner.supervisor.lock().unwrap().tasks.abort_all();
-    }
-}
-
 impl ImmichCatalog {
-    pub(crate) fn new(config: Config, events: Subscriptions) -> Result<Self> {
+    pub(crate) fn new(config: Config, events: Subscriptions) -> Result<(Self, CatalogTask)> {
         Self::from_parts(config, Ledger::new(rand::random()), events)
     }
 
-    fn from_parts(config: Config, ledger: Ledger, events: Subscriptions) -> Result<Self> {
+    fn from_parts(
+        config: Config,
+        ledger: Ledger,
+        events: Subscriptions,
+    ) -> Result<(Self, CatalogTask)> {
         let source = Source::new(
             immich::Client::new(config.api_base, config.api_key)?,
             config.listen_address,
@@ -416,216 +387,192 @@ impl ImmichCatalog {
 
         events.publish(ledger.system_update_id);
 
-        Ok(Self {
-            inner: Arc::new(Inner {
-                source,
-                collator: config.collator,
+        let (commands, receiver) = mpsc::channel(REQUESTS);
+
+        Ok((
+            Self {
+                commands,
+                collator: Arc::new(config.collator),
+            },
+            CatalogTask {
+                commands: receiver,
+                source: Arc::new(source),
                 events,
-                failure: CancellationToken::new(),
-                state: Mutex::new(State {
+                state: State {
                     ledger: Arc::new(ledger),
                     cache: Cache::new(),
-                    flights: BTreeMap::new(),
-                }),
-                permits: Arc::new(Semaphore::new(REFRESHES)),
-                supervisor: Mutex::new(Supervisor {
-                    tasks: JoinSet::new(),
-                    running: false,
-                }),
-                wake: Notify::new(),
-                #[cfg(test)]
-                prepared: Mutex::new(None),
-            }),
-        })
+                },
+                pending: Vec::new(),
+            },
+        ))
     }
 
-    /// Supervise refresh tasks and fail after cancelling preparation on task failure.
-    pub(crate) async fn run(&self) -> Result<()> {
-        {
-            let mut supervisor = self.inner.supervisor.lock().unwrap();
-            ensure!(!supervisor.running, "catalog supervisor already started");
-            supervisor.running = true;
+    async fn view(&self, query: BrowseQuery, deadline: Instant) -> RefreshResult {
+        if Instant::now() >= deadline {
+            return Err(FAILED);
         }
 
-        let _running = Running(self.clone());
+        let (reply, receiver) = oneshot::channel();
+
+        self.commands
+            .try_send(Command::Browse(Pending {
+                query,
+                deadline,
+                reply,
+                needed: Scope::Root,
+                waiting: false,
+            }))
+            .map_err(|_| FAILED)?;
+
+        timeout_at(deadline, receiver)
+            .await
+            .map_err(|_| FAILED)?
+            .map_err(|_| FAILED)?
+    }
+}
+
+impl CatalogTask {
+    pub(crate) async fn run(mut self) -> Result<()> {
+        let mut active: Option<Refresh> = None;
 
         loop {
-            let notified = self.inner.wake.notified();
+            self.resolve(active.as_ref().map(|refresh| refresh.scope));
 
-            let finished = std::future::poll_fn(|cx| {
-                let mut supervisor = self.inner.supervisor.lock().unwrap();
+            if active.is_none()
+                && let Some(request) = self.pending.first()
+            {
+                let scope = request.needed;
+                active = Some(self.start(scope));
 
-                // poll_join_next registers a completion waker, including the narrow
-                // interval between Flight::drop and Tokio marking the task finished.
-                match supervisor.tasks.poll_join_next(cx) {
-                    Poll::Ready(Some(result)) => {
-                        if result.is_err() {
-                            self.inner.failure.cancel();
-                        }
-
-                        Poll::Ready(false)
-                    }
-
-                    Poll::Ready(None) if self.inner.failure.is_cancelled() => Poll::Ready(true),
-                    _ => Poll::Pending,
+                for request in &mut self.pending {
+                    request.waiting = request.needed == scope;
                 }
-            });
+            }
+
+            let deadline = self.pending.iter().map(|request| request.deadline).min();
+
+            let finished = async {
+                match active.as_mut() {
+                    Some(refresh) => refresh.future.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            };
 
             tokio::select! {
-                done = finished => {
-                    if done {
-                        return Err(anyhow!("catalog refresh task failed"));
+                command = self.commands.recv() => {
+                    match command.ok_or_else(|| anyhow!("catalog command channel closed"))? {
+                        Command::Browse(request) => {
+                            // Ready views need no waiting slot. Prune cancellations too.
+                            self.pending.push(request);
+                            self.resolve(active.as_ref().map(|refresh| refresh.scope));
+
+                            if self.pending.len() > REQUESTS {
+                                let request = self.pending.pop().unwrap();
+                                let _ = request.reply.send(Err(FAILED));
+                            }
+                        }
+
+                        Command::SystemUpdateId(reply) => {
+                            let _ = reply.send(self.state.ledger.system_update_id);
+                        }
+
+                        #[cfg(test)]
+                        Command::Inspect(inspect) => inspect(&mut self),
                     }
                 }
 
-                _ = notified => {}
+                result = finished => {
+                    let refresh = active.take().unwrap();
+                    let result = result.and_then(|candidate| self.publish(candidate, refresh.deadline));
+
+                    if let Err(error) = &result {
+                        tracing::warn!(scope = ?refresh.scope, %error, "catalog refresh failed");
+                    } else {
+                        tracing::debug!(scope = ?refresh.scope, update_id = self.state.ledger.system_update_id, "catalog refresh completed");
+                    }
+
+                    let mut index = 0;
+
+                    while index < self.pending.len() {
+                        if result.is_err() && self.pending[index].waiting {
+                            let request = self.pending.remove(index);
+                            let _ = request.reply.send(Err(FAILED));
+                        } else {
+                            self.pending[index].waiting = false;
+                            index += 1;
+                        }
+                    }
+                }
+
+                _ = sleep_until(deadline) => {}
             }
         }
     }
 
-    async fn fresh(&self, scope: Scope) -> RefreshResult {
-        let mut receiver = {
-            let mut state = self.inner.state.lock().unwrap();
+    fn resolve(&mut self, active: Option<Scope>) {
+        let now = Instant::now();
+        let mut index = 0;
 
-            if self.inner.failure.is_cancelled() {
-                return Err(FAILED);
-            }
+        while index < self.pending.len() {
+            let request = &mut self.pending[index];
 
-            let now = Instant::now();
-
-            let token = match scope {
-                Scope::Root => Token::Root,
-
-                Scope::Album(id) => {
-                    let revision = state
-                        .ledger
-                        .albums
-                        .get(&id)
-                        .filter(|revision| revision.present)
-                        .copied()
-                        .ok_or(MISSING)?;
-
-                    Token::Album(id, revision)
-                }
-            };
-
-            if state.cache.is_fresh(scope, now) {
-                return state.view(scope);
-            }
-
-            if let Some(receiver) = state.flights.get(&scope) {
-                receiver.clone()
+            let result = if request.reply.is_closed() || now >= request.deadline {
+                Err(FAILED)
             } else {
-                let mut supervisor = self.inner.supervisor.lock().unwrap();
-
-                // Reap on admission too: finished handles cannot accumulate when
-                // Browse traffic runs ahead of the supervisor.
-                while let Some(result) = supervisor.tasks.try_join_next() {
-                    if result.is_err() {
-                        self.inner.failure.cancel();
+                match self.state.needed(request.query, now) {
+                    Ok(Some(scope)) => {
+                        request.needed = scope;
+                        request.waiting |= active == Some(scope);
+                        index += 1;
+                        continue;
                     }
+
+                    Ok(None) => {
+                        self.state.cache.touch(request.query.scope(), now);
+
+                        self.state.view(request.query.scope())
+                    }
+
+                    Err(error) => Err(error),
                 }
+            };
 
-                if self.inner.failure.is_cancelled() {
-                    self.inner.wake.notify_one();
-
-                    return Err(FAILED);
-                }
-
-                let permit = self
-                    .inner
-                    .permits
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| FAILED)?;
-
-                let (sender, receiver) = watch::channel(None);
-                state.flights.insert(scope, receiver.clone());
-
-                let mut flight = Flight {
-                    catalog: self.clone(),
-                    scope,
-                    sender,
-                    permit: Some(permit),
-                    result: Err(FAILED),
-                };
-
-                let deadline = now + REFRESH_TIMEOUT;
-
-                supervisor.tasks.spawn(async move {
-                    flight.result = flight
-                        .catalog
-                        .refresh(token, deadline)
-                        .await
-                        .inspect(|view| {
-                            tracing::debug!(?scope, update_id = view.ledger.system_update_id, elapsed_ms = now.elapsed().as_millis(), "catalog refresh completed");
-                        })
-                        .map_err(|error| {
-                            // Immich and ledger errors contain only sanitized diagnostics.
-                            tracing::warn!(?scope, %error, elapsed_ms = now.elapsed().as_millis(), "catalog refresh failed");
-
-                            FAILED
-                        });
-
-                    drop(flight);
-                });
-
-                self.inner.wake.notify_one();
-
-                receiver
-            }
-        };
-
-        loop {
-            if let Some(result) = receiver.borrow_and_update().clone() {
-                return result;
-            }
-
-            receiver.changed().await.map_err(|_| FAILED)?;
+            let request = self.pending.remove(index);
+            let _ = request.reply.send(result);
         }
     }
 
-    async fn refresh(&self, token: Token, deadline: Instant) -> Result<View> {
-        let scope = token.scope();
+    fn start(&self, scope: Scope) -> Refresh {
+        let source = self.source.clone();
+        let deadline = Instant::now() + REFRESH_TIMEOUT;
 
-        ensure!(
-            !self.inner.failure.is_cancelled() && Instant::now() < deadline,
-            "catalog preparation failed or expired"
-        );
+        let future = Box::pin(async move {
+            ensure!(
+                Instant::now() < deadline,
+                "catalog refresh deadline exceeded"
+            );
 
-        let prepare = async {
-            let candidate = match scope {
-                Scope::Root => Candidate::Root(self.inner.source.root().await?),
-                Scope::Album(id) => Candidate::Album(id, self.inner.source.contents(id).await?),
+            let prepare = async {
+                match scope {
+                    Scope::Root => Ok(Candidate::Root(source.root().await?)),
+                    Scope::Album(id) => Ok(Candidate::Album(id, source.contents(id).await?)),
+                }
             };
 
-            #[cfg(test)]
-            {
-                let barrier = self.inner.prepared.lock().unwrap().clone();
+            timeout_at(deadline, prepare)
+                .await
+                .map_err(|_| anyhow!("catalog refresh deadline exceeded"))?
+        });
 
-                if let Some((at, barrier)) = barrier
-                    && at == scope
-                {
-                    barrier.entered.notify_one();
-                    barrier.release.acquire().await.unwrap().forget();
-                    assert!(!barrier.panic, "injected preparation panic");
-                }
-            }
+        Refresh {
+            scope,
+            deadline,
+            future,
+        }
+    }
 
-            Ok::<_, anyhow::Error>(candidate)
-        };
-
-        let candidate = tokio::select! {
-            biased;
-            _ = self.inner.failure.cancelled() => return Err(anyhow!("catalog preparation cancelled after task failure")),
-
-            result = timeout_at(deadline, prepare) => {
-                result.map_err(|_| anyhow!("catalog refresh deadline exceeded"))??
-            }
-        };
-
-        let mut state = self.inner.state.lock().unwrap();
-        ensure!(token.applicable(&state.ledger), "stale catalog candidate");
+    fn publish(&mut self, candidate: Candidate, deadline: Instant) -> Result<()> {
+        let state = &mut self.state;
 
         let next = match &candidate {
             Candidate::Root(root) => {
@@ -644,8 +591,8 @@ impl ImmichCatalog {
         };
 
         ensure!(
-            !self.inner.failure.is_cancelled() && Instant::now() < deadline,
-            "catalog refresh failed or expired"
+            Instant::now() < deadline,
+            "catalog refresh deadline exceeded"
         );
 
         let changed = next.is_some();
@@ -657,36 +604,35 @@ impl ImmichCatalog {
         state.cache.insert(candidate, Instant::now());
 
         if changed {
-            self.inner.events.publish(state.ledger.system_update_id);
+            self.events.publish(state.ledger.system_update_id);
         }
 
-        let view = state.view(scope).expect("published snapshot is resident");
-        state.cache.mark_completed(scope, Instant::now());
-
-        Ok(view)
+        Ok(())
     }
 }
 
 impl Catalog for ImmichCatalog {
-    fn system_update_id(&self) -> u32 {
-        self.inner.state.lock().unwrap().ledger.system_update_id
+    async fn system_update_id(&self) -> Result<u32, Fault> {
+        let (reply, receiver) = oneshot::channel();
+
+        self.commands
+            .try_send(Command::SystemUpdateId(reply))
+            .map_err(|_| FAILED)?;
+
+        receiver.await.map_err(|_| FAILED)
     }
 
-    async fn browse(&self, query: BrowseQuery) -> Result<BrowseResult, Fault> {
-        let id = query.object_id;
-        let mut view = self.fresh(Scope::Root).await?;
+    async fn browse(&self, query: BrowseQuery, deadline: Instant) -> Result<BrowseResult, Fault> {
+        let view = self.view(query, deadline).await?;
 
-        match id {
-            ObjectId::Album(album) if matches!(query.mode, BrowseMode::DirectChildren { .. }) => {
-                view = self.fresh(Scope::Album(album)).await?
-            }
+        view.browse(query, &self.collator)
+    }
+}
 
-            ObjectId::Item { album, .. } => view = self.fresh(Scope::Album(album)).await?,
-
-            _ => {}
-        }
-
-        view.browse(query, &self.inner.collator)
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 

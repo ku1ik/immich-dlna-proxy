@@ -42,11 +42,11 @@ impl Write for Capture {
 struct TestCatalog;
 
 impl Catalog for TestCatalog {
-    fn system_update_id(&self) -> u32 {
-        42
+    async fn system_update_id(&self) -> Result<u32, Fault> {
+        Ok(42)
     }
 
-    async fn browse(&self, _: BrowseQuery) -> Result<BrowseResult, Fault> {
+    async fn browse(&self, _: BrowseQuery, _: tokio::time::Instant) -> Result<BrowseResult, Fault> {
         Ok(BrowseResult {
             objects: vec![Object {
                 kind: immich_dlna_proxy::catalog::ObjectKind::Root {

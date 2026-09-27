@@ -23,18 +23,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let uuid = config.server_uuid;
     let name = config.friendly_name.clone();
     let interface_index = config.interface_index;
-    let catalog = ImmichCatalog::new(config, events.clone())?;
+    let (catalog, catalog_task) = ImmichCatalog::new(config, events.clone())?;
 
     let http = TcpListener::bind(address)
         .await
         .context("cannot bind configured HTTP listener")?;
 
     let discovery = Discovery::bind(interface_index, uuid, address)?;
-    let server = Server::new(name, uuid, catalog.clone(), media, events.clone());
+    let server = Server::new(name, uuid, catalog, media, events.clone());
     tracing::info!(%address, %uuid, "service started");
 
     let (name, result) = tokio::select! {
-        result = catalog.run() => ("catalog", result),
+        result = catalog_task.run() => ("catalog", result),
 
         result = events.run() => ("eventing", result),
 
