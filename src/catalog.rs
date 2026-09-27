@@ -81,7 +81,7 @@ pub struct BrowseResult {
 }
 
 /// Complete projected metadata; callers own filtering and wire serialization.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Object {
     pub kind: ObjectKind,
     pub title: String,
@@ -89,7 +89,7 @@ pub struct Object {
     pub art: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum ObjectKind {
     Root {
         child_count: Option<usize>,
@@ -151,32 +151,6 @@ impl Object {
             ObjectKind::Root { .. } | ObjectKind::Album { .. } => &[],
             ObjectKind::Photo { resources, .. } | ObjectKind::Video { resources, .. } => resources,
         }
-    }
-}
-
-// Keep the canonical projection stable independently of the in-memory model.
-impl Serialize for Object {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-
-        let mut object = serializer.serialize_struct("Object", 8)?;
-        object.serialize_field("id", &self.id().to_string())?;
-
-        object.serialize_field(
-            "parent_id",
-            &self
-                .parent_id()
-                .map_or_else(|| "-1".into(), |id| id.to_string()),
-        )?;
-
-        object.serialize_field("title", &self.title)?;
-        object.serialize_field("class", self.class())?;
-        object.serialize_field("date", &self.date)?;
-        object.serialize_field("art", &self.art)?;
-        object.serialize_field("child_count", &self.child_count())?;
-        object.serialize_field("resources", self.resources())?;
-
-        object.end()
     }
 }
 
