@@ -119,6 +119,7 @@ impl FakeServer {
         MediaProxy::new(
             self.base.as_str().parse().unwrap(),
             HeaderValue::from_static("test-secret"),
+            Activity::default(),
         )
         .unwrap()
     }
@@ -163,6 +164,7 @@ fn proxy_for(listener: &TcpListener) -> MediaProxy {
             .parse()
             .unwrap(),
         HeaderValue::from_static("test-secret"),
+        Activity::default(),
     )
     .unwrap()
 }
@@ -963,6 +965,9 @@ async fn immediate_admission_is_shared_by_clones_and_body_drop_releases_permits(
     }
 
     assert_eq!(proxy.operations.available_permits(), 0);
+    let activity = proxy.activity.subscribe();
+    assert_eq!(activity.borrow().media, OPERATIONS);
+    let before_overload = activity.borrow().last;
 
     let overloaded = tokio::time::timeout(
         Duration::from_millis(100),
@@ -972,9 +977,11 @@ async fn immediate_admission_is_shared_by_clones_and_body_drop_releases_permits(
     .unwrap();
 
     assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(activity.borrow().last, before_overload);
     assert!(server.requests.try_recv().is_err());
     drop(responses.pop());
     assert_eq!(proxy.operations.available_permits(), 1);
+    assert_eq!(activity.borrow().media, OPERATIONS - 1);
 
     let result = proxy
         .serve(ASSET, "original", Method::HEAD, HeaderMap::new())
@@ -982,9 +989,18 @@ async fn immediate_admission_is_shared_by_clones_and_body_drop_releases_permits(
 
     assert_eq!(result.status(), StatusCode::OK);
     assert_eq!(proxy.operations.available_permits(), 1);
+    assert_eq!(activity.borrow().media, OPERATIONS - 1);
     drop(responses);
 
     assert_eq!(proxy.operations.available_permits(), OPERATIONS);
+    assert_eq!(activity.borrow().media, 0);
+    assert_eq!(
+        activity.borrow().idle_deadline(),
+        activity
+            .borrow()
+            .last
+            .map(|last| last + crate::activity::IDLE_TIMEOUT)
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1014,11 +1030,15 @@ async fn completion_truncation_and_read_timeout_release_body_permits() {
         assert_eq!(result.status(), StatusCode::OK);
 
         assert_eq!(proxy.operations.available_permits(), OPERATIONS - 1);
+        let activity = proxy.activity.subscribe();
+        assert_eq!(activity.borrow().media, 1);
 
         let body = to_bytes(result.into_body(), 1024).await;
         assert_eq!(body.is_ok(), succeeds);
 
         assert_eq!(proxy.operations.available_permits(), OPERATIONS);
+        assert_eq!(activity.borrow().media, 0);
+        assert_eq!(activity.borrow().last, Some(Instant::now()));
     }
 }
 
@@ -1270,6 +1290,8 @@ async fn header_deadline_and_request_cancellation_release_admission() {
 
     assert_eq!(result.status(), StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(proxy.operations.available_permits(), OPERATIONS);
+    let activity = proxy.activity.subscribe();
+    assert_eq!(activity.borrow().media, 0);
 
     server.request().await;
 
@@ -1284,11 +1306,14 @@ async fn header_deadline_and_request_cancellation_release_admission() {
     server.request().await;
 
     assert_eq!(proxy.operations.available_permits(), OPERATIONS - 1);
+    assert_eq!(activity.borrow().media, 1);
 
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
 
     assert_eq!(proxy.operations.available_permits(), OPERATIONS);
+    assert_eq!(activity.borrow().media, 0);
+    assert_eq!(activity.borrow().last, Some(Instant::now()));
 }
 
 #[tokio::test]
@@ -1338,11 +1363,12 @@ async fn head_rejects_unsolicited_partial_response_without_get_fallback() {
 #[tokio::test(start_paused = true)]
 async fn healthy_streams_have_progress_timeout_not_total_deadline() {
     let reply = Reply {
-        chunks: vec![
-            (Duration::from_secs(59), "1\r\nb\r\n".into()),
-            (Duration::from_secs(59), "1\r\nc\r\n".into()),
-            (Duration::from_secs(59), "0\r\n\r\n".into()),
-        ],
+        chunks: std::iter::repeat_n((Duration::from_secs(59), "1\r\nb\r\n".into()), 11)
+            .chain(std::iter::once((
+                Duration::from_secs(59),
+                "0\r\n\r\n".into(),
+            )))
+            .collect(),
         ..Reply::new(
             "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\na\r\n",
         )
@@ -1350,6 +1376,7 @@ async fn healthy_streams_have_progress_timeout_not_total_deadline() {
 
     let server = FakeServer::new(vec![reply]).await;
     let proxy = server.proxy();
+    let activity = proxy.activity.subscribe();
 
     let result = proxy
         .serve(ASSET, "preview", Method::GET, HeaderMap::new())
@@ -1360,11 +1387,56 @@ async fn healthy_streams_have_progress_timeout_not_total_deadline() {
 
     assert_eq!(proxy.operations.available_permits(), OPERATIONS - 1);
 
-    assert_eq!(stream.next().await.unwrap().unwrap(), "b");
-    assert_eq!(stream.next().await.unwrap().unwrap(), "c");
+    for _ in 0..11 {
+        assert_eq!(stream.next().await.unwrap().unwrap(), "b");
+        assert_eq!(activity.borrow().media, 1);
+        assert!(activity.borrow().active(Instant::now()));
+    }
+
     assert!(stream.next().await.is_none());
 
     assert_eq!(proxy.operations.available_permits(), OPERATIONS);
+    assert_eq!(activity.borrow().media, 0);
+    assert_eq!(activity.borrow().last, Some(Instant::now()));
+}
+
+#[tokio::test]
+async fn rejected_media_does_not_report_activity_and_bodyless_outcomes_release_it() {
+    let server = FakeServer::new(vec![Reply::new(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )])
+    .await;
+
+    let proxy = server.proxy();
+    let activity = proxy.activity.subscribe();
+
+    for (id, route, method) in [
+        ("invalid", "original", Method::GET),
+        (ASSET, "invalid", Method::GET),
+        (ASSET, "original", Method::POST),
+    ] {
+        assert!(
+            !proxy
+                .serve(id, route, method, HeaderMap::new())
+                .await
+                .status()
+                .is_success()
+        );
+        assert_eq!(activity.borrow().last, None);
+        assert_eq!(activity.borrow().media, 0);
+    }
+
+    for method in [Method::HEAD, Method::GET] {
+        assert_eq!(
+            proxy
+                .serve(ASSET, "original", method, HeaderMap::new())
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(activity.borrow().last.is_some());
+        assert_eq!(activity.borrow().media, 0);
+    }
 }
 
 #[tokio::test]

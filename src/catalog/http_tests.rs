@@ -40,8 +40,9 @@ async fn browse_http(client: &reqwest::Client, base: &str, album: Uuid) -> Strin
     response.text().await.unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn browse_resources_and_published_revisions_connect_over_http() {
+    let _clock = background_tests::Clock::new();
     let fake = Fake::new().await;
     let album = Uuid::from_u128(1);
     let asset = Uuid::from_u128(10);
@@ -66,15 +67,23 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
     let base = format!("http://{address}");
     let mut config = config(fake.address);
     config.listen_address = address;
-    let media = MediaProxy::new(config.api_base.clone(), config.api_key.clone()).unwrap();
+    let activity = activity::Activity::default();
+    let media = MediaProxy::new(
+        config.api_base.clone(),
+        config.api_key.clone(),
+        activity.clone(),
+    )
+    .unwrap();
     let events = Subscriptions::new().unwrap();
     let name = config.friendly_name.clone();
     let uuid = config.server_uuid;
     let (catalog, task) =
-        ImmichCatalog::from_parts(config, Ledger::new(1), events.clone()).unwrap();
+        ImmichCatalog::from_parts(config, Ledger::new(1), events.clone(), activity.subscribe())
+            .unwrap();
     let library = Library {
         catalog,
         events: events.clone(),
+        activity: activity.clone(),
     };
 
     let mut fixture = Fixture {
@@ -85,7 +94,14 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
 
     let catalog_task = fixture.run();
     let events_task = tokio::spawn(events.clone().run());
-    let server = Server::new(name, uuid, fixture.library.catalog.clone(), media, events);
+    let server = Server::new(
+        name,
+        uuid,
+        fixture.library.catalog.clone(),
+        media,
+        events,
+        activity,
+    );
     let server_task = tokio::spawn(server.run(listener));
 
     let client = reqwest::Client::builder()
@@ -139,10 +155,15 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
         .get_mut(&album)
         .unwrap()[0]["checksum"] = json!("changed");
 
-    fixture.expire(Scope::Album(album)).await;
-    let changed = browse_http(&client, &base, album).await;
+    let gate = fixture.gate(Scope::Root);
+    tokio::time::advance(crate::catalog::background::INTERVAL).await;
+    gate.entered().await;
+    gate.release.add_permits(1);
+    background_tests::finished(&fixture).await;
     let committed = fixture.revisions().await;
     assert_eq!(committed.system_update_id, published.system_update_id + 1);
+    fixture.fake.event(committed.system_update_id).await;
+    let changed = browse_http(&client, &base, album).await;
 
     assert_eq!(
         committed.albums[&album].update_id,
@@ -153,8 +174,6 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
         text(&changed, "UpdateID"),
         committed.albums[&album].update_id.to_string()
     );
-
-    fixture.fake.event(committed.system_update_id).await;
 
     assert_eq!(
         fixture.library.system_update_id().await,

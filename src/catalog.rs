@@ -6,18 +6,20 @@ use anyhow::{Result, anyhow, ensure};
 use icu_collator::CollatorBorrowed;
 use serde::Serialize;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
 };
 use uuid::Uuid;
 
-use crate::{config::Config, eventing::Subscriptions, immich, protocol::Fault};
+use crate::{activity, config::Config, eventing::Subscriptions, immich, protocol::Fault};
 
+mod background;
 mod browse;
 mod digest;
 mod revisions;
 mod snapshots;
 
+use background::Background;
 pub use browse::{ObjectId, parse_id};
 use browse::{Payload, View};
 use revisions::Ledger;
@@ -174,25 +176,27 @@ pub(crate) struct CatalogTask {
     events: Subscriptions,
     state: State,
     pending: Vec<Pending>,
+    activity: watch::Receiver<activity::Snapshot>,
+    background: Background,
 }
 
 enum Command {
     Browse(Pending),
     SystemUpdateId(oneshot::Sender<u32>),
     #[cfg(test)]
-    Inspect(Box<dyn FnOnce(&mut CatalogTask) + Send>),
+    Test(tests::Control),
 }
 
 struct Pending {
     query: BrowseQuery,
     deadline: Instant,
     reply: oneshot::Sender<Result<View, Fault>>,
-    needed: Scope,
     waiting: bool,
 }
 
 struct Refresh {
     scope: Scope,
+    background: bool,
     deadline: Instant,
     future: Pin<Box<dyn Future<Output = Result<Candidate>> + Send>>,
 }
@@ -289,7 +293,7 @@ impl Cache {
     }
 
     fn insert(&mut self, candidate: Candidate, now: Instant) {
-        let scope = match candidate {
+        match candidate {
             Candidate::Root(snapshot) => {
                 self.albums.retain(|id, _| snapshot.albums.contains_key(id));
 
@@ -298,24 +302,24 @@ impl Cache {
                     completed: now,
                     used: now,
                 });
-
-                Scope::Root
             }
 
             Candidate::Album(id, snapshot) => {
+                let used = self.albums.get(&id).map_or(now, |cached| cached.used);
+
                 self.albums.insert(
                     id,
                     Cached {
                         snapshot: Arc::new(snapshot),
                         completed: now,
-                        used: now,
+                        used,
                     },
                 );
-
-                Scope::Album(id)
             }
-        };
+        }
+    }
 
+    fn evict(&mut self) {
         while self.albums.len() > self.album_limit
             || self.root.as_ref().map_or(0, |root| root.snapshot.bytes)
                 + self
@@ -328,10 +332,9 @@ impl Cache {
             let oldest = self
                 .albums
                 .iter()
-                .filter(|(id, _)| scope != Scope::Album(**id))
                 .min_by_key(|(id, cached)| (cached.used, **id))
                 .map(|(id, _)| *id)
-                .expect("cache budget fits root and the published album");
+                .expect("cache budget fits the root");
 
             self.albums.remove(&oldest);
         }
@@ -370,14 +373,19 @@ enum Candidate {
 }
 
 impl ImmichCatalog {
-    pub(crate) fn new(config: Config, events: Subscriptions) -> Result<(Self, CatalogTask)> {
-        Self::from_parts(config, Ledger::new(rand::random()), events)
+    pub(crate) fn new(
+        config: Config,
+        events: Subscriptions,
+        activity: watch::Receiver<activity::Snapshot>,
+    ) -> Result<(Self, CatalogTask)> {
+        Self::from_parts(config, Ledger::new(rand::random()), events, activity)
     }
 
     fn from_parts(
         config: Config,
         ledger: Ledger,
         events: Subscriptions,
+        activity: watch::Receiver<activity::Snapshot>,
     ) -> Result<(Self, CatalogTask)> {
         let source = Source::new(
             immich::Client::new(config.api_base, config.api_key)?,
@@ -403,6 +411,8 @@ impl ImmichCatalog {
                     cache: Cache::new(),
                 },
                 pending: Vec::new(),
+                activity,
+                background: Background::default(),
             },
         ))
     }
@@ -419,7 +429,6 @@ impl ImmichCatalog {
                 query,
                 deadline,
                 reply,
-                needed: Scope::Root,
                 waiting: false,
             }))
             .map_err(|_| FAILED)?;
@@ -436,20 +445,32 @@ impl CatalogTask {
         let mut active: Option<Refresh> = None;
 
         loop {
-            self.resolve(active.as_ref().map(|refresh| refresh.scope));
+            let now = Instant::now();
+            let activity = *self.activity.borrow_and_update();
+            self.background.update(activity, &self.state.cache, now);
+            let needed = self.resolve(active.as_ref().map(|refresh| refresh.scope));
 
-            if active.is_none()
-                && let Some(request) = self.pending.first()
-            {
-                let scope = request.needed;
-                active = Some(self.start(scope));
+            if active.is_none() {
+                let next = needed.map(|scope| (scope, false)).or_else(|| {
+                    self.background
+                        .next(&self.state.cache, now)
+                        .map(|scope| (scope, true))
+                });
 
-                for request in &mut self.pending {
-                    request.waiting = request.needed == scope;
+                if let Some((scope, background)) = next {
+                    active = Some(self.start(scope, background));
+
+                    self.resolve(Some(scope));
                 }
             }
 
-            let deadline = self.pending.iter().map(|request| request.deadline).min();
+            let deadline = self
+                .pending
+                .iter()
+                .map(|request| request.deadline)
+                .chain(self.background.deadline())
+                .chain(activity.idle_deadline().filter(|deadline| *deadline > now))
+                .min();
 
             let finished = async {
                 match active.as_mut() {
@@ -477,18 +498,21 @@ impl CatalogTask {
                         }
 
                         #[cfg(test)]
-                        Command::Inspect(inspect) => inspect(&mut self),
+                        Command::Test(control) => control.apply(&mut self),
                     }
                 }
 
                 result = finished => {
                     let refresh = active.take().unwrap();
+
                     let result = result.and_then(|candidate| self.publish(candidate, refresh.deadline));
 
+                    self.background.completed(refresh.scope, result.is_ok(), Instant::now());
+
                     if let Err(error) = &result {
-                        tracing::warn!(scope = ?refresh.scope, %error, "catalog refresh failed");
+                        tracing::warn!(scope = ?refresh.scope, background = refresh.background, %error, "catalog refresh failed");
                     } else {
-                        tracing::debug!(scope = ?refresh.scope, update_id = self.state.ledger.system_update_id, "catalog refresh completed");
+                        tracing::debug!(scope = ?refresh.scope, background = refresh.background, update_id = self.state.ledger.system_update_id, "catalog refresh completed");
                     }
 
                     let mut index = 0;
@@ -505,13 +529,18 @@ impl CatalogTask {
                 }
 
                 _ = sleep_until(deadline) => {}
+
+                changed = self.activity.changed() => {
+                    changed.map_err(|_| anyhow!("catalog activity channel closed"))?;
+                }
             }
         }
     }
 
-    fn resolve(&mut self, active: Option<Scope>) {
+    fn resolve(&mut self, active: Option<Scope>) -> Option<Scope> {
         let now = Instant::now();
         let mut index = 0;
+        let mut needed = None;
 
         while index < self.pending.len() {
             let request = &mut self.pending[index];
@@ -521,7 +550,7 @@ impl CatalogTask {
             } else {
                 match self.state.needed(request.query, now) {
                     Ok(Some(scope)) => {
-                        request.needed = scope;
+                        needed.get_or_insert(scope);
                         request.waiting |= active == Some(scope);
                         index += 1;
                         continue;
@@ -540,9 +569,11 @@ impl CatalogTask {
             let request = self.pending.remove(index);
             let _ = request.reply.send(result);
         }
+
+        needed
     }
 
-    fn start(&self, scope: Scope) -> Refresh {
+    fn start(&self, scope: Scope, background: bool) -> Refresh {
         let source = self.source.clone();
         let deadline = Instant::now() + REFRESH_TIMEOUT;
 
@@ -566,6 +597,7 @@ impl CatalogTask {
 
         Refresh {
             scope,
+            background,
             deadline,
             future,
         }
@@ -606,6 +638,11 @@ impl CatalogTask {
         if changed {
             self.events.publish(state.ledger.system_update_id);
         }
+
+        // Pin all ready replies before enforcing residency limits. Only serving
+        // demand touches recency; eviction has the same policy for every refresh.
+        self.resolve(None);
+        self.state.cache.evict();
 
         Ok(())
     }

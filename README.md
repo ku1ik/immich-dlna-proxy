@@ -194,16 +194,23 @@ No universal playback guarantee, UPnP Search/write actions, or media cache.
 Eligible album members are images/videos with `timeline` or `archive` visibility,
 not trashed. Hidden/locked/unknown visibility is excluded; empty albums remain.
 Offline or missing-generated-file assets are not silently removed from listings.
-Only **Browse** discovers changes after a **60-second TTL** from successful publication.
-`GetSystemUpdateID` polling and subscriptions report published state without fetching
-Immich; no refresh scheduler exists. Poll-only clients can retain old listings until
-another Browse. Expired-snapshot refresh failures return errors, not empty/partial success.
+**Browse** refreshes needed data after a **60-second TTL** from successful publication.
+While clients are active, background passes check the root and resident album contents:
+the first pass starts after **two minutes**, and subsequent passes two minutes after
+completion. Recently refreshed scopes are skipped. Foreground requests take priority
+between scopes; load and traversal time can delay discovery.
 
-On the tested LG C4, reloading or reopening Media Player can reuse its cached listing
-without sending Browse. An ordinary Browse from another client, after cache expiry,
-can discover a change and trigger notifications that make the TV reload. Root Browse
-checks albums/album metadata; changes to members require browsing that album. This
-is not a force-refresh bypass or automatic library synchronization.
+Admitted Browse/media requests and successful ContentDirectory subscriptions **and
+renewals** count as activity. Polling stops after **ten idle minutes**; an open media
+GET keeps it active, with ten minutes of grace after playback ends. Update-ID polling,
+discovery, and outgoing notifications do not extend activity. A valid subscription
+alone is insufficient if its renewals are more than ten minutes apart.
+
+Root refresh discovers album-list/metadata changes. Background contents discovery is
+limited to resident albums; evicted or never-browsed contents need a Browse. Changed
+fingerprints advance revisions and trigger notifications. Failures preserve published
+state and retry on a later pass; Browse needing stale data returns an error. Background
+access does not promote albums in the user-access cache order.
 
 Fixed limits: 4,096 current albums; 20,000 eligible items/16 MiB per album; 50 pages/50,000
 examined records per traversal; 32 resident albums/64 MiB projected cache; 16 media operations.
@@ -251,8 +258,8 @@ Logging uses TOML, **not `RUST_LOG`**. Diagnostics include IDs/status/resource k
 upstream bodies, EXIF/GPS, storage paths, callback query secrets, or media. Keep reports sanitized.
 For stale listings, debug logs show incoming Browse scope/pagination, response counts
 and revisions, update-ID reads, subscription leases/outcomes and event delivery.
-Compare those with an actual root Browse before assuming that restarting the server
-or changing its refresh policy fixes the cause.
+Refresh logs distinguish foreground and background work. On the tested LG C4, reopening
+Media Player could reuse its cached listing while continuing subscription renewals.
 
 ## Verification
 
@@ -267,6 +274,9 @@ nix build --no-link
 denied, then a release build. Run Rust commands inside `nix develop`. Module evaluation
 does not build the package; `nix build` verifies packaging separately. Automated tests
 use local fixtures, not production keys or live changes.
+The serial catalog loop and activity-gated polling have automated coverage, including
+notification-driven revision discovery over HTTP. C4/desktop background-refresh and
+memory-only restart behavior still need live-client verification.
 
 The [fixture guide](tests/fixtures/README.md) has synthetic media, a test-only server,
 and HTTP/TV/desktop checklists. Tested: **LG OLED77C45LA.DEUQLJP, webOS 25, platform 10.3.1,

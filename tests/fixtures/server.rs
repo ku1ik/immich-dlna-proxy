@@ -279,10 +279,12 @@ impl Bound {
 
         let subscriptions = Subscriptions::new()?;
         let address = SocketAddrV4::new(*address.ip(), http.local_addr()?.port());
+        let activity = immich_dlna_proxy::Activity::default();
 
         let media = MediaProxy::new(
             format!("http://{}/api/", upstream.local_addr()?).parse()?,
             HeaderValue::from_static(API_KEY),
+            activity.clone(),
         )?;
 
         let server = Server::new(
@@ -291,6 +293,7 @@ impl Bound {
             catalog::FixtureCatalog(catalog::objects(address)),
             media,
             subscriptions.clone(),
+            activity,
         );
 
         Ok(Self {

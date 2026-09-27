@@ -19,6 +19,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    activity::Activity,
     catalog::Catalog,
     eventing::Subscriptions,
     media::MediaProxy,
@@ -37,6 +38,7 @@ pub struct Server<C> {
     subscriptions: Subscriptions,
     device: String,
     browses: Semaphore,
+    activity: Activity,
 }
 
 enum Route<'a> {
@@ -82,8 +84,10 @@ impl<C: Catalog> Server<C> {
         catalog: C,
         media: MediaProxy,
         subscriptions: Subscriptions,
+        activity: Activity,
     ) -> Self {
         Self {
+            activity,
             catalog,
             media,
             subscriptions,
@@ -179,9 +183,18 @@ impl<C: Catalog> Server<C> {
             }
 
             Route::Events(service) => {
-                return self
-                    .subscriptions
-                    .request(service, peer, &parts.method, &parts.headers);
+                let response =
+                    self.subscriptions
+                        .request(service, peer, &parts.method, &parts.headers);
+
+                if service == Service::ContentDirectory
+                    && parts.method.as_str() == "SUBSCRIBE"
+                    && response.status() == StatusCode::OK
+                {
+                    self.activity.touch();
+                }
+
+                return response;
             }
 
             _ if parts.method != Method::GET && parts.method != Method::HEAD => {
@@ -299,9 +312,12 @@ impl<C: Catalog> Server<C> {
             None
         };
 
-        let result = timeout_at(deadline, execute(&self.catalog, action, peer, deadline))
-            .await
-            .unwrap_or(Err(Fault::ActionFailed));
+        let result = timeout_at(
+            deadline,
+            execute(&self.catalog, action, peer, deadline, &self.activity),
+        )
+        .await
+        .unwrap_or(Err(Fault::ActionFailed));
 
         let result = if Instant::now() < deadline {
             result
@@ -322,6 +338,7 @@ async fn execute<C: Catalog>(
     action: Action,
     peer: Ipv4Addr,
     deadline: Instant,
+    activity: &Activity,
 ) -> Result<String, Fault> {
     let service = action.service();
     let name = action.name();
@@ -339,10 +356,13 @@ async fn execute<C: Catalog>(
                 "Browse request"
             );
 
+            let object_id = object?;
+            activity.touch();
+
             let result = catalog
                 .browse(
                     crate::catalog::BrowseQuery {
-                        object_id: object?,
+                        object_id,
                         mode: query.mode,
                         sort: query.sort,
                     },

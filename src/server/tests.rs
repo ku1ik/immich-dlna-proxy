@@ -56,6 +56,8 @@ impl Catalog for TestCatalog {
 }
 
 fn server(catalog: TestCatalog) -> Server<TestCatalog> {
+    let activity = Activity::default();
+
     Server::new(
         "Test & Media".into(),
         Uuid::nil(),
@@ -63,9 +65,11 @@ fn server(catalog: TestCatalog) -> Server<TestCatalog> {
         MediaProxy::new(
             "http://127.0.0.1:9/api/".parse().unwrap(),
             HeaderValue::from_static("test-key"),
+            activity.clone(),
         )
         .unwrap(),
         Subscriptions::new().unwrap(),
+        activity,
     )
 }
 
@@ -221,6 +225,7 @@ async fn local_actions_and_faults_do_not_browse() {
     }
 
     assert!(server.catalog.actions.lock().unwrap().is_empty());
+    assert_eq!(server.activity.subscribe().borrow().last, None);
 }
 
 #[tokio::test]
@@ -230,6 +235,7 @@ async fn browse_serializes_snapshot_and_releases_permit_with_response() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(server.browses.available_permits(), BROWSES);
+    assert!(server.activity.subscribe().borrow().last.is_some());
 
     let document = body(response).await;
 
@@ -617,4 +623,106 @@ async fn run_serves_with_connect_info() {
     )));
 
     task.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn accepted_content_directory_subscriptions_and_renewals_extend_activity() {
+    let server = server(TestCatalog::default());
+    let activity = server.activity.subscribe();
+
+    let subscribe = |path: &str| {
+        Request::builder()
+            .method("SUBSCRIBE")
+            .uri(path)
+            .header("nt", "upnp:event")
+            .header("callback", "<http://127.0.0.1:12345/events>")
+            .header("timeout", "Second-300")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let renew = |path: &str, sid: &HeaderValue, method: &str, lease: &str| {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("sid", sid)
+            .header("timeout", lease)
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let connection_events = "/upnp/connection-manager/events";
+
+    let connection = server
+        .route(subscribe(connection_events), Ipv4Addr::LOCALHOST)
+        .await;
+
+    assert_eq!(connection.status(), StatusCode::OK);
+    let sid = connection.headers()["sid"].clone();
+
+    let renewed = server
+        .route(
+            renew(connection_events, &sid, "SUBSCRIBE", "Second-300"),
+            Ipv4Addr::LOCALHOST,
+        )
+        .await;
+
+    assert_eq!(renewed.status(), StatusCode::OK);
+    assert_eq!(activity.borrow().last, None);
+    let response = server.route(subscribe(EVENTS), Ipv4Addr::LOCALHOST).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let sid = response.headers()["sid"].clone();
+    assert_eq!(activity.borrow().last, Some(Instant::now()));
+
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_secs(210)).await;
+
+        let response = server
+            .route(
+                renew(EVENTS, &sid, "SUBSCRIBE", "Second-300"),
+                Ipv4Addr::LOCALHOST,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(activity.borrow().last, Some(Instant::now()));
+    }
+
+    let response = server
+        .route(
+            renew(EVENTS, &sid, "SUBSCRIBE", "Second-1800"),
+            Ipv4Addr::LOCALHOST,
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let before = activity.borrow().last;
+    tokio::time::advance(crate::activity::IDLE_TIMEOUT).await;
+    assert!(!activity.borrow().active(Instant::now()));
+
+    // The lease is still live, but publications/local reads/unsubscribe do not touch activity.
+    server.subscriptions.publish(43);
+
+    server
+        .route(action(CDS, "GetSystemUpdateID", ""), Ipv4Addr::LOCALHOST)
+        .await;
+
+    let response = server
+        .route(
+            renew(EVENTS, &sid, "UNSUBSCRIBE", "Second-1800"),
+            Ipv4Addr::LOCALHOST,
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = server
+        .route(
+            renew(EVENTS, &sid, "SUBSCRIBE", "Second-300"),
+            Ipv4Addr::LOCALHOST,
+        )
+        .await;
+
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(activity.borrow().last, before);
 }

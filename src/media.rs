@@ -10,7 +10,10 @@ use tokio::{
 use url::Url;
 use uuid::Uuid;
 
-use crate::config::ApiBase;
+use crate::{
+    activity::{Activity, MediaActivity},
+    config::ApiBase,
+};
 
 const OPERATIONS: usize = 16;
 const REDIRECTS: usize = 3;
@@ -80,6 +83,13 @@ pub struct MediaProxy {
     api_base: ApiBase,
     api_key: HeaderValue,
     operations: Arc<Semaphore>,
+    activity: Activity,
+}
+
+// Admission and activity follow the same request/response-body lifetime.
+struct Operation {
+    _permit: OwnedSemaphorePermit,
+    _activity: Option<MediaActivity>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -130,7 +140,11 @@ impl ByteRange {
 }
 
 impl MediaProxy {
-    pub fn new(api_base: ApiBase, mut api_key: HeaderValue) -> anyhow::Result<Self> {
+    pub fn new(
+        api_base: ApiBase,
+        mut api_key: HeaderValue,
+        activity: Activity,
+    ) -> anyhow::Result<Self> {
         api_key.set_sensitive(true);
 
         let client = crate::outbound_client_builder().build()?;
@@ -140,6 +154,7 @@ impl MediaProxy {
             api_base,
             api_key,
             operations: Arc::new(Semaphore::new(OPERATIONS)),
+            activity,
         })
     }
 
@@ -184,9 +199,22 @@ impl MediaProxy {
             return response(StatusCode::SERVICE_UNAVAILABLE);
         };
 
+        let activity = if method == Method::GET {
+            Some(self.activity.media())
+        } else {
+            self.activity.touch();
+
+            None
+        };
+
+        let operation = Operation {
+            _permit: permit,
+            _activity: activity,
+        };
+
         let started = std::time::Instant::now();
 
-        let result = self.request(asset, route, method, headers, permit).await;
+        let result = self.request(asset, route, method, headers, operation).await;
 
         match result {
             Ok(response) => response,
@@ -208,7 +236,7 @@ impl MediaProxy {
         route: Representation,
         method: Method,
         headers: HeaderMap,
-        permit: OwnedSemaphorePermit,
+        operation: Operation,
     ) -> Result<Response, Failure> {
         let mut forwarded = HeaderMap::new();
 
@@ -367,7 +395,7 @@ impl MediaProxy {
             return Ok(result);
         }
 
-        *result.body_mut() = media_body(upstream, permit, body_length, asset);
+        *result.body_mut() = media_body(upstream, operation, body_length, asset);
 
         Ok(result)
     }
@@ -507,13 +535,13 @@ fn allowed_redirect(api_base: &Url, initial_edited: bool, target: &Url, asset: U
 
 fn media_body(
     upstream: reqwest::Response,
-    permit: OwnedSemaphorePermit,
+    operation: Operation,
     body_length: Option<u64>,
     asset: Uuid,
 ) -> Body {
     let stream = futures_util::stream::try_unfold(
-        (upstream, permit, body_length),
-        move |(mut upstream, permit, mut remaining)| async move {
+        (upstream, operation, body_length),
+        move |(mut upstream, operation, mut remaining)| async move {
             let deadline = Instant::now() + READ_IDLE_TIMEOUT;
 
             let chunk = timeout_at(deadline, async {
@@ -542,7 +570,7 @@ fn media_body(
                             ))?;
                     }
 
-                    Ok(Some((chunk, (upstream, permit, remaining))))
+                    Ok(Some((chunk, (upstream, operation, remaining))))
                 }
 
                 None if remaining.is_none_or(|left| left == 0) => Ok(None),

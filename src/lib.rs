@@ -1,3 +1,5 @@
+mod activity;
+pub use activity::Activity;
 pub mod catalog;
 pub mod config;
 pub mod eventing;
@@ -17,20 +19,25 @@ use crate::{
 };
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
-    let media = MediaProxy::new(config.api_base.clone(), config.api_key.clone())?;
+    let activity = Activity::default();
+    let media = MediaProxy::new(
+        config.api_base.clone(),
+        config.api_key.clone(),
+        activity.clone(),
+    )?;
     let events = Subscriptions::new()?;
     let address = config.listen_address;
     let uuid = config.server_uuid;
     let name = config.friendly_name.clone();
     let interface_index = config.interface_index;
-    let (catalog, catalog_task) = ImmichCatalog::new(config, events.clone())?;
+    let (catalog, catalog_task) = ImmichCatalog::new(config, events.clone(), activity.subscribe())?;
 
     let http = TcpListener::bind(address)
         .await
         .context("cannot bind configured HTTP listener")?;
 
     let discovery = Discovery::bind(interface_index, uuid, address)?;
-    let server = Server::new(name, uuid, catalog, media, events.clone());
+    let server = Server::new(name, uuid, catalog, media, events.clone(), activity);
     tracing::info!(%address, %uuid, "service started");
 
     let (name, result) = tokio::select! {

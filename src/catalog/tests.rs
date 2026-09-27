@@ -22,6 +22,9 @@ use crate::protocol::Service;
 #[path = "http_tests.rs"]
 mod http_tests;
 
+#[path = "background_tests.rs"]
+mod background_tests;
+
 pub(super) struct Barrier {
     pub(super) entered: Notify,
     pub(super) release: Semaphore,
@@ -194,6 +197,7 @@ impl Fake {
         );
 
         assert_eq!(response.status(), 200);
+        library.activity.touch();
     }
 
     async fn event(&mut self, id: u32) {
@@ -235,19 +239,64 @@ fn config(address: SocketAddr) -> Config {
 struct Library {
     catalog: ImmichCatalog,
     events: Subscriptions,
+    activity: activity::Activity,
+}
+
+// Explicit fixture operations keep test assertions read-only. No callback can
+// rewrite catalog state or scheduling while the task is running.
+pub(super) enum Control {
+    Inspect(Box<dyn FnOnce(&CatalogTask) + Send>),
+    Expire(Scope),
+    Limits { albums: usize, bytes: usize },
+}
+
+impl Control {
+    pub(super) fn apply(self, task: &mut CatalogTask) {
+        match self {
+            Self::Inspect(inspect) => inspect(task),
+
+            Self::Expire(scope) => match scope {
+                Scope::Root => task.state.cache.root.as_mut().unwrap().completed -= FRESHNESS,
+
+                Scope::Album(id) => {
+                    task.state.cache.albums.get_mut(&id).unwrap().completed -= FRESHNESS
+                }
+            },
+
+            Self::Limits { albums, bytes } => {
+                task.state.cache.album_limit = albums;
+                task.state.cache.byte_limit = bytes;
+            }
+        }
+    }
 }
 
 impl Library {
     fn new(config: Config, seed: u32) -> (Self, CatalogTask) {
         let events = Subscriptions::new().unwrap();
+        let activity = activity::Activity::default();
 
-        let (catalog, task) =
-            ImmichCatalog::from_parts(config, Ledger::new(seed), events.clone()).unwrap();
+        let (catalog, task) = ImmichCatalog::from_parts(
+            config,
+            Ledger::new(seed),
+            events.clone(),
+            activity.subscribe(),
+        )
+        .unwrap();
 
-        (Self { catalog, events }, task)
+        (
+            Self {
+                catalog,
+                events,
+                activity,
+            },
+            task,
+        )
     }
 
     async fn browse(&self, query: BrowseQuery) -> Result<BrowseResult, Fault> {
+        self.activity.touch();
+
         self.catalog
             .browse(query, Instant::now() + REFRESH_TIMEOUT)
             .await
@@ -259,18 +308,27 @@ impl Library {
 
     async fn inspect<T: Send + 'static>(
         &self,
-        inspect: impl FnOnce(&mut CatalogTask) -> T + Send + 'static,
+        inspect: impl FnOnce(&CatalogTask) -> T + Send + 'static,
     ) -> T {
         let (reply, receiver) = oneshot::channel();
 
         self.catalog
             .commands
-            .try_send(Command::Inspect(Box::new(move |task| {
+            .try_send(Command::Test(Control::Inspect(Box::new(move |task| {
                 let _ = reply.send(inspect(task));
-            })))
+            }))))
             .unwrap_or_else(|_| panic!("test catalog unavailable"));
 
         receiver.await.unwrap()
+    }
+
+    async fn control(&self, control: Control) {
+        self.catalog
+            .commands
+            .try_send(Command::Test(control))
+            .unwrap_or_else(|_| panic!("test catalog unavailable"));
+
+        self.inspect(|_| ()).await;
     }
 
     fn enqueue(&self, query: BrowseQuery, deadline: Instant) -> oneshot::Receiver<RefreshResult> {
@@ -282,7 +340,6 @@ impl Library {
                 query,
                 deadline,
                 reply,
-                needed: Scope::Root,
                 waiting: false,
             }))
             .unwrap_or_else(|_| panic!("catalog unavailable"));
@@ -333,19 +390,7 @@ impl Fixture {
     }
 
     async fn expire(&self, scope: Scope) {
-        self.library
-            .inspect(move |task| {
-                let state = &mut task.state;
-
-                match scope {
-                    Scope::Root => state.cache.root.as_mut().unwrap().completed -= FRESHNESS,
-
-                    Scope::Album(id) => {
-                        state.cache.albums.get_mut(&id).unwrap().completed -= FRESHNESS
-                    }
-                }
-            })
-            .await;
+        self.library.control(Control::Expire(scope)).await;
     }
 
     async fn revisions(&self) -> Arc<Ledger> {
@@ -779,7 +824,10 @@ async fn expiry_and_lru_refill_preserve_revisions_without_events() {
     let task = fixture.run();
     fixture
         .library
-        .inspect(|task| task.state.cache.album_limit = 1)
+        .control(Control::Limits {
+            albums: 1,
+            bytes: CACHE_BYTES,
+        })
         .await;
     fixture.library.browse(children(1)).await.unwrap();
     fixture.library.browse(children(2)).await.unwrap();
@@ -853,10 +901,9 @@ async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
     let (root_bytes, contents_bytes) = fixture
         .library
         .inspect(|task| {
-            let state = &mut task.state;
+            let state = &task.state;
             let root_bytes = state.cache.root.as_ref().unwrap().snapshot.bytes;
             let contents_bytes = state.cache.albums[&Uuid::from_u128(1)].snapshot.bytes;
-            state.cache.byte_limit = root_bytes + 2 * contents_bytes;
             assert_eq!(state.cache.albums.len(), 2);
             assert_eq!(state.ledger.albums.len(), 2);
 
@@ -877,6 +924,14 @@ async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
             );
 
             (root_bytes, contents_bytes)
+        })
+        .await;
+
+    fixture
+        .library
+        .control(Control::Limits {
+            albums: RESIDENT_ALBUMS,
+            bytes: root_bytes + 2 * contents_bytes,
         })
         .await;
 
@@ -1299,23 +1354,15 @@ async fn queued_album_rechecks_root_membership_after_serial_publication() {
 }
 
 #[tokio::test]
-async fn task_panic_closes_handles_and_pending_replies() {
+async fn task_exit_closes_handles_and_pending_replies() {
     let fixture = Fixture::new(0).await;
     let task = fixture.run();
     let barrier = fixture.gate(Scope::Root);
     let caller = spawn_browse(&fixture.library, metadata_query("0"));
     barrier.entered().await;
 
-    fixture
-        .library
-        .catalog
-        .commands
-        .try_send(Command::Inspect(Box::new(|_| {
-            panic!("injected task panic")
-        })))
-        .unwrap_or_else(|_| panic!("catalog unavailable"));
-
-    assert!(task.await.unwrap_err().is_panic());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
     fault(caller, 501).await;
     assert_eq!(
         fixture.library.catalog.system_update_id().await,
@@ -1382,9 +1429,7 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
     let (album_id, system_id) = fixture
         .library
         .inspect(|task| {
-            let state = &mut task.state;
-            let bytes = state.cache.albums[&Uuid::from_u128(1)].snapshot.bytes;
-            state.cache.byte_limit = state.cache.root.as_ref().unwrap().snapshot.bytes + bytes;
+            let state = &task.state;
 
             (
                 state.ledger.albums[&Uuid::from_u128(1)].update_id,
@@ -1393,6 +1438,13 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
         })
         .await;
 
+    fixture
+        .library
+        .control(Control::Limits {
+            albums: 1,
+            bytes: CACHE_BYTES,
+        })
+        .await;
     fixture.library.browse(children(2)).await.unwrap();
 
     fixture

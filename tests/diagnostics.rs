@@ -111,10 +111,12 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let activity = immich_dlna_proxy::Activity::default();
 
         let media = MediaProxy::new(
             format!("http://{upstream_address}/api/").parse().unwrap(),
             HeaderValue::from_static("api-key-secret"),
+            activity.clone(),
         )
         .unwrap();
 
@@ -124,6 +126,7 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
             TestCatalog,
             media,
             subscriptions,
+            activity,
         );
 
         tasks.spawn(async move {
@@ -177,6 +180,7 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
         let media = MediaProxy::new(
             format!("http://{overrun_address}/api/").parse().unwrap(),
             HeaderValue::from_static("api-key-secret"),
+            immich_dlna_proxy::Activity::default(),
         )
         .unwrap();
 
