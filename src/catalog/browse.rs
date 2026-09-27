@@ -369,7 +369,7 @@ mod tests {
                     created_at: Some(format!("{created}T00:00:00Z").parse().unwrap()),
                     end_date: end.map(|date| format!("{date}T00:00:00Z").parse().unwrap()),
                 },
-                digest: format!("{number:064x}").parse().unwrap(),
+                digest: super::super::digest::Digest::from_bytes([number as u8; 32]),
             };
 
             (id, album)
@@ -379,16 +379,12 @@ mod tests {
         let root = Root {
             object: root_object,
             albums,
-            digest: "a".repeat(64).parse().unwrap(),
+            digest: super::super::digest::Digest::from_bytes([0xaa; 32]),
             bytes: 0,
         };
 
-        let ledger = Ledger {
-            server_uuid: Uuid::from_u128(999),
-            system_update_id: 42,
-            root_digest: Some(root.digest),
-            albums: Default::default(),
-        };
+        let mut ledger = Ledger::new(42);
+        ledger.root_digest = Some(root.digest);
 
         let view = View {
             root: Arc::new(root),

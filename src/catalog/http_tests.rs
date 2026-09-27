@@ -64,21 +64,15 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
     };
 
     let base = format!("http://{address}");
-    let directory = tempfile::tempdir().unwrap();
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let mut config = config(fake.address, directory.path());
+    let mut config = config(fake.address);
     config.listen_address = address;
     let media = MediaProxy::new(config.api_base.clone(), config.api_key.clone()).unwrap();
     let events = Subscriptions::new().unwrap();
     let name = config.friendly_name.clone();
     let uuid = config.server_uuid;
-    let library = ImmichCatalog::open(config, events.clone()).await.unwrap();
+    let library = ImmichCatalog::from_parts(config, Ledger::new(1), events.clone()).unwrap();
 
-    let mut fixture = Fixture {
-        library,
-        fake,
-        directory,
-    };
+    let mut fixture = Fixture { library, fake };
 
     let catalog_task = fixture.run();
     let events_task = tokio::spawn(events.clone().run());
@@ -96,11 +90,11 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
     let didl = text(&listing, "Result");
     let resource = text(&didl, "res");
     assert_eq!(resource, format!("{base}/media/assets/{asset}/original"));
-    let published = fixture.disk();
+    let published = fixture.revisions();
 
     assert_eq!(
         text(&listing, "UpdateID"),
-        published.1.albums[&album].update_id.to_string()
+        published.albums[&album].update_id.to_string()
     );
 
     let calls = fixture.fake.upstream.lock().unwrap().requests.len();
@@ -108,7 +102,7 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
     assert_eq!(response.status(), 200);
     assert_eq!(response.bytes().await.unwrap().as_ref(), b"original-jpeg");
     assert_eq!(fixture.fake.upstream.lock().unwrap().requests.len(), calls);
-    assert_eq!(fixture.disk(), published);
+    assert_eq!(fixture.revisions(), published);
 
     let subscription = client
         .request(
@@ -125,7 +119,7 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
         .unwrap();
 
     assert_eq!(subscription.status(), 200);
-    fixture.fake.event(published.1.system_update_id).await;
+    fixture.fake.event(published.system_update_id).await;
 
     fixture
         .fake
@@ -138,12 +132,12 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
 
     fixture.expire(Scope::Album(album));
     let changed = browse_http(&client, &base, album).await;
-    let committed = fixture.disk().1;
-    assert_eq!(committed.system_update_id, published.1.system_update_id + 1);
+    let committed = fixture.revisions();
+    assert_eq!(committed.system_update_id, published.system_update_id + 1);
 
     assert_eq!(
         committed.albums[&album].update_id,
-        published.1.albums[&album].update_id + 1
+        published.albums[&album].update_id + 1
     );
 
     assert_eq!(

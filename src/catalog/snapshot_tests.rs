@@ -384,8 +384,8 @@ async fn contents_hashes_canonical_order_and_exact_bytes() {
     assert_eq!(baseline.bytes, serialized.len());
 
     assert_eq!(
-        baseline.digest.to_string(),
-        format!("{:x}", Sha256::digest(&serialized))
+        baseline.digest,
+        Digest::from_bytes(Sha256::digest(&serialized).into())
     );
 }
 
@@ -490,8 +490,8 @@ fn projected_root_encoding_is_stable_across_refactors() {
     assert_eq!(root.bytes, expected.len());
 
     assert_eq!(
-        root.digest.to_string(),
-        format!("{:x}", Sha256::digest(expected.as_bytes()))
+        root.digest,
+        Digest::from_bytes(Sha256::digest(expected.as_bytes()).into())
     );
 
     assert_eq!(
@@ -500,8 +500,8 @@ fn projected_root_encoding_is_stable_across_refactors() {
     );
 
     assert_eq!(
-        root.albums[&id].digest.to_string(),
-        format!("{:x}", Sha256::digest(expected_album.as_bytes()))
+        root.albums[&id].digest,
+        Digest::from_bytes(Sha256::digest(expected_album.as_bytes()).into())
     );
 }
 
@@ -531,8 +531,8 @@ async fn projected_video_encoding_with_playback_is_stable_across_refactors() {
     assert_eq!(contents.bytes, expected.len() + 2);
 
     assert_eq!(
-        contents.digest.to_string(),
-        format!("{:x}", Sha256::digest(format!("[{expected}]").as_bytes()))
+        contents.digest,
+        Digest::from_bytes(Sha256::digest(format!("[{expected}]").as_bytes()).into())
     );
 }
 

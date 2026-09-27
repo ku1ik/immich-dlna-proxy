@@ -57,7 +57,6 @@ let
     friendly_name = "Media \"room\" \\ TV\nSecond line";
     sort_locale = required.sortLocale;
     server_uuid = required.serverUuid;
-    state_directory = "/var/lib/${name}";
     log_level = "debug";
   };
   # Inspect the TOML generator's input without realizing its derivation (no IFD).
@@ -113,10 +112,10 @@ let
       &&
         lib.hasInfix "LoadCredential=${expectedCredential}\n"
           escaped.config.systemd.units."${name}.service".text;
-    privateStateAndHardening =
-      service.serviceConfig.DynamicUser
-      && service.serviceConfig.StateDirectory == name
-      && service.serviceConfig.StateDirectoryMode == "0700"
+    memoryOnlyAndHardening =
+        service.serviceConfig.DynamicUser
+        && !(service.serviceConfig ? StateDirectory)
+        && !(service.serviceConfig ? StateDirectoryMode)
       && service.serviceConfig.UMask == "0077"
       && service.serviceConfig.NoNewPrivileges
       && service.serviceConfig.CapabilityBoundingSet == ""

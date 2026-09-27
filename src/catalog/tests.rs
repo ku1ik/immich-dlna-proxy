@@ -7,13 +7,7 @@ use axum::{
 };
 use http::{HeaderMap, HeaderValue, Method};
 use serde_json::{Value, json};
-use std::{
-    fs,
-    net::{Ipv4Addr, SocketAddr},
-    os::unix::fs::{MetadataExt, PermissionsExt},
-    path::Path,
-};
-use tempfile::TempDir;
+use std::net::{Ipv4Addr, SocketAddr};
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
 
 use crate::protocol::Service;
@@ -219,7 +213,7 @@ impl Drop for Fake {
     }
 }
 
-fn config(address: SocketAddr, directory: &Path) -> Config {
+fn config(address: SocketAddr) -> Config {
     Config {
         api_base: format!("http://{address}/api/").parse().unwrap(),
         api_key: HeaderValue::from_static("fake-key"),
@@ -227,25 +221,14 @@ fn config(address: SocketAddr, directory: &Path) -> Config {
         friendly_name: "Photos & videos".into(),
         collator: crate::config::collator("pl").unwrap(),
         server_uuid: Uuid::from_u128(999),
-        state_directory: directory.to_owned(),
         log_level: tracing::Level::INFO,
         interface_index: 1,
     }
 }
 
-fn disk(directory: &Path) -> (u64, Ledger) {
-    let path = directory.join("revisions.json");
-
-    (
-        fs::metadata(&path).unwrap().ino(),
-        serde_json::from_slice(&fs::read(path).unwrap()).unwrap(),
-    )
-}
-
 struct Fixture {
     library: ImmichCatalog,
     fake: Fake,
-    directory: TempDir,
 }
 
 impl Fixture {
@@ -255,19 +238,14 @@ impl Fixture {
         fake.upstream.lock().unwrap().albums =
             (1..=albums).map(|id| album(id as u128, "Album")).collect();
 
-        let directory = tempfile::tempdir().unwrap();
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let config = config(fake.address, directory.path());
+        let library = ImmichCatalog::from_parts(
+            config(fake.address),
+            Ledger::new(1),
+            Subscriptions::new().unwrap(),
+        )
+        .unwrap();
 
-        let library = ImmichCatalog::open(config, Subscriptions::new().unwrap())
-            .await
-            .unwrap();
-
-        Self {
-            library,
-            fake,
-            directory,
-        }
+        Self { library, fake }
     }
 
     fn run(&self) -> JoinHandle<Result<()>> {
@@ -286,8 +264,8 @@ impl Fixture {
         }
     }
 
-    fn disk(&self) -> (u64, Ledger) {
-        disk(self.directory.path())
+    fn revisions(&self) -> Arc<Ledger> {
+        self.library.inner.state.lock().unwrap().ledger.clone()
     }
 
     async fn abort(&self, task: JoinHandle<Result<()>>) {
@@ -405,7 +383,7 @@ async fn shared_asset_keeps_album_identity_and_asset_only_resources() {
         ]
     );
 
-    let (_, ledger) = fixture.disk();
+    let ledger = fixture.revisions();
     let first_digest = ledger.albums[&Uuid::from_u128(1)].contents_digest.unwrap();
     let second_digest = ledger.albums[&Uuid::from_u128(2)].contents_digest.unwrap();
     assert_ne!(first_digest, second_digest);
@@ -454,7 +432,7 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
         .await
         .unwrap();
 
-    assert_eq!(metadata.update_id, 0);
+    assert_eq!(metadata.update_id, 1);
     assert_eq!(metadata.total_matches, 1);
     assert!(metadata.objects[0].child_count().is_none());
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
@@ -483,7 +461,7 @@ async fn album_latest_date_refresh_reorders_and_publishes_without_loading_conten
     let request = || page_query("0", 0, 0, SortOrder::Catalog);
     let before = fixture.library.browse(request()).await.unwrap();
     assert_eq!(before.objects[0].title, "Z");
-    let disk = fixture.disk().1;
+    let revisions = fixture.revisions();
 
     let events = tokio::spawn(fixture.library.inner.events.clone().run());
 
@@ -502,34 +480,28 @@ async fn album_latest_date_refresh_reorders_and_publishes_without_loading_conten
     assert_eq!(after.objects[1], before.objects[0]);
     assert_eq!(after.update_id, before.update_id + 1);
     fixture.fake.event(after.update_id).await;
-    let changed = fixture.disk();
-    assert_eq!(changed.1.system_update_id, after.update_id);
+    let changed = fixture.revisions();
+    assert_eq!(changed.system_update_id, after.update_id);
     let id = Uuid::from_u128(1);
 
     assert_eq!(
-        changed.1.albums[&id].update_id,
-        disk.albums[&id].update_id + 1
+        changed.albums[&id].update_id,
+        revisions.albums[&id].update_id + 1
     );
 
     assert_eq!(
-        changed.1.albums[&Uuid::from_u128(2)],
-        disk.albums[&Uuid::from_u128(2)]
+        changed.albums[&Uuid::from_u128(2)],
+        revisions.albums[&Uuid::from_u128(2)]
     );
 
-    assert!(
-        changed
-            .1
-            .albums
-            .values()
-            .all(|a| a.contents_digest.is_none())
-    );
+    assert!(changed.albums.values().all(|a| a.contents_digest.is_none()));
 
     fixture.fake.upstream.lock().unwrap().albums.reverse();
     fixture.expire(Scope::Root);
     let same = fixture.library.browse(request()).await.unwrap();
     assert_eq!(same.objects, after.objects);
     assert_eq!(same.update_id, after.update_id);
-    assert_eq!(fixture.disk(), changed);
+    assert_eq!(fixture.revisions(), changed);
     assert_eq!(fixture.fake.calls("/api/albums"), 3);
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
     events.abort();
@@ -599,7 +571,7 @@ async fn album_browse_counts_eligible_items_and_sorts_before_pagination() {
     let task = fixture.run();
     let baseline = fixture.library.browse(children(1)).await.unwrap();
     assert_eq!(baseline.total_matches, 3);
-    assert_eq!(baseline.update_id, 1);
+    assert_eq!(baseline.update_id, 2);
 
     assert_eq!(
         baseline
@@ -722,7 +694,7 @@ async fn item_browse_validates_album_membership_and_returns_the_system_revision(
 }
 
 #[tokio::test]
-async fn expiry_and_lru_refill_are_fresh_without_writes_or_events() {
+async fn expiry_and_lru_refill_preserve_revisions_without_events() {
     let mut fixture = Fixture::new(2).await;
 
     fixture
@@ -750,14 +722,14 @@ async fn expiry_and_lru_refill_are_fresh_without_writes_or_events() {
             .contains_key(&Uuid::from_u128(1))
     );
 
-    let before = fixture.disk();
+    let before = fixture.revisions();
 
     let events = tokio::spawn(fixture.library.inner.events.clone().run());
 
     fixture.fake.subscribe(&fixture.library);
-    fixture.fake.event(before.1.system_update_id).await;
+    fixture.fake.event(before.system_update_id).await;
     fixture.library.browse(children(1)).await.unwrap();
-    assert_eq!(fixture.disk(), before);
+    assert_eq!(fixture.revisions(), before);
     fixture.expire(Scope::Root);
     fixture.expire(Scope::Album(Uuid::from_u128(1)));
 
@@ -771,7 +743,7 @@ async fn expiry_and_lru_refill_are_fresh_without_writes_or_events() {
             > expired
     );
 
-    assert_eq!(fixture.disk(), before);
+    assert_eq!(fixture.revisions(), before);
     let calls = fixture.fake.upstream.lock().unwrap().requests.len();
     fixture.fake.upstream.lock().unwrap().outage = true;
     fixture.library.browse(children(1)).await.unwrap();
@@ -834,7 +806,7 @@ async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
         (root_bytes, contents_bytes)
     };
 
-    let before = fixture.disk();
+    let before = fixture.revisions();
     fixture.fake.upstream.lock().unwrap().albums[0]["albumName"] = json!("Albums");
     fixture.expire(Scope::Root);
 
@@ -851,35 +823,35 @@ async fn root_counts_toward_byte_budget_and_payload_eviction_retains_history() {
         assert_eq!(state.ledger.albums.len(), 2);
 
         for (id, album) in &state.ledger.albums {
-            assert_eq!(album.contents_digest, before.1.albums[id].contents_digest);
+            assert_eq!(album.contents_digest, before.albums[id].contents_digest);
         }
     }
 
-    let grown = fixture.disk();
-    assert_eq!(grown.1.system_update_id, before.1.system_update_id + 1);
+    let grown = fixture.revisions();
+    assert_eq!(grown.system_update_id, before.system_update_id + 1);
 
     assert_eq!(
-        grown.1.albums[&Uuid::from_u128(1)].update_id,
-        before.1.albums[&Uuid::from_u128(1)].update_id + 1
+        grown.albums[&Uuid::from_u128(1)].update_id,
+        before.albums[&Uuid::from_u128(1)].update_id + 1
     );
 
     assert_eq!(
-        grown.1.albums[&Uuid::from_u128(2)],
-        before.1.albums[&Uuid::from_u128(2)]
+        grown.albums[&Uuid::from_u128(2)],
+        before.albums[&Uuid::from_u128(2)]
     );
 
     fixture.library.browse(children(1)).await.unwrap();
-    assert_eq!(fixture.disk(), grown);
+    assert_eq!(fixture.revisions(), grown);
     fixture.abort(task).await;
 }
 
 #[tokio::test]
-async fn metadata_contents_and_restart_preserve_independent_durable_counters() {
+async fn metadata_contents_have_independent_counters_and_restart_forgets_history() {
     let mut fixture = Fixture::new(2).await;
     let task = fixture.run();
     fixture.library.browse(children(1)).await.unwrap();
     fixture.library.browse(children(2)).await.unwrap();
-    let before = fixture.disk().1;
+    let before = fixture.revisions();
     fixture.fake.upstream.lock().unwrap().albums[0]["albumName"] = json!("Renamed");
     fixture.expire(Scope::Root);
 
@@ -889,7 +861,7 @@ async fn metadata_contents_and_restart_preserve_independent_durable_counters() {
         .await
         .unwrap();
 
-    let renamed = fixture.disk().1;
+    let renamed = fixture.revisions();
     assert_eq!(result.objects[0].title, "Renamed");
     assert_eq!(renamed.system_update_id, before.system_update_id + 1);
 
@@ -916,30 +888,21 @@ async fn metadata_contents_and_restart_preserve_independent_durable_counters() {
     fixture.expire(Scope::Album(Uuid::from_u128(1)));
     fixture.library.browse(children(1)).await.unwrap();
     fixture.abort(task).await;
-    let mut restarted = fixture.disk().1;
-    restarted.restart();
-    let store = fixture.library.inner.store.clone();
-    store.persist(restarted.clone()).await;
-
     fixture.library = ImmichCatalog::from_parts(
-        config(fixture.fake.address, fixture.directory.path()),
-        store,
-        restarted.clone(),
+        config(fixture.fake.address),
+        Ledger::new(0),
         Subscriptions::new().unwrap(),
     )
     .unwrap();
 
-    let disk = fixture.disk();
     let task = fixture.run();
-
-    assert_eq!(
-        fixture.library.system_update_id(),
-        restarted.system_update_id
-    );
+    assert_eq!(fixture.library.system_update_id(), 0);
+    assert!(fixture.revisions().albums.is_empty());
 
     fixture.library.browse(children(1)).await.unwrap();
     fixture.library.browse(children(2)).await.unwrap();
-    assert_eq!(fixture.disk(), disk);
+    assert_eq!(fixture.library.system_update_id(), 3);
+    assert_eq!(fixture.revisions().albums[&Uuid::from_u128(1)].update_id, 1);
     assert_eq!(fixture.fake.calls("/api/server/version"), 2);
     fixture.abort(task).await;
 }
@@ -996,11 +959,6 @@ async fn shared_flights_survive_callers_and_four_scopes_reject_without_backlog()
     fixture.library.browse(children(5)).await.unwrap();
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 5);
     assert_eq!(fixture.library.system_update_id(), 7);
-
-    assert_eq!(
-        fixture.disk().1,
-        *fixture.library.inner.state.lock().unwrap().ledger
-    );
 
     fixture.abort(task).await;
 }
@@ -1060,13 +1018,12 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
     // Stall version checking, album listing, or a later search page.
     for (stage, body_pending) in [(0, true), (1, false), (1, true), (2, false), (2, true)] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let config = config(listener.local_addr().unwrap(), directory.path());
-
-        let library = ImmichCatalog::open(config, Subscriptions::new().unwrap())
-            .await
-            .unwrap();
+        let library = ImmichCatalog::from_parts(
+            config(listener.local_addr().unwrap()),
+            Ledger::new(1),
+            Subscriptions::new().unwrap(),
+        )
+        .unwrap();
 
         tokio::time::pause();
 
@@ -1117,15 +1074,15 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
         }
 
         assert!(!caller.is_finished());
-        let before = disk(directory.path());
+        let before = library.inner.state.lock().unwrap().ledger.clone();
 
         // Earlier requests consumed six seconds; a new page gets no new window.
-        tokio::time::advance(Duration::from_secs(if stage == 0 { 21 } else { 15 })).await;
+        tokio::time::advance(Duration::from_secs(if stage == 0 { 26 } else { 20 })).await;
 
         clock_guard.abort();
         assert!(clock_guard.await.unwrap_err().is_cancelled());
         fault(caller, 501).await;
-        assert_eq!(disk(directory.path()), before);
+        assert_eq!(library.inner.state.lock().unwrap().ledger, before);
         assert_eq!(library.inner.permits.available_permits(), REFRESHES);
 
         assert!(library.inner.state.lock().unwrap().flights.is_empty());
@@ -1147,13 +1104,12 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
 }
 
 #[tokio::test]
-async fn whole_permit_covers_commit_wait_and_preparation_timeout_cleans_flight() {
+async fn whole_permit_covers_projection_and_refresh_timeout_cleans_flight() {
     let fixture = Fixture::new(1).await;
     let task = fixture.run();
 
     fixture.library.browse(metadata_query("0")).await.unwrap();
 
-    let gate = fixture.library.inner.commit.lock().await;
     let barrier = Barrier::new();
 
     *fixture.library.inner.prepared.lock().unwrap() =
@@ -1162,14 +1118,12 @@ async fn whole_permit_covers_commit_wait_and_preparation_timeout_cleans_flight()
     let caller = spawn_browse(&fixture.library, children(1));
     barrier.entered().await;
     tokio::time::pause();
-    barrier.release.add_permits(1);
-    tokio::task::yield_now().await;
     assert_eq!(fixture.library.inner.permits.available_permits(), 3);
-    let before = fixture.disk();
-    tokio::time::advance(PREPARATION_TIMEOUT + Duration::from_millis(1)).await;
+    let before = fixture.revisions();
+    tokio::time::advance(REFRESH_TIMEOUT + Duration::from_millis(1)).await;
     tokio::time::resume();
     fault(caller, 501).await;
-    assert_eq!(fixture.disk(), before);
+    assert_eq!(fixture.revisions(), before);
     assert_eq!(fixture.library.inner.permits.available_permits(), 4);
 
     assert!(
@@ -1183,7 +1137,6 @@ async fn whole_permit_covers_commit_wait_and_preparation_timeout_cleans_flight()
             .is_empty()
     );
 
-    drop(gate);
     *fixture.library.inner.prepared.lock().unwrap() = None;
     fixture.library.browse(children(1)).await.unwrap();
     fixture.abort(task).await;
@@ -1231,10 +1184,10 @@ async fn stale_unchanged_album_cannot_survive_root_removal_and_reappearance() {
 
     fixture.library.browse(metadata_query("0")).await.unwrap();
 
-    let before = fixture.disk();
+    let before = fixture.revisions();
     barrier.release.add_permits(1);
     fault(caller, 501).await;
-    assert_eq!(fixture.disk(), before);
+    assert_eq!(fixture.revisions(), before);
 
     assert!(
         !fixture
@@ -1250,7 +1203,7 @@ async fn stale_unchanged_album_cannot_survive_root_removal_and_reappearance() {
 
     *fixture.library.inner.prepared.lock().unwrap() = None;
     fixture.library.browse(children(1)).await.unwrap();
-    assert_eq!(fixture.disk(), before);
+    assert_eq!(fixture.revisions(), before);
     fixture.abort(task).await;
 }
 
@@ -1275,12 +1228,12 @@ async fn unrelated_root_and_album_changes_do_not_invalidate_prepared_contents() 
     fixture.fake.upstream.lock().unwrap().albums[1]["albumName"] = json!("Other rename");
     fixture.expire(Scope::Root);
     fixture.library.browse(children(2)).await.unwrap();
-    let before = fixture.disk();
+    let before = fixture.revisions();
     barrier.release.add_permits(1);
     caller.await.unwrap().unwrap();
-    assert_eq!(fixture.disk(), before);
+    assert_eq!(fixture.revisions(), before);
     let view = flight.borrow().as_ref().unwrap().as_ref().unwrap().clone();
-    assert_eq!(*view.ledger, before.1);
+    assert_eq!(view.ledger, before);
 
     assert_eq!(
         view.root.albums[&Uuid::from_u128(2)].metadata.object.title,
@@ -1288,191 +1241,6 @@ async fn unrelated_root_and_album_changes_do_not_invalidate_prepared_contents() 
     );
 
     fixture.abort(task).await;
-}
-
-#[tokio::test]
-async fn publication_failure_worker() {
-    let Some(directory) = std::env::var_os("CATALOG_TEST_DIRECTORY") else {
-        return;
-    };
-
-    let mode = std::env::var("CATALOG_TEST_MODE").unwrap();
-    let mut fake = Fake::new().await;
-    fake.upstream.lock().unwrap().albums = vec![album(1, "Album")];
-    let config = config(fake.address, Path::new(&directory));
-
-    let library = ImmichCatalog::open(config, Subscriptions::new().unwrap())
-        .await
-        .unwrap();
-
-    let supervised = library.clone();
-    let mut supervisor = tokio::spawn(async move { supervised.run().await });
-
-    library
-        .browse(page_query("0", 0, 0, SortOrder::Catalog))
-        .await
-        .unwrap();
-
-    let before = library.inner.state.lock().unwrap().ledger.clone();
-
-    let mut events = tokio::spawn(library.inner.events.clone().run());
-
-    fake.subscribe(&library);
-    fake.event(before.system_update_id).await;
-    fake.upstream.lock().unwrap().albums = vec![album(1, "Changed")];
-
-    library
-        .inner
-        .state
-        .lock()
-        .unwrap()
-        .cache
-        .root
-        .as_mut()
-        .unwrap()
-        .completed -= FRESHNESS;
-
-    let mut barrier = Barrier::new();
-    Arc::get_mut(&mut barrier).unwrap().panic = mode == "panic";
-    *library.inner.publication.lock().unwrap() = Some(barrier.clone());
-    let mut caller = spawn_browse(&library, page_query("0", 0, 0, SortOrder::Catalog));
-    barrier.entered().await;
-    let directory = Path::new(&directory);
-
-    let committed: Ledger =
-        serde_json::from_slice(&fs::read(directory.join("revisions.json")).unwrap()).unwrap();
-
-    assert_eq!(committed.system_update_id, before.system_update_id + 1);
-    assert_ne!(committed.root_digest, before.root_digest);
-
-    {
-        let state = library.inner.state.lock().unwrap();
-        assert_eq!(state.ledger, before);
-
-        assert_eq!(
-            state.cache.root.as_ref().unwrap().snapshot.albums[&Uuid::from_u128(1)]
-                .metadata
-                .object
-                .title,
-            "Album"
-        );
-    }
-
-    // A subscription registered after durable completion still sees published state.
-    fake.subscribe(&library);
-    fake.event(before.system_update_id).await;
-    assert!(fake.notifications.try_recv().is_err());
-    assert!(!caller.is_finished());
-
-    fs::write(
-        directory.join("observed-candidate.json"),
-        serde_json::to_vec(&committed).unwrap(),
-    )
-    .unwrap();
-
-    if mode == "panic" {
-        barrier.release.add_permits(1);
-    }
-
-    // Only Publication::drop may end this worker successfully for the parent.
-    tokio::select! {
-        _ = &mut caller => std::process::exit(90),
-
-        _ = &mut supervisor => std::process::exit(91),
-
-        _ = &mut events => std::process::exit(92),
-
-        _ = fake.notifications.recv() => std::process::exit(93),
-
-        _ = tokio::time::sleep(COMMIT_TIMEOUT + Duration::from_secs(1)) => {
-            std::process::exit(94);
-        }
-    }
-}
-
-async fn publication_failure(mode: &str) {
-    let directory = tempfile::tempdir().unwrap();
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
-
-    let test_name = format!(
-        "{}::publication_failure_worker",
-        module_path!().split_once("::").unwrap().1
-    );
-
-    let mut child = {
-        let _spawn = SPAWN_OR_REOPEN.lock().unwrap();
-
-        std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test_name, "--nocapture"])
-            .env("CATALOG_TEST_DIRECTORY", directory.path())
-            .env("CATALOG_TEST_MODE", mode)
-            .stdin(std::process::Stdio::null())
-            .spawn()
-            .unwrap()
-    };
-
-    let started = std::time::Instant::now();
-
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-
-        if started.elapsed() >= Duration::from_secs(12) {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("catalog publication worker exceeded watchdog deadline");
-        }
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
-
-    assert_eq!(status.code(), Some(1), "{mode}: {status}");
-
-    let candidate: Ledger = serde_json::from_slice(
-        &fs::read(directory.path().join("observed-candidate.json")).unwrap(),
-    )
-    .unwrap();
-
-    assert_eq!(candidate.system_update_id, 3);
-    let (store, mut restored) = Store::open(directory.path(), Uuid::from_u128(999)).unwrap();
-    assert_eq!(restored, candidate);
-    restored.restart();
-    store.persist(restored.clone()).await;
-    let mut fake = Fake::new().await;
-    fake.upstream.lock().unwrap().albums = vec![album(1, "Changed")];
-
-    let library = ImmichCatalog::from_parts(
-        config(fake.address, directory.path()),
-        store,
-        restored.clone(),
-        Subscriptions::new().unwrap(),
-    )
-    .unwrap();
-
-    let result = library
-        .browse(page_query("0", 0, 0, SortOrder::Catalog))
-        .await
-        .unwrap();
-
-    assert_eq!(result.objects[0].title, "Changed");
-    assert_eq!(result.update_id, 4);
-    assert_eq!(*library.inner.state.lock().unwrap().ledger, restored);
-    let events = tokio::spawn(library.inner.events.clone().run());
-    fake.subscribe(&library);
-    fake.event(4).await;
-    events.abort();
-    assert!(events.await.unwrap_err().is_cancelled());
-}
-
-#[tokio::test]
-async fn publication_timeout_after_persist_fails_stop_and_restores_candidate() {
-    publication_failure("timeout").await;
-}
-
-#[tokio::test]
-async fn publication_panic_after_persist_fails_stop_and_restores_candidate() {
-    publication_failure("panic").await;
 }
 
 #[tokio::test]
@@ -1536,13 +1304,13 @@ async fn abandoned_refresh_completes_and_expiry_alone_never_does_work() {
     flight.changed().await.unwrap();
     assert!(flight.borrow().as_ref().is_some_and(Result::is_ok));
     assert_eq!(fixture.library.system_update_id(), 2);
-    let before = fixture.disk();
+    let before = fixture.revisions();
     let calls = fixture.fake.upstream.lock().unwrap().requests.len();
     tokio::time::pause();
     tokio::time::advance(FRESHNESS).await;
     tokio::time::resume();
     assert_eq!(fixture.library.system_update_id(), 2);
-    assert_eq!(fixture.disk(), before);
+    assert_eq!(fixture.revisions(), before);
     assert_eq!(fixture.fake.upstream.lock().unwrap().requests.len(), calls);
 
     assert!(
@@ -1686,9 +1454,9 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
 
     assert!(futures_util::poll!(&mut album_waiter).is_pending());
     let mut flight = fixture.library.inner.state.lock().unwrap().flights[&Scope::Root].clone();
-    let before = fixture.disk();
+    let before = fixture.revisions();
     flight.changed().await.unwrap();
-    assert_eq!(fixture.disk(), before);
+    assert_eq!(fixture.revisions(), before);
     fixture.fake.upstream.lock().unwrap().albums.remove(0);
     fixture.expire(Scope::Root);
 
@@ -1697,7 +1465,7 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
     assert_eq!(removed.objects[0].child_count(), Some(1));
     let old_root = root_waiter.await.unwrap();
     assert_eq!(old_root.objects[0].child_count(), Some(2));
-    assert_eq!(old_root.update_id, before.1.system_update_id);
+    assert_eq!(old_root.update_id, before.system_update_id);
     let old_album = album_waiter.await.unwrap();
 
     assert_eq!(
@@ -1707,7 +1475,7 @@ async fn fresh_hits_and_unchanged_root_flights_pin_coherent_views() {
 
     assert_eq!(
         old_album.update_id,
-        before.1.albums[&Uuid::from_u128(1)].update_id
+        before.albums[&Uuid::from_u128(1)].update_id
     );
 
     assert_eq!(
@@ -1748,9 +1516,9 @@ async fn failed_album_keeps_successful_root_and_later_requests_recover() {
         .insert(Uuid::from_u128(1), vec![json!({"id": Uuid::from_u128(1)})]);
 
     fault(spawn_browse(&fixture.library, children(1)), 501).await;
-    let root = fixture.disk();
-    assert_eq!(root.1.system_update_id, 2);
-    assert!(root.1.albums[&Uuid::from_u128(1)].contents_digest.is_none());
+    let root = fixture.revisions();
+    assert_eq!(root.system_update_id, 2);
+    assert!(root.albums[&Uuid::from_u128(1)].contents_digest.is_none());
     assert_eq!(fixture.library.system_update_id(), 2);
 
     assert!(
@@ -1772,7 +1540,7 @@ async fn failed_album_keeps_successful_root_and_later_requests_recover() {
     fixture.fake.event(2).await;
     fixture.fake.upstream.lock().unwrap().contents.clear();
     let result = fixture.library.browse(children(1)).await.unwrap();
-    assert_eq!(result.update_id, 1);
+    assert_eq!(result.update_id, 2);
     assert_eq!(result.total_matches, 0);
     fixture.fake.event(3).await;
     assert_eq!(fixture.fake.calls("/api/albums"), 1);

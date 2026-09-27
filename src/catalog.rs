@@ -1,10 +1,8 @@
-//! Browse-driven snapshots, durable revision history, and service-owned publication.
+//! Browse-driven snapshots and process-local revision history.
 //!
-//! Snapshots are prepared concurrently. Changed revision persistence, publication,
-//! and notification-state updates form one serialized, non-cancelable commit.
-//! Client deadlines only stop waiting.
-//! History is never automatically pruned; exhausted or lost state requires explicit
-//! recovery with a new server UUID and an empty state directory.
+//! Shared refreshes prepare snapshots concurrently, then publish snapshots,
+//! counters, and pending event state under one short lock. Client deadlines only
+//! stop waiting. Restarting forgets history and randomly seeds new counters.
 
 use std::{
     collections::BTreeMap,
@@ -17,7 +15,7 @@ use anyhow::{Result, anyhow, ensure};
 use icu_collator::CollatorBorrowed;
 use serde::Serialize;
 use tokio::{
-    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, watch},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, watch},
     task::JoinSet,
     time::{Instant, timeout_at},
 };
@@ -33,7 +31,7 @@ mod snapshots;
 
 pub use browse::{ObjectId, parse_id};
 use browse::{Payload, View};
-use revisions::{AlbumRevision, Ledger, Store};
+use revisions::{AlbumRevision, Ledger};
 use snapshots::{Contents, Root, Source};
 
 const FRESHNESS: Duration = Duration::from_secs(60);
@@ -42,9 +40,7 @@ const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ALBUMS: usize = 4_096;
 const REFRESHES: usize = 4;
-const PREPARATION_TIMEOUT: Duration = Duration::from_secs(20);
-// The outer commit includes publication; persistence also runs independently at startup.
-const COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Select, sort and paginate objects, capturing their revision together.
 pub trait Catalog: Send + Sync + 'static {
@@ -193,11 +189,6 @@ pub struct Resource {
     pub byte_seek: bool,
 }
 
-// Fork temporarily inherits flock descriptors even with CLOEXEC. All subprocess
-// tests share this guard with close/reopen tests until exec closes those copies.
-#[cfg(test)]
-static SPAWN_OR_REOPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 const FAILED: Fault = Fault::ActionFailed;
 const MISSING: Fault = Fault::NoSuchObject;
 
@@ -215,16 +206,12 @@ pub(crate) struct ImmichCatalog {
 struct Inner {
     source: Source,
     collator: CollatorBorrowed<'static>,
-    store: Store,
     events: Subscriptions,
     failure: CancellationToken,
     state: Mutex<State>,
-    commit: AsyncMutex<()>,
     permits: Arc<Semaphore>,
     supervisor: Mutex<Supervisor>,
     wake: Notify,
-    #[cfg(test)]
-    publication: Mutex<Option<Arc<tests::Barrier>>>,
     #[cfg(test)]
     prepared: Mutex<Option<(Scope, Arc<tests::Barrier>)>>,
 }
@@ -433,17 +420,6 @@ impl Drop for Flight {
     }
 }
 
-// Persistence's own guard ends at disk completion; this one extends ownership
-// through catalog assignment AND subscriber publication, including unwinding.
-struct Publication;
-
-impl Drop for Publication {
-    fn drop(&mut self) {
-        tracing::error!("catalog commit did not complete publication; terminating");
-        std::process::exit(1);
-    }
-}
-
 struct Running(ImmichCatalog);
 
 impl Drop for Running {
@@ -453,21 +429,11 @@ impl Drop for Running {
 }
 
 impl ImmichCatalog {
-    /// Lock, load, and durably invalidate revision state before admitting requests.
-    pub(crate) async fn open(config: Config, events: Subscriptions) -> Result<Self> {
-        let (store, mut ledger) = Store::open(&config.state_directory, config.server_uuid)?;
-        ledger.restart();
-        let ledger = store.persist(ledger).await;
-
-        Self::from_parts(config, store, ledger, events)
+    pub(crate) fn new(config: Config, events: Subscriptions) -> Result<Self> {
+        Self::from_parts(config, Ledger::new(rand::random()), events)
     }
 
-    fn from_parts(
-        config: Config,
-        store: Store,
-        ledger: Ledger,
-        events: Subscriptions,
-    ) -> Result<Self> {
+    fn from_parts(config: Config, ledger: Ledger, events: Subscriptions) -> Result<Self> {
         let source = Source::new(
             immich::Client::new(config.api_base, config.api_key)?,
             config.listen_address,
@@ -480,7 +446,6 @@ impl ImmichCatalog {
             inner: Arc::new(Inner {
                 source,
                 collator: config.collator,
-                store,
                 events,
                 failure: CancellationToken::new(),
                 state: Mutex::new(State {
@@ -488,15 +453,12 @@ impl ImmichCatalog {
                     cache: Cache::new(),
                     flights: BTreeMap::new(),
                 }),
-                commit: AsyncMutex::new(()),
                 permits: Arc::new(Semaphore::new(REFRESHES)),
                 supervisor: Mutex::new(Supervisor {
                     tasks: JoinSet::new(),
                     running: false,
                 }),
                 wake: Notify::new(),
-                #[cfg(test)]
-                publication: Mutex::new(None),
                 #[cfg(test)]
                 prepared: Mutex::new(None),
             }),
@@ -614,7 +576,7 @@ impl ImmichCatalog {
                     result: Err(FAILED),
                 };
 
-                let deadline = now + PREPARATION_TIMEOUT;
+                let deadline = now + REFRESH_TIMEOUT;
 
                 supervisor.tasks.spawn(async move {
                     flight.result = flight
@@ -649,11 +611,11 @@ impl ImmichCatalog {
         }
     }
 
-    async fn refresh(&self, token: Token, preparation: Instant) -> Result<View> {
+    async fn refresh(&self, token: Token, deadline: Instant) -> Result<View> {
         let scope = token.scope();
 
         ensure!(
-            !self.inner.failure.is_cancelled() && Instant::now() < preparation,
+            !self.inner.failure.is_cancelled() && Instant::now() < deadline,
             "catalog preparation failed or expired"
         );
 
@@ -676,33 +638,20 @@ impl ImmichCatalog {
                 }
             }
 
-            let gate = self.inner.commit.lock().await;
-
-            Ok::<_, anyhow::Error>((candidate, gate))
+            Ok::<_, anyhow::Error>(candidate)
         };
 
-        let (candidate, _gate) = tokio::select! {
+        let candidate = tokio::select! {
             biased;
             _ = self.inner.failure.cancelled() => return Err(anyhow!("catalog preparation cancelled after task failure")),
 
-            result = timeout_at(preparation, prepare) => {
-                result.map_err(|_| anyhow!("catalog preparation deadline exceeded"))??
+            result = timeout_at(deadline, prepare) => {
+                result.map_err(|_| anyhow!("catalog refresh deadline exceeded"))??
             }
         };
 
-        ensure!(
-            !self.inner.failure.is_cancelled() && Instant::now() < preparation,
-            "catalog preparation failed or expired"
-        );
-
-        let deadline = Instant::now() + COMMIT_TIMEOUT;
-
-        let ledger = {
-            let state = self.inner.state.lock().unwrap();
-            ensure!(token.applicable(&state.ledger), "stale catalog candidate");
-
-            state.ledger.clone()
-        };
+        let mut state = self.inner.state.lock().unwrap();
+        ensure!(token.applicable(&state.ledger), "stale catalog candidate");
 
         let next = match &candidate {
             Candidate::Root(root) => {
@@ -712,80 +661,33 @@ impl ImmichCatalog {
                     .map(|(id, album)| (*id, album.digest))
                     .collect();
 
-                ledger.root_transition(&root.digest, &albums)?
+                state.ledger.root_transition(&root.digest, &albums)?
             }
 
-            Candidate::Album(id, contents) => ledger.contents_transition(*id, &contents.digest)?,
+            Candidate::Album(id, contents) => {
+                state.ledger.contents_transition(*id, &contents.digest)?
+            }
         };
 
         ensure!(
-            !self.inner.failure.is_cancelled()
-                && Instant::now() < preparation
-                && Instant::now() < deadline,
-            "catalog preparation failed or expired"
+            !self.inner.failure.is_cancelled() && Instant::now() < deadline,
+            "catalog refresh failed or expired"
         );
 
         let changed = next.is_some();
-        let guard = if changed { Some(Publication) } else { None };
 
-        let publish = async {
-            let next = match next {
-                Some(next) => Some(self.inner.store.persist(next).await),
-                None => None,
-            };
+        if let Some(next) = next {
+            state.ledger = Arc::new(next);
+        }
 
-            #[cfg(test)]
-            {
-                let barrier = self.inner.publication.lock().unwrap().clone();
+        state.cache.insert(candidate, Instant::now());
 
-                if let Some(barrier) = barrier {
-                    barrier.entered.notify_one();
-                    barrier.release.acquire().await.unwrap().forget();
-                    assert!(!barrier.panic, "injected publication panic");
-                }
-            }
+        if changed {
+            self.inner.events.publish(state.ledger.system_update_id);
+        }
 
-            // The commit gate remains owned from applicability checking through
-            // publication, so no other refresh can interleave a ledger write.
-            let mut state = self.inner.state.lock().unwrap();
-
-            ensure!(
-                Instant::now() < deadline,
-                "catalog publication deadline exceeded"
-            );
-
-            if let Some(next) = next {
-                state.ledger = Arc::new(next);
-            }
-
-            state.cache.insert(candidate, Instant::now());
-
-            if changed {
-                self.inner.events.publish(state.ledger.system_update_id);
-            }
-
-            let view = state
-                .view(scope)
-                .map_err(|_| anyhow!("catalog publication missing snapshot"))?;
-
-            // Freshness starts after the entire publication boundary, not fetch.
-            let completed = Instant::now();
-            state.cache.mark_completed(scope, completed);
-
-            ensure!(
-                completed < deadline,
-                "catalog publication deadline exceeded"
-            );
-
-            Ok(view)
-        };
-
-        let result = timeout_at(deadline, publish)
-            .await
-            .map_err(|_| anyhow!("catalog commit deadline exceeded"))?;
-
-        let view = result?;
-        std::mem::forget(guard);
+        let view = state.view(scope).expect("published snapshot is resident");
+        state.cache.mark_completed(scope, Instant::now());
 
         Ok(view)
     }

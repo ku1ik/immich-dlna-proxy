@@ -29,7 +29,6 @@ struct Settings {
     friendly_name: String,
     sort_locale: String,
     server_uuid: Uuid,
-    state_directory: PathBuf,
     #[serde(default = "default_log_level")]
     log_level: String,
 }
@@ -50,7 +49,6 @@ pub struct Config {
     pub(crate) friendly_name: String,
     pub(crate) collator: CollatorBorrowed<'static>,
     pub(crate) server_uuid: Uuid,
-    pub(crate) state_directory: PathBuf,
     pub log_level: tracing::Level,
     pub(crate) interface_index: u32,
 }
@@ -71,7 +69,6 @@ impl Config {
             friendly_name: settings.friendly_name,
             collator,
             server_uuid: settings.server_uuid,
-            state_directory: settings.state_directory,
             log_level: settings.log_level.parse().expect("validated log level"),
             interface_index,
         })
@@ -84,8 +81,8 @@ fn parse_settings(text: &str) -> anyhow::Result<Settings> {
         .map_err(|_| anyhow::anyhow!("invalid configuration fields or TOML"))?;
 
     ensure!(
-        settings.immich_api_key_file.is_absolute() && settings.state_directory.is_absolute(),
-        "credential and state paths must be absolute"
+        settings.immich_api_key_file.is_absolute(),
+        "credential path must be absolute"
     );
 
     ensure!(
@@ -293,7 +290,6 @@ immich_api_key_file = "/run/secrets/key"
 listen_address = "192.168.1.10:8200"
 sort_locale = "pl"
 server_uuid = "7B37DF49-B75D-4BCB-89A6-0C917A934643"
-state_directory = "/var/lib/immich-dlna-proxy"
 "#;
 
     #[test]
@@ -322,12 +318,12 @@ state_directory = "/var/lib/immich-dlna-proxy"
                 "00000000-0000-0000-0000-000000000000",
             ),
             ("/run/secrets/key", "relative-key"),
-            ("/var/lib/immich-dlna-proxy", "relative-state"),
         ] {
             assert!(parse_settings(&CONFIG.replace(old, new)).is_err(), "{new}");
         }
 
         for extra in [
+            "state_directory = \"/var/lib/immich-dlna-proxy\"",
             "friendly_name = \"\"",
             "friendly_name = \"\\u0001\"",
             "log_level = \"INFO\"",

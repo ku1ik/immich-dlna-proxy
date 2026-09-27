@@ -16,7 +16,6 @@ let
     friendly_name = cfg.friendlyName;
     sort_locale = cfg.sortLocale;
     server_uuid = cfg.serverUuid;
-    state_directory = "/var/lib/immich-dlna-proxy";
     log_level = cfg.logLevel;
   };
   addressMatch = builtins.match "[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:([0-9]{1,5})" cfg.listenAddress;
@@ -135,8 +134,6 @@ in
         # LoadCredential does not accept a quoted ID:path pair.
         LoadCredential = [ "immich-api-key:${cfg.immichApiKeyFile}" ];
         DynamicUser = true;
-        StateDirectory = "immich-dlna-proxy";
-        StateDirectoryMode = "0700";
         UMask = "0077";
         Restart = "on-failure";
         RestartSec = 3;

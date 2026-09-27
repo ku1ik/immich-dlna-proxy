@@ -46,7 +46,6 @@ listen_address = "192.168.1.10:8200"
 friendly_name = "Immich"
 sort_locale = "pl"
 server_uuid = "7b37df49-b75d-4bcb-89a6-0c917a934643"
-state_directory = "/var/lib/immich-dlna-proxy"
 log_level = "info"
 ```
 
@@ -72,8 +71,8 @@ Defaults: `friendly_name = "Immich"` (1-128 XML-safe UTF-8 bytes), `log_level = 
 Provision the key externally as a protected regular file, **<= 8 KiB**. Only trailing
 CR/LF are removed, not spaces; empty keys/remaining controls are rejected. Never put
 the key in TOML, command arguments, or the Nix store. For direct execution, use its
-absolute runtime path and pre-create `state_directory`, user-owned, writable, mode
-**0700**, on local storage. Systemd provisions credentials and state instead.
+absolute runtime path. Systemd provisions credentials through `LoadCredential`.
+Catalog revisions are kept in memory; no writable state directory is needed.
 
 ## Standalone Systemd
 
@@ -91,8 +90,6 @@ After=network-online.target
 ExecStart=/usr/local/bin/immich-dlna-proxy --config /etc/immich-dlna-proxy.toml
 LoadCredential=immich-api-key:/run/secrets/immich-dlna-api-key
 DynamicUser=yes
-StateDirectory=immich-dlna-proxy
-StateDirectoryMode=0700
 UMask=0077
 Restart=on-failure
 RestartSec=3
@@ -210,45 +207,42 @@ is not a force-refresh bypass or automatic library synchronization.
 
 Fixed limits: 4,096 current albums; 20,000 eligible items/16 MiB per album; 50 pages/50,000
 examined records per traversal; 32 resident albums/64 MiB projected cache; 16 media operations.
-Over-limit refreshes fail, never truncate. History retains **16,384 lifetime album identities**
-including removals, independently of cache eviction; removing albums cannot reclaim history.
+Over-limit refreshes fail, never truncate. In-memory history retains **16,384 album identities
+per process lifetime**, including removals, independently of snapshot eviction. If history
+fills, refreshes needing new identities fail; restart to clear it using the same device UUID.
 
-State uses one exclusive process-lifetime directory lock, not a lock file or initialization
-marker. Counters/digests survive eviction; restarts durably increment global/retained album
-counters before discovery. Updates use a temporary-file write, file sync, atomic rename,
-and directory sync before publication; persistence failure or a five-second commit timeout
-terminates the service. Invalid or wrong-UUID `revisions.json` blocks startup; its absence
-initializes state only if the directory is otherwise empty. An uncommitted `revisions.tmp`
-is discarded only after loading valid committed state; other files are left untouched.
-Immich outages do not block startup: version checking occurs on first catalog access;
-requests can recover.
+Global and per-album update IDs are wrapping 32-bit counters. One random seed initializes
+each process and its newly observed albums. Full catalog fingerprints detect changes;
+snapshots, counters, and pending notifications are published together in memory. Each
+refresh has one 25-second budget; a timeout fails the refresh without terminating the service.
+Immich outages do not block startup: version checking occurs on first catalog access.
 
-Configured state-directory symlinks are resolved once at startup; file operations use that
-resolved path. Live replacement/renaming of the directory or its parents and external state
-edits are unsupported. **Stop the service for maintenance and upgrades**; the directory lock
-does not coordinate with older binaries that lock only `revisions.lock`.
+Restarting forgets counters and fingerprints but retains the configured device UUID.
+**Restart cache invalidation is probabilistic**: a new revision can match one cached by a
+client. First observations may report changes even when Immich is unchanged. Client restart
+behavior with memory-only revisions remains to be checked on the LG C4 and desktop viewers.
 
-Back up the **whole state directory and matching configuration/UUID** while stopped.
-Protect backups; restore ownership/modes (directory 0700, files 0600). Never delete state
-while keeping the UUID: reset counters break client change tracking. Deleting the sole
-`revisions.json` and leaving an empty directory is indistinguishable from first setup,
-as is complete directory loss: restore intact matching state/UUID or use a new identity.
-A full-ledger restore cannot fix lifetime exhaustion: **stop, archive the old state directory,
-configure a new UUID, and start with fresh empty private state**. Let `StateDirectory`
-recreate systemd-managed state; the TV will discover a new device.
-With DynamicUser, the configured directory may link into `/var/lib/private`;
-archive the actual state data, not just that symlink.
+### Upgrading from Persistent Revisions
+
+Stop the old service, remove `state_directory` from standalone TOML and `StateDirectory` /
+`StateDirectoryMode` from standalone units, then upgrade and restart with the same UUID.
+The NixOS module generates the updated configuration. Unknown TOML fields are rejected.
+
+Old revision files are unused and never automatically deleted. They may be archived or
+removed explicitly; with DynamicUser, account for the symlink into `/var/lib/private`.
+Restoring an archived ledger when rolling back does not preserve continuity with revisions
+issued by the memory-only version.
 
 ## Diagnostics
 
 - Discovery: check `systemctl status immich-dlna-proxy` and read `http://192.168.1.10:8200/device.xml` with `curl --fail`. This checks local HTTP, not Immich readiness. Confirm the configured address/interface, trusted firewall rules, multicast, and Wi-Fi client isolation.
 - Desktop discovery: if direct media URLs work but discovery fails, check the client firewall too. SSDP replies come from the server's UDP 1900 to the client's search socket, which can use an ephemeral port. Opening only client UDP 1900 may be insufficient. Capture searches/replies on both hosts and scope any exception to the trusted interface/server; do not leave the firewall disabled.
-- Missing albums/items: check Immich version and `album.read`/`asset.read`, visibility, and refresh/traversal limits. Browse again after TTL expiry; counter polling alone cannot refresh. Failed refreshes leave published counters unchanged; restart increments are intentional, not proof of media changes.
+- Missing albums/items: check Immich version and `album.read`/`asset.read`, visibility, and refresh/traversal limits. Browse again after TTL expiry; counter polling alone cannot refresh. Failed refreshes leave published counters unchanged; reseeding and first observations after restart are not proof of media changes.
 - Missing key/media: inspect credential provisioning and restart after rotation. Media permission failures return 502; check `asset.view` and `asset.download`. A readable catalog does not prove byte access. Missing files normally return 404; inspect Immich generation jobs and failures.
 - MIME/generation: display/preview must actually return JPEG and playback MP4. Stale encoded records or incompatible old derivatives can fail; check settings/jobs and intentionally regenerate as needed, not by granting admin scopes to the proxy.
 - Mislabeled originals: Immich derives catalog MIME from the original filename and download MIME from the storage-path extension. A file named `.png` can contain JPEG data, leaving both labels wrong while its JPEG preview works. Inspect the actual format before blaming PNG support; metadata or thumbnail regeneration does not repair original extensions. The proxy does not probe or rewrite originals to correct this upstream inconsistency.
 - Failed seek/playback: set TOML `log_level = "debug"`, restart, then use `journalctl -u immich-dlna-proxy`. Compare selected representation, incoming/forwarded range diagnostics, upstream status and 206 evidence using the same clip; test alternatives separately. 504 indicates an upstream deadline; 503 can indicate admission overload.
-- State failures: check ownership, free space, local filesystem sync support, and duplicate processes holding the directory lock. Follow the recovery procedure, never delete state files to bypass it.
+- History exhaustion: restart to clear process-local revision history, keeping the same server UUID.
 
 Logging uses TOML, **not `RUST_LOG`**. Diagnostics include IDs/status/resource kind, not keys,
 upstream bodies, EXIF/GPS, storage paths, callback query secrets, or media. Keep reports sanitized.

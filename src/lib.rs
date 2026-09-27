@@ -23,7 +23,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let uuid = config.server_uuid;
     let name = config.friendly_name.clone();
     let interface_index = config.interface_index;
-    let catalog = ImmichCatalog::open(config, events.clone()).await?;
+    let catalog = ImmichCatalog::new(config, events.clone())?;
 
     let http = TcpListener::bind(address)
         .await
@@ -92,21 +92,13 @@ pub(crate) fn server_header() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, path::PathBuf};
-
     use http::HeaderValue;
     use uuid::Uuid;
 
     use super::*;
 
     #[tokio::test]
-    async fn revision_startup_precedes_listener_binding() {
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let state = directory.path().join("revisions.json");
-        std::fs::write(&state, b"invalid").unwrap();
-        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o600)).unwrap();
-
+    async fn listener_conflict_fails_without_contacting_immich() {
         let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
 
         let address = match occupied.local_addr().unwrap() {
@@ -121,13 +113,15 @@ mod tests {
             friendly_name: "Test".into(),
             collator: crate::config::collator("en").unwrap(),
             server_uuid: Uuid::from_u128(1),
-            state_directory: PathBuf::from(directory.path()),
             log_level: tracing::Level::INFO,
             interface_index: 1,
         };
 
         let error = run(config).await.unwrap_err().to_string();
 
-        assert!(error.contains("invalid revision JSON"), "{error}");
+        assert!(
+            error.contains("cannot bind configured HTTP listener"),
+            "{error}"
+        );
     }
 }
