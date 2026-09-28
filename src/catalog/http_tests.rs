@@ -74,7 +74,7 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
         activity.clone(),
     )
     .unwrap();
-    let events = Subscriptions::new().unwrap();
+    let (events, event_task) = Subscriptions::new().unwrap();
     let name = config.friendly_name.clone();
     let uuid = config.server_uuid;
     let (catalog, task) =
@@ -90,10 +90,11 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
         library,
         fake,
         task: Mutex::new(Some(task)),
+        event_task: Mutex::new(Some(event_task)),
     };
 
     let catalog_task = fixture.run();
-    let events_task = tokio::spawn(events.clone().run());
+    let events_task = fixture.run_events();
     let server = Server::new(
         name,
         uuid,

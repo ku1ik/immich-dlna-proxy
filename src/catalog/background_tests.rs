@@ -48,7 +48,7 @@ async fn activity_arms_without_postponing_and_passes_use_completion_based_delay(
     tokio::time::advance(INTERVAL * 5).await;
     assert_eq!(fixture.library.system_update_id().await, 1);
     assert!(fixture.fake.upstream.lock().unwrap().requests.is_empty());
-    let events = tokio::spawn(fixture.library.events.clone().run());
+    let events = fixture.run_events();
     fixture.fake.subscribe(&fixture.library);
     fixture.fake.event(1).await;
 

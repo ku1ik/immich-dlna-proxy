@@ -8,7 +8,7 @@ use anyhow::{Context, ensure};
 use axum::{Router, body::Body, extract::Request, response::Response};
 use http::{HeaderValue, Method, StatusCode, header};
 use immich_dlna_proxy::{
-    eventing::Subscriptions,
+    eventing::{EventTask, Subscriptions},
     media::{
         MediaProxy,
         Representation::{Display, Original, Playback, Preview},
@@ -262,7 +262,7 @@ pub(super) struct Bound {
     upstream: TcpListener,
     directory: PathBuf,
     server: Server<catalog::FixtureCatalog>,
-    subscriptions: Subscriptions,
+    event_task: EventTask,
 }
 
 impl Bound {
@@ -277,7 +277,7 @@ impl Bound {
             .await
             .context("bind fixture upstream")?;
 
-        let subscriptions = Subscriptions::new()?;
+        let (subscriptions, event_task) = Subscriptions::new()?;
         let address = SocketAddrV4::new(*address.ip(), http.local_addr()?.port());
         let activity = immich_dlna_proxy::Activity::default();
 
@@ -292,7 +292,7 @@ impl Bound {
             SERVER_UUID,
             catalog::FixtureCatalog(catalog::objects(address)),
             media,
-            subscriptions.clone(),
+            subscriptions,
             activity,
         );
 
@@ -301,7 +301,7 @@ impl Bound {
             upstream,
             directory,
             server,
-            subscriptions,
+            event_task,
         })
     }
 
@@ -323,7 +323,7 @@ impl Bound {
         };
 
         let http = self.server.run(self.http);
-        let subscriptions = self.subscriptions.run();
+        let subscriptions = self.event_task.run();
 
         let discovery = async move {
             match discovery {

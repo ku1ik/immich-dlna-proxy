@@ -105,7 +105,7 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
             axum::serve(upstream, router).await.unwrap();
         });
 
-        let subscriptions = Subscriptions::new().unwrap();
+        let (subscriptions, _) = Subscriptions::new().unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

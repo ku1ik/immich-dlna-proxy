@@ -272,8 +272,8 @@ impl Control {
 }
 
 impl Library {
-    fn new(config: Config, seed: u32) -> (Self, CatalogTask) {
-        let events = Subscriptions::new().unwrap();
+    fn new(config: Config, seed: u32) -> (Self, CatalogTask, crate::eventing::EventTask) {
+        let (events, event_task) = Subscriptions::new().unwrap();
         let activity = activity::Activity::default();
 
         let (catalog, task) = ImmichCatalog::from_parts(
@@ -291,6 +291,7 @@ impl Library {
                 activity,
             },
             task,
+            event_task,
         )
     }
 
@@ -356,6 +357,7 @@ struct Fixture {
     library: Library,
     fake: Fake,
     task: Mutex<Option<CatalogTask>>,
+    event_task: Mutex<Option<crate::eventing::EventTask>>,
 }
 
 impl Fixture {
@@ -365,17 +367,24 @@ impl Fixture {
         fake.upstream.lock().unwrap().albums =
             (1..=albums).map(|id| album(id as u128, "Album")).collect();
 
-        let (library, task) = Library::new(config(fake.address), 1);
+        let (library, task, event_task) = Library::new(config(fake.address), 1);
 
         Self {
             library,
             fake,
             task: Mutex::new(Some(task)),
+            event_task: Mutex::new(Some(event_task)),
         }
     }
 
     fn run(&self) -> JoinHandle<Result<()>> {
         let task = self.task.lock().unwrap().take().unwrap();
+
+        tokio::spawn(task.run())
+    }
+
+    fn run_events(&self) -> JoinHandle<Result<()>> {
+        let task = self.event_task.lock().unwrap().take().unwrap();
 
         tokio::spawn(task.run())
     }
@@ -523,7 +532,7 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
     let mut fixture = Fixture::new(2).await;
     let task = fixture.run();
 
-    let events = tokio::spawn(fixture.library.events.clone().run());
+    let events = fixture.run_events();
 
     fixture.fake.subscribe(&fixture.library);
     fixture.fake.event(1).await;
@@ -591,7 +600,7 @@ async fn album_latest_date_refresh_reorders_and_publishes_without_loading_conten
     assert_eq!(before.objects[0].title, "Z");
     let revisions = fixture.revisions().await;
 
-    let events = tokio::spawn(fixture.library.events.clone().run());
+    let events = fixture.run_events();
 
     fixture.fake.subscribe(&fixture.library);
     fixture.fake.event(before.update_id).await;
@@ -843,7 +852,7 @@ async fn expiry_and_lru_refill_preserve_revisions_without_events() {
 
     let before = fixture.revisions().await;
 
-    let events = tokio::spawn(fixture.library.events.clone().run());
+    let events = fixture.run_events();
 
     fixture.fake.subscribe(&fixture.library);
     fixture.fake.event(before.system_update_id).await;
@@ -1026,9 +1035,10 @@ async fn metadata_contents_have_independent_counters_and_restart_forgets_history
     fixture.expire(Scope::Album(Uuid::from_u128(1))).await;
     fixture.library.browse(children(1)).await.unwrap();
     fixture.abort(task).await;
-    let (library, task) = Library::new(config(fixture.fake.address), 0);
+    let (library, task, event_task) = Library::new(config(fixture.fake.address), 0);
     fixture.library = library;
     *fixture.task.lock().unwrap() = Some(task);
+    *fixture.event_task.lock().unwrap() = Some(event_task);
 
     let task = fixture.run();
     assert_eq!(fixture.library.system_update_id().await, 0);
@@ -1169,7 +1179,7 @@ async fn caller_deadline_does_not_cancel_shared_work_or_start_expired_queued_wor
 #[tokio::test]
 async fn full_or_closed_mailbox_fails_without_waiting_to_enqueue() {
     let fake = Fake::new().await;
-    let (library, task) = Library::new(config(fake.address), 1);
+    let (library, task, _) = Library::new(config(fake.address), 1);
     let mut replies = Vec::new();
 
     for _ in 0..REQUESTS {
@@ -1194,7 +1204,7 @@ async fn full_or_closed_mailbox_fails_without_waiting_to_enqueue() {
 #[tokio::test]
 async fn expired_publication_leaves_snapshot_and_revisions_untouched() {
     let fake = Fake::new().await;
-    let (_, mut task) = Library::new(config(fake.address), 1);
+    let (_, mut task, _) = Library::new(config(fake.address), 1);
     let candidate = Candidate::Root(task.source.root().await.unwrap());
     assert!(task.publish(candidate, Instant::now()).is_err());
     assert!(task.state.cache.root.is_none());
@@ -1269,7 +1279,7 @@ async fn preparation_timeout_drops_stalled_requests_across_pages() {
     // Stall version checking, album listing, or a later search page.
     for (stage, body_pending) in [(0, true), (1, false), (1, true), (2, false), (2, true)] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let (library, task) = Library::new(config(listener.local_addr().unwrap()), 1);
+        let (library, task, _) = Library::new(config(listener.local_addr().unwrap()), 1);
 
         tokio::time::pause();
 
@@ -1674,7 +1684,7 @@ async fn failed_album_keeps_successful_root_and_later_requests_recover() {
     assert!(root.albums[&Uuid::from_u128(1)].contents_digest.is_none());
     assert_eq!(fixture.library.system_update_id().await, 2);
 
-    let events = tokio::spawn(fixture.library.events.clone().run());
+    let events = fixture.run_events();
 
     fixture.fake.subscribe(&fixture.library);
     fixture.fake.event(2).await;

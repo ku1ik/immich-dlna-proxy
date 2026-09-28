@@ -30,7 +30,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         config.api_key.clone(),
         activity.clone(),
     )?;
-    let events = Subscriptions::new()?;
+    let (events, event_task) = Subscriptions::new()?;
     let address = config.listen_address;
     let uuid = config.server_uuid;
     let name = config.friendly_name.clone();
@@ -42,7 +42,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .context("cannot bind configured HTTP listener")?;
 
     let discovery = Discovery::bind(interface_index, uuid, address)?;
-    let server = Server::new(name, uuid, catalog, media, events.clone(), activity);
+    let server = Server::new(name, uuid, catalog, media, events, activity);
     tracing::info!(%address, %uuid, "service started");
 
     let shutdown = async {
@@ -63,7 +63,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
         result = catalog_task.run() => ("catalog", result),
 
-        result = events.run() => ("eventing", result),
+        result = event_task.run() => ("eventing", result),
 
         result = server.run(http) => ("HTTP", result),
 

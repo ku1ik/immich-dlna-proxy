@@ -30,6 +30,11 @@ pub(crate) const MODERATION: Duration = Duration::from_secs(2);
 pub struct Subscriptions {
     state: Arc<Mutex<State>>,
     wake: Arc<Notify>,
+}
+
+/// The uniquely owned notification scheduler, consumed when started.
+pub struct EventTask {
+    subscriptions: Subscriptions,
     client: reqwest::Client,
 }
 
@@ -37,7 +42,6 @@ pub struct Subscriptions {
 struct State {
     entries: Vec<Subscription>,
     system_update_id: u32,
-    running: bool,
 }
 
 struct Subscription {
@@ -91,17 +95,25 @@ impl State {
 }
 
 impl Subscriptions {
-    pub fn new() -> anyhow::Result<Self> {
+    /// Create a shared subscription handle and its single delivery task.
+    pub fn new() -> anyhow::Result<(Self, EventTask)> {
         let client = crate::outbound_client_builder()
             // Callback-port churn must not accumulate idle sockets across origins.
             .pool_max_idle_per_host(0)
             .build()?;
 
-        Ok(Self {
+        let subscriptions = Self {
             state: Arc::new(Mutex::new(State::default())),
             wake: Arc::new(Notify::new()),
-            client,
-        })
+        };
+
+        Ok((
+            subscriptions.clone(),
+            EventTask {
+                subscriptions,
+                client,
+            },
+        ))
     }
 
     /// Update pending events synchronously with catalog publication. Initialize
@@ -270,25 +282,20 @@ impl Subscriptions {
 
         Ok((sid, lease))
     }
+}
 
+impl EventTask {
     /// Runs the single bounded delivery scheduler. No catalog polling occurs.
     pub async fn run(self) -> anyhow::Result<()> {
-        {
-            let mut state = self.state.lock().unwrap();
-
-            anyhow::ensure!(!state.running, "eventing scheduler already started");
-
-            state.running = true;
-        }
-
+        let subscriptions = self.subscriptions;
         let mut deliveries = FuturesUnordered::new();
 
         loop {
             // Notify retains a permit if a request/publication races inspection and select.
-            let notified = self.wake.notified();
+            let notified = subscriptions.wake.notified();
 
             let deadline = {
-                let mut state = self.state.lock().unwrap();
+                let mut state = subscriptions.state.lock().unwrap();
                 let now = Instant::now();
                 state.expire(now);
 
@@ -354,7 +361,7 @@ impl Subscriptions {
                 biased;
                 finished = deliveries.next(), if !deliveries.is_empty() => {
                     let (sid, deactivate) = finished.expect("nonempty delivery set");
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = subscriptions.state.lock().unwrap();
 
                     let entry = state
                         .entries
