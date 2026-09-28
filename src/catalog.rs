@@ -206,8 +206,6 @@ struct State {
     cache: Cache,
 }
 
-type RefreshResult = Result<View, Fault>;
-
 impl State {
     fn needed(&self, query: BrowseQuery, now: Instant) -> Result<Option<Scope>, Fault> {
         if !self.cache.is_fresh(Scope::Root, now) {
@@ -227,7 +225,7 @@ impl State {
         Ok(None)
     }
 
-    fn view(&self, query: BrowseQuery) -> RefreshResult {
+    fn view(&self, query: BrowseQuery) -> Result<View, Fault> {
         let contents = match query.scope() {
             Scope::Root => None,
 
@@ -415,7 +413,7 @@ impl ImmichCatalog {
         ))
     }
 
-    async fn view(&self, query: BrowseQuery, deadline: Instant) -> RefreshResult {
+    async fn view(&self, query: BrowseQuery, deadline: Instant) -> Result<View, Fault> {
         if Instant::now() >= deadline {
             return Err(FAILED);
         }

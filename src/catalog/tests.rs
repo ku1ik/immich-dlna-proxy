@@ -331,7 +331,11 @@ impl Library {
         self.inspect(|_| ()).await;
     }
 
-    fn enqueue(&self, query: BrowseQuery, deadline: Instant) -> oneshot::Receiver<RefreshResult> {
+    fn enqueue(
+        &self,
+        query: BrowseQuery,
+        deadline: Instant,
+    ) -> oneshot::Receiver<Result<View, Fault>> {
         let (reply, receiver) = oneshot::channel();
 
         self.catalog
