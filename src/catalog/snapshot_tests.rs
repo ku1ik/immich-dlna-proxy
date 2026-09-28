@@ -503,9 +503,14 @@ fn projection_hashes_hints_capture_resource_order_and_exact_bytes() {
 
     for item in [&item, &reversed] {
         let size = serde_json::to_vec(item).unwrap().len();
-        assert_eq!(encoded_size(item, SNAPSHOT_BYTES).unwrap(), size);
-        assert_eq!(encoded_size(item, size).unwrap(), size);
-        assert!(encoded_size(item, size - 1).is_err());
+
+        for limit in [SNAPSHOT_BYTES, size] {
+            let mut count = ByteCount::new(limit);
+            count.json(item).unwrap();
+            assert_eq!(count.bytes, size);
+        }
+
+        assert!(ByteCount::new(size - 1).json(item).is_err());
     }
 }
 

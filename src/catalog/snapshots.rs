@@ -103,7 +103,8 @@ impl Source {
         let mut items = BTreeMap::<Uuid, Item>::new();
         let mut pages = 0;
         let mut records = 0;
-        let mut bytes = 2;
+        let mut count = ByteCount::new(SNAPSHOT_BYTES);
+        count.write_all(b"[]")?;
         let mut bad_dates = 0;
 
         for encoded in [false, true] {
@@ -161,13 +162,8 @@ impl Source {
                             byte_seek: true,
                         };
 
-                        let separator = usize::from(!resources.is_empty());
-
-                        let remaining = (SNAPSHOT_BYTES - bytes)
-                            .checked_sub(separator)
-                            .ok_or_else(|| anyhow!("catalog projected byte limit exceeded"))?;
-
-                        bytes += separator + encoded_size(&resource, remaining)?;
+                        count.write_all(b",")?;
+                        count.json(&resource)?;
                         resources.push(resource);
                         continue;
                     }
@@ -179,13 +175,11 @@ impl Source {
 
                     ensure!(items.len() < ALBUM_ITEMS, "Immich album exceeds item limit");
 
-                    bytes += usize::from(!items.is_empty())
-                        + encoded_size(&item, SNAPSHOT_BYTES - bytes)?;
+                    if !items.is_empty() {
+                        count.write_all(b",")?;
+                    }
 
-                    ensure!(
-                        bytes <= SNAPSHOT_BYTES,
-                        "Immich album exceeds projected byte limit"
-                    );
+                    count.json(&item)?;
 
                     items.insert(id, item);
                 }
@@ -442,6 +436,17 @@ struct ByteCount {
     limit: usize,
 }
 
+impl ByteCount {
+    fn new(limit: usize) -> Self {
+        Self { bytes: 0, limit }
+    }
+
+    fn json(&mut self, value: &impl Serialize) -> Result<()> {
+        serde_json::to_writer(self, value)
+            .map_err(|_| anyhow!("catalog projected byte limit exceeded"))
+    }
+}
+
 impl Write for ByteCount {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if bytes.len() > self.limit - self.bytes {
@@ -470,7 +475,7 @@ impl Projection {
     fn new(limit: usize) -> Self {
         Self {
             hash: Sha256::new(),
-            count: ByteCount { bytes: 0, limit },
+            count: ByteCount::new(limit),
         }
     }
 
@@ -495,15 +500,6 @@ impl Write for Projection {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
-}
-
-fn encoded_size(value: &impl Serialize, limit: usize) -> Result<usize> {
-    let mut count = ByteCount { bytes: 0, limit };
-
-    serde_json::to_writer(&mut count, value)
-        .map_err(|_| anyhow!("catalog projected byte limit exceeded"))?;
-
-    Ok(count.bytes)
 }
 
 #[cfg(test)]
