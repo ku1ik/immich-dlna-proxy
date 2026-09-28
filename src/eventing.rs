@@ -66,6 +66,12 @@ enum Delivery {
     InFlight { next_seq: NonZeroU32 },
 }
 
+struct ReadyDelivery {
+    at: Instant,
+    update_id: u32,
+    seq: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeliveryOutcome {
     KeepLease,
@@ -133,16 +139,20 @@ impl SubscriptionRequest {
 }
 
 impl Subscription {
-    fn next_delivery(&self) -> Option<(Instant, u32)> {
-        let id = match self.delivery {
-            Delivery::Initial(id) => id,
-            Delivery::Idle { .. } => self.lease.as_ref()?.pending?,
+    fn next_delivery(&self) -> Option<ReadyDelivery> {
+        let (update_id, seq) = match self.delivery {
+            Delivery::Initial(id) => (id, 0),
+            Delivery::Idle { next_seq } => (self.lease.as_ref()?.pending?, next_seq.get()),
             Delivery::InFlight { .. } => return None,
         };
 
         // The initial obligation survives lease expiry. Its next_attempt is the
         // registration time; moderation starts only when an attempt is prepared.
-        Some((self.next_attempt, id))
+        Some(ReadyDelivery {
+            at: self.next_attempt,
+            update_id,
+            seq,
+        })
     }
 }
 
@@ -351,11 +361,11 @@ impl EventTask {
                 state.expire(now);
 
                 while deliveries.len() < DELIVERIES {
-                    let Some((index, id)) =
+                    let Some((index, ready)) =
                         state.entries.iter().enumerate().find_map(|(index, entry)| {
-                            let (at, id) = entry.next_delivery()?;
+                            let ready = entry.next_delivery()?;
 
-                            (at <= now).then_some((index, id))
+                            (ready.at <= now).then_some((index, ready))
                         })
                     else {
                         break;
@@ -370,26 +380,19 @@ impl EventTask {
                     }
 
                     // Allocate once at preparation, including failures and the initial attempt.
-                    let seq = match entry.delivery {
-                        Delivery::Initial(_) => 0,
-                        Delivery::Idle { next_seq } => next_seq.get(),
-                        Delivery::InFlight { .. } => {
-                            unreachable!("in-flight delivery is not ready")
-                        }
-                    };
-
                     entry.next_attempt = now + MODERATION;
 
                     entry.delivery = Delivery::InFlight {
-                        next_seq: NonZeroU32::new(seq.wrapping_add(1)).unwrap_or(NonZeroU32::MIN),
+                        next_seq: NonZeroU32::new(ready.seq.wrapping_add(1))
+                            .unwrap_or(NonZeroU32::MIN),
                     };
 
                     deliveries.push(deliver(
                         &self.client,
                         entry.sid,
                         entry.callbacks.clone(),
-                        seq,
-                        protocol::event_body(entry.service, id),
+                        ready.seq,
+                        protocol::event_body(entry.service, ready.update_id),
                     ));
 
                     // Preserve waiting order across removals and new registrations.
@@ -402,7 +405,7 @@ impl EventTask {
                     .flat_map(|entry| {
                         // A ready event waits on completion when all delivery slots are full.
                         let delivery = if deliveries.len() < DELIVERIES {
-                            entry.next_delivery().map(|(at, _)| at)
+                            entry.next_delivery().map(|ready| ready.at)
                         } else {
                             None
                         };
