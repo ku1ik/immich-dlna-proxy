@@ -45,15 +45,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let server = Server::new(name, uuid, catalog, media, events.clone(), activity);
     tracing::info!(%address, %uuid, "service started");
 
-    let (name, result) = tokio::select! {
-        _ = terminate.recv() => {
-            discovery.depart();
-            tracing::info!("service stopped");
+    let shutdown = async {
+        tokio::select! {
+            _ = terminate.recv() => {}
 
-            return Ok(());
+            _ = interrupt.recv() => {}
         }
+    };
 
-        _ = interrupt.recv() => {
+    let (name, result) = tokio::select! {
+        _ = shutdown => {
             discovery.depart();
             tracing::info!("service stopped");
 
