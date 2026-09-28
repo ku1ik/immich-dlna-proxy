@@ -63,6 +63,12 @@ enum Delivery {
     InFlight,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliveryOutcome {
+    KeepLease,
+    RemoveSubscription,
+}
+
 impl Subscription {
     fn next_delivery(&self) -> Option<(Instant, u32)> {
         let id = match self.delivery {
@@ -361,7 +367,7 @@ impl EventTask {
             tokio::select! {
                 biased;
                 finished = deliveries.next(), if !deliveries.is_empty() => {
-                    let (sid, deactivate) = finished.expect("nonempty delivery set");
+                    let (sid, outcome) = finished.expect("nonempty delivery set");
                     let mut state = subscriptions.state.lock().unwrap();
 
                     let entry = state
@@ -372,7 +378,7 @@ impl EventTask {
 
                     entry.delivery = Delivery::Idle;
 
-                    if deactivate {
+                    if outcome == DeliveryOutcome::RemoveSubscription {
                         entry.expires = None;
                     }
 
@@ -494,7 +500,7 @@ async fn deliver(
     callbacks: Vec<Url>,
     seq: u32,
     body: String,
-) -> (Uuid, bool) {
+) -> (Uuid, DeliveryOutcome) {
     for url in callbacks {
         let deadline = Instant::now() + CALLBACK_TIMEOUT;
 
@@ -544,13 +550,13 @@ async fn deliver(
             Ok(Some(StatusCode::OK)) => {
                 tracing::debug!(%sid, seq, "event delivered");
 
-                return (sid, false);
+                return (sid, DeliveryOutcome::KeepLease);
             }
 
             Ok(Some(StatusCode::PRECONDITION_FAILED)) => {
                 tracing::debug!(%sid, seq, "event rejected with invalid SID; subscription removed");
 
-                return (sid, true);
+                return (sid, DeliveryOutcome::RemoveSubscription);
             }
 
             _ => {}
@@ -559,7 +565,7 @@ async fn deliver(
 
     tracing::debug!(%sid, seq, "event delivery failed; lease retained if active");
 
-    (sid, false)
+    (sid, DeliveryOutcome::KeepLease)
 }
 
 #[cfg(test)]
