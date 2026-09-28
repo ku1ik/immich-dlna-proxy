@@ -69,6 +69,16 @@ pub fn parse_id(value: &str) -> Result<ObjectId, Fault> {
     }
 }
 
+fn compare_optional<T: Ord>(a: Option<T>, b: Option<T>, descending: bool) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) if descending => b.cmp(&a),
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 fn compare_dates(
     a_date: Option<&str>,
     a_capture: Option<&DateTime<Utc>>,
@@ -78,18 +88,8 @@ fn compare_dates(
     b_id: Uuid,
     descending: bool,
 ) -> Ordering {
-    fn optional<T: Ord>(a: Option<T>, b: Option<T>, descending: bool) -> Ordering {
-        match (a, b) {
-            (Some(a), Some(b)) if descending => b.cmp(&a),
-            (Some(a), Some(b)) => a.cmp(&b),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        }
-    }
-
-    optional(a_date, b_date, descending)
-        .then_with(|| optional(a_capture, b_capture, descending))
+    compare_optional(a_date, b_date, descending)
+        .then_with(|| compare_optional(a_capture, b_capture, descending))
         .then_with(|| a_id.cmp(&b_id))
 }
 
@@ -221,22 +221,21 @@ impl Rows<'_> {
             Rows::Items(contents) => {
                 let mut rows: Vec<_> = contents.items.iter().collect();
 
-                rows.sort_unstable_by(|(a_id, a), (b_id, b)| {
-                    compare_dates(
-                        a.object
-                            .date
-                            .as_deref()
-                            .filter(|_| sort != SortOrder::Catalog),
+                rows.sort_unstable_by(|(a_id, a), (b_id, b)| match sort {
+                    SortOrder::Catalog => {
+                        compare_optional(a.capture.as_ref(), b.capture.as_ref(), false)
+                            .then_with(|| a_id.cmp(b_id))
+                    }
+
+                    SortOrder::DateAscending | SortOrder::DateDescending => compare_dates(
+                        a.object.date.as_deref(),
                         a.capture.as_ref(),
                         **a_id,
-                        b.object
-                            .date
-                            .as_deref()
-                            .filter(|_| sort != SortOrder::Catalog),
+                        b.object.date.as_deref(),
                         b.capture.as_ref(),
                         **b_id,
                         sort == SortOrder::DateDescending,
-                    )
+                    ),
                 });
 
                 paginate(
