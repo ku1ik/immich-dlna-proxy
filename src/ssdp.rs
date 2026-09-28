@@ -108,13 +108,13 @@ impl Discovery {
         })
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run(&self) -> anyhow::Result<()> {
         self.run_to(MULTICAST, |mx| rand::random_range(0..mx.as_nanos() as u64))
             .await
     }
 
     async fn run_to(
-        self,
+        &self,
         announcement_destination: SocketAddrV4,
         mut delay_nanos: impl FnMut(Duration) -> u64,
     ) -> anyhow::Result<()> {
@@ -189,6 +189,21 @@ impl Discovery {
         }
     }
 
+    /// Best-effort withdrawal on normal shutdown; never waits or retries.
+    pub fn depart(&self) {
+        self.depart_to(MULTICAST);
+    }
+
+    fn depart_to(&self, destination: SocketAddrV4) {
+        for target in Target::ALL {
+            let message = message(&self.udn, &self.location, target, Message::Byebye);
+
+            if let Err(error) = self.send(message.as_bytes(), destination) {
+                tracing::warn!(%error, "SSDP departure dropped");
+            }
+        }
+    }
+
     fn send(&self, bytes: &[u8], destination: SocketAddrV4) -> io::Result<()> {
         send(
             &self.socket,
@@ -221,6 +236,7 @@ impl Discovery {
 #[derive(Clone, Copy)]
 enum Message {
     Alive,
+    Byebye,
     Response,
 }
 
@@ -238,6 +254,12 @@ fn message(udn: &str, location: &str, target: Target, kind: Message) -> String {
 
         Message::Alive => {
             format!("NOTIFY * HTTP/1.1\r\nHOST: {MULTICAST}\r\nNT: {name}\r\nNTS: ssdp:alive\r\n")
+        }
+
+        Message::Byebye => {
+            return format!(
+                "NOTIFY * HTTP/1.1\r\nHOST: {MULTICAST}\r\nNT: {name}\r\nNTS: ssdp:byebye\r\nUSN: {usn}\r\n\r\n"
+            );
         }
     };
 

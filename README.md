@@ -37,6 +37,8 @@ Cross-origin redirects, HTTPS downgrades, and loops fail; HTTPS validates certif
 
 Required invocation: `immich-dlna-proxy --config /etc/immich-dlna-proxy.toml`.
 No environment overrides or reload: restart after config/credential changes.
+SIGTERM/SIGINT send best-effort SSDP departure announcements and exit successfully,
+without draining active requests or playback.
 Unknown TOML fields are rejected. Example for the standalone systemd unit below:
 
 ```toml

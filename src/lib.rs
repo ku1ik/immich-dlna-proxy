@@ -11,7 +11,10 @@ pub mod server;
 pub mod ssdp;
 
 use anyhow::Context;
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    signal::unix::{SignalKind, signal},
+};
 
 use crate::{
     catalog::ImmichCatalog, config::Config, eventing::Subscriptions, media::MediaProxy,
@@ -19,6 +22,8 @@ use crate::{
 };
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    let mut terminate = signal(SignalKind::terminate()).context("register SIGTERM handler")?;
+    let mut interrupt = signal(SignalKind::interrupt()).context("register SIGINT handler")?;
     let activity = Activity::default();
     let media = MediaProxy::new(
         config.api_base.clone(),
@@ -41,6 +46,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     tracing::info!(%address, %uuid, "service started");
 
     let (name, result) = tokio::select! {
+        _ = terminate.recv() => {
+            discovery.depart();
+            tracing::info!("service stopped");
+
+            return Ok(());
+        }
+
+        _ = interrupt.recv() => {
+            discovery.depart();
+            tracing::info!("service stopped");
+
+            return Ok(());
+        }
+
         result = catalog_task.run() => ("catalog", result),
 
         result = events.run() => ("eventing", result),
@@ -55,6 +74,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         Err(error) => Err(error.context(format!("{name} service failed"))),
     }
 }
+
+#[cfg(test)]
+mod shutdown_tests;
 
 pub fn logging(level: tracing::Level) -> anyhow::Result<()> {
     tracing_subscriber::fmt()

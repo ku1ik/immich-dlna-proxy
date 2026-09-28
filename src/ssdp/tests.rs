@@ -42,6 +42,47 @@ fn loopback() -> Discovery {
     }
 }
 
+#[tokio::test]
+async fn departure_sends_one_byebye_for_each_advertised_identity() {
+    let discovery = loopback();
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let std::net::SocketAddr::V4(destination) = receiver.local_addr().unwrap() else {
+        unreachable!();
+    };
+
+    discovery.depart_to(destination);
+
+    for (target, name) in TARGETS {
+        let mut buffer = [0; 2048];
+
+        let (length, source) =
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(source.ip(), Ipv4Addr::LOCALHOST);
+
+        let usn = if target == Target::Uuid {
+            UDN.to_owned()
+        } else {
+            format!("{UDN}::{name}")
+        };
+
+        assert_eq!(
+            std::str::from_utf8(&buffer[..length]).unwrap(),
+            format!(
+                "NOTIFY * HTTP/1.1\r\nHOST: {MULTICAST}\r\nNT: {name}\r\nNTS: ssdp:byebye\r\nUSN: {usn}\r\n\r\n"
+            ),
+        );
+    }
+
+    assert_eq!(
+        receiver.try_recv(&mut [0; 2048]).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
 #[test]
 fn parses_all_and_each_exact_target_and_clamps_mx() {
     for (kind, target) in TARGETS {
@@ -434,7 +475,7 @@ async fn isolated_search_round_trip_returns_all_targets_from_selected_source() {
     };
 
     // Exercise socket routing without random delays near expiry; queue tests cover timing.
-    let task = tokio::spawn(discovery.run_to(destination, |_| 0));
+    let task = tokio::spawn(async move { discovery.run_to(destination, |_| 0).await });
     let mut buffer = [0; DATAGRAM_BYTES];
 
     peer.send_to(search("ssdp:all", "1").as_bytes(), address)
@@ -479,7 +520,7 @@ async fn sends_startup_repeat_and_periodic_alive_announcements() {
         panic!("IPv4 socket");
     };
 
-    let task = tokio::spawn(discovery.run_to(destination, |_| 0));
+    let task = tokio::spawn(async move { discovery.run_to(destination, |_| 0).await });
     let mut buffer = [0; DATAGRAM_BYTES];
 
     for advance in [
