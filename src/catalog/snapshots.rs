@@ -28,11 +28,9 @@ pub(super) struct Source {
     friendly_name: String,
 }
 
-#[derive(Debug, Eq, PartialEq, Serialize)]
+#[derive(Debug, Eq, PartialEq)]
 pub(super) struct Album {
-    #[serde(flatten)]
     pub(super) metadata: AlbumMetadata,
-    #[serde(skip)]
     pub(super) digest: Digest,
 }
 
@@ -278,7 +276,7 @@ pub(super) fn project_root(
 
     for album in albums.values() {
         projection.write_all(b",")?;
-        projection.json(album)?;
+        projection.json(&album.metadata)?;
     }
 
     projection.write_all(b"]")?;
