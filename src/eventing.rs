@@ -323,7 +323,7 @@ impl EventTask {
                     entry.delivery = Delivery::InFlight;
 
                     deliveries.push(deliver(
-                        self.client.clone(),
+                        &self.client,
                         entry.sid,
                         entry.callbacks.clone(),
                         seq,
@@ -488,7 +488,7 @@ fn callbacks(value: &str, peer: Ipv4Addr) -> Option<Vec<Url>> {
 }
 
 async fn deliver(
-    client: reqwest::Client,
+    client: &reqwest::Client,
     sid: Uuid,
     callbacks: Vec<Url>,
     seq: u32,
