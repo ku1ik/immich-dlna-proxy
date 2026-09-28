@@ -1,3 +1,19 @@
+/// A validated, lowercase concrete MIME type without parameters.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(transparent)]
+pub struct MimeType(String);
+
+impl MimeType {
+    /// Validate the complete input, then retain only its normalized type/subtype.
+    pub fn parse(value: &str) -> Option<Self> {
+        parse(value).map(|mime| Self(mime.to_ascii_lowercase()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Validate a concrete MIME type and its parameters, preserving type/subtype case.
 /// Accept spaces and tabs around parameter `=`.
 pub(crate) fn parse(value: &str) -> Option<&str> {
@@ -88,7 +104,19 @@ pub(crate) fn parse(value: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{MimeType, parse};
+
+    #[test]
+    fn catalog_mime_normalizes_and_serializes_as_a_string() {
+        let mime = MimeType::parse(" VIDEO/X-Custom+MP4 ; codecs=\"avc1\"").unwrap();
+        assert_eq!(mime.as_str(), "video/x-custom+mp4");
+        assert_eq!(mime, MimeType::parse("video/x-custom+mp4").unwrap());
+
+        assert_eq!(
+            serde_json::to_string(&mime).unwrap(),
+            "\"video/x-custom+mp4\""
+        );
+    }
 
     #[test]
     fn mime_grammar_preserves_case_and_consumes_all_parameters() {
@@ -118,6 +146,12 @@ mod tests {
             ),
         ] {
             assert_eq!(parse(value), Some(expected), "{value:?}");
+
+            assert_eq!(
+                MimeType::parse(value).unwrap().as_str(),
+                expected.to_ascii_lowercase(),
+                "{value:?}"
+            );
         }
     }
 
@@ -167,6 +201,7 @@ mod tests {
             "image/jpeg; ;\u{2003}",
         ] {
             assert_eq!(parse(value), None, "{value:?}");
+            assert_eq!(MimeType::parse(value), None, "{value:?}");
         }
     }
 

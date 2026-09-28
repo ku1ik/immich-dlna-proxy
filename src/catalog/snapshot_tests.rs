@@ -77,7 +77,7 @@ fn image_resources_follow_mime_and_edit_selection() {
         let resources: Vec<_> = item.object.resources().collect();
         assert_eq!(resources.len(), 2);
         assert!(resources[0].uri.ends_with(representation));
-        assert_eq!(resources[0].mime, expected);
+        assert_eq!(resources[0].mime.as_str(), expected);
         assert!(resources[1].uri.ends_with("preview"));
 
         assert!(
@@ -124,7 +124,7 @@ fn original_video_without_mime_remains_seekable_with_preview_artwork() {
     dto["originalMimeType"] = Value::Null;
     let item = project(dto);
     let original = item.object.resources().next().unwrap();
-    assert_eq!(original.mime, "application/octet-stream");
+    assert_eq!(original.mime.as_str(), "application/octet-stream");
     assert!(original.byte_seek);
     assert!(item.object.art.unwrap().ends_with("preview"));
 }
@@ -209,8 +209,8 @@ async fn complete_pagination_and_scoped_encoded_intersection_without_probes() {
     let video = &contents.items[&Uuid::from_u128(1001)].object;
     let resources: Vec<_> = video.resources().collect();
     assert_eq!(resources.len(), 2);
-    assert_eq!(resources[0].mime, "video/quicktime");
-    assert_eq!(resources[1].mime, "video/mp4");
+    assert_eq!(resources[0].mime.as_str(), "video/quicktime");
+    assert_eq!(resources[1].mime.as_str(), "video/mp4");
     assert!(video.resources().all(|r| r.byte_seek));
     assert!(resources[1].duration_ms.is_none());
 
@@ -747,7 +747,7 @@ async fn playback_enrichment_respects_exact_snapshot_byte_budget() {
     *playback = Some(Resource {
         uri: "http://192.0.2.1:8200/media/assets/00000000-0000-0000-0000-000000000001/playback"
             .into(),
-        mime: "video/mp4".into(),
+        mime: MimeType::parse("video/mp4").unwrap(),
         duration_ms: None,
         byte_seek: true,
     });

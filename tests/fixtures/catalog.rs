@@ -2,8 +2,8 @@ use std::net::SocketAddrV4;
 
 use immich_dlna_proxy::{
     catalog::{
-        BrowseMode, BrowseQuery, BrowseResult, Catalog, Object, ObjectId, ObjectKind, Resource,
-        SortOrder, parse_id,
+        BrowseMode, BrowseQuery, BrowseResult, Catalog, MimeType, Object, ObjectId, ObjectKind,
+        Resource, SortOrder, parse_id,
     },
     media::{
         Representation,
@@ -149,7 +149,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
     ] {
         let resources = representations.map(|representation| Resource {
             uri: media(asset, representation),
-            mime: mime.into(),
+            mime: MimeType::parse(mime).unwrap(),
             duration_ms: (asset == VIDEO_ID && representation == Original).then_some(30_000),
             byte_seek: asset == VIDEO_ID,
         });
@@ -187,7 +187,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             // This standalone fixture uses the encoded rendition as its original.
             original: Resource {
                 uri: media(VIDEO_ID, Playback),
-                mime: "video/mp4".into(),
+                mime: MimeType::parse("video/mp4").unwrap(),
                 duration_ms: None,
                 byte_seek: true,
             },

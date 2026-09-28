@@ -500,7 +500,7 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
         if filter.res() {
             for resource in object.resources() {
                 xml.raw("<res protocolInfo=\"http-get:*:")?;
-                xml.text(&resource.mime)?;
+                xml.text(resource.mime.as_str())?;
 
                 xml.raw(if resource.byte_seek {
                     ":DLNA.ORG_OP=01\""

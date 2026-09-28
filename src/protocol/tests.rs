@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use quick_xml::{NsReader, events::Event, name::ResolveResult};
 
 use super::*;
-use crate::catalog::{ObjectKind, Resource};
+use crate::catalog::{MimeType, ObjectKind, Resource};
 use uuid::Uuid;
 
 fn request(action: &str, arguments: &str) -> String {
@@ -36,13 +36,13 @@ fn object() -> Object {
             asset: Uuid::from_u128(11),
             original: Resource {
                 uri: "http://192.0.2.1/original?a=1&b=2".into(),
-                mime: "video/quicktime".into(),
+                mime: MimeType::parse("video/quicktime").unwrap(),
                 duration_ms: Some(443_045_006),
                 byte_seek: false,
             },
             playback: Some(Resource {
                 uri: "http://192.0.2.1/playback".into(),
-                mime: "video/mp4".into(),
+                mime: MimeType::parse("video/mp4").unwrap(),
                 duration_ms: None,
                 byte_seek: false,
             }),
@@ -943,10 +943,10 @@ fn serialization_sanitizes_xml_and_escapes_exactly_two_layers() {
         panic!("expected video");
     };
 
-    original.mime = "video/mp4\" bad=\"value".into();
+    original.mime = MimeType::parse("video/x-test&'").unwrap();
     let xml = didl(&[object], &Filter::parse("*").unwrap()).unwrap();
     assert_xml(&xml);
-    assert!(xml.contains("video/mp4&quot; bad=&quot;value"));
+    assert!(xml.contains("video/x-test&amp;&apos;"));
 
     let response = action_response(
         &browse(BROWSE_ARGS).unwrap(),
@@ -956,6 +956,7 @@ fn serialization_sanitizes_xml_and_escapes_exactly_two_layers() {
 
     assert_xml(&response);
     assert!(response.contains("A&amp;amp;B &amp;lt;title&amp;gt; Łódź 東京 𐐀\u{fffd}"));
+    assert!(response.contains("video/x-test&amp;amp;&amp;apos;"));
     assert!(!response.contains("A&amp;amp;amp;B"));
     assert!(response.contains("<NumberReturned>1</NumberReturned>"));
 

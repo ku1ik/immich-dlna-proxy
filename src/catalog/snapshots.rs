@@ -11,7 +11,7 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest as ShaDigest, Sha256};
 use uuid::Uuid;
 
-use super::{Digest, MAX_ALBUMS, Object, ObjectKind, Resource, SNAPSHOT_BYTES};
+use super::{Digest, MAX_ALBUMS, MimeType, Object, ObjectKind, Resource, SNAPSHOT_BYTES};
 use crate::{
     immich::{Asset, AssetKind, Client, SearchMode, Visibility},
     media::{Representation, asset_url},
@@ -239,7 +239,7 @@ impl Source {
 
                 *playback = Some(Resource {
                     uri: asset_url(self.http_address, id, Representation::Playback),
-                    mime: "video/mp4".into(),
+                    mime: MimeType::parse("video/mp4").unwrap(),
                     duration_ms: None,
                     byte_seek: true,
                 });
@@ -363,11 +363,7 @@ fn project_item(
         return Ok(None);
     }
 
-    let mime = dto
-        .original_mime_type
-        .as_deref()
-        .and_then(crate::mime::parse)
-        .map(str::to_ascii_lowercase);
+    let mime = dto.original_mime_type.as_deref().and_then(MimeType::parse);
 
     let kind = match dto.kind {
         AssetKind::Image => {
@@ -379,7 +375,10 @@ fn project_item(
                     (Representation::Original, mime)
                 }
 
-                _ => (Representation::Display, "image/jpeg".into()),
+                _ => (
+                    Representation::Display,
+                    MimeType::parse("image/jpeg").unwrap(),
+                ),
             };
 
             ObjectKind::Photo {
@@ -394,7 +393,7 @@ fn project_item(
                     },
                     Resource {
                         uri: asset_url(http_address, dto.id, Representation::Preview),
-                        mime: "image/jpeg".into(),
+                        mime: MimeType::parse("image/jpeg").unwrap(),
                         duration_ms: None,
                         byte_seek: false,
                     },
@@ -410,7 +409,8 @@ fn project_item(
                 asset: dto.id,
                 original: Resource {
                     uri: asset_url(http_address, dto.id, Representation::Original),
-                    mime: mime.unwrap_or_else(|| "application/octet-stream".into()),
+                    mime: mime
+                        .unwrap_or_else(|| MimeType::parse("application/octet-stream").unwrap()),
                     duration_ms,
                     byte_seek: true,
                 },

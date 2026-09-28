@@ -13,6 +13,8 @@ use uuid::Uuid;
 
 use crate::{activity, config::Config, eventing::Subscriptions, immich, protocol::Fault};
 
+pub use crate::mime::MimeType;
+
 mod background;
 mod browse;
 mod revisions;
@@ -156,7 +158,7 @@ impl Object {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Resource {
     pub uri: String,
-    pub mime: String,
+    pub mime: MimeType,
     pub duration_ms: Option<u64>,
     /// Explicitly established byte-seek support, not inferred from the MIME.
     pub byte_seek: bool,
