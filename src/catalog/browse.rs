@@ -30,21 +30,6 @@ enum Rows<'a> {
     Items(&'a Contents),
 }
 
-enum Selection<'a> {
-    Metadata(Object),
-    Children {
-        rows: Rows<'a>,
-        starting_index: u32,
-        requested_count: u32,
-        sort: SortOrder,
-    },
-}
-
-struct ResolvedBrowse<'a> {
-    selection: Selection<'a>,
-    update_id: u32,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ObjectId {
     Root,
@@ -120,66 +105,33 @@ impl View {
         query: BrowseQuery,
         collator: &CollatorBorrowed<'_>,
     ) -> Result<BrowseResult, Fault> {
-        Ok(self.resolve(query)?.browse(collator))
-    }
-
-    fn contents(&self, album: Uuid) -> Result<&Contents, Fault> {
-        match &self.payload {
-            Payload::Album { id, contents } if *id == album => Ok(contents),
-            _ => Err(FAILED),
-        }
-    }
-
-    fn resolve(&self, query: BrowseQuery) -> Result<ResolvedBrowse<'_>, Fault> {
         let root = &self.root;
         let ledger = &self.ledger;
 
-        let (selection, update_id) = match query.object_id {
+        let (rows, update_id) = match query.object_id {
             ObjectId::Root => {
-                let selection = match query.mode {
-                    BrowseMode::Metadata => {
-                        let mut object = root.object.clone();
+                if query.mode == BrowseMode::Metadata {
+                    let mut object = root.object.clone();
 
-                        object.kind = super::ObjectKind::Root {
-                            child_count: Some(root.albums.len()),
-                        };
+                    object.kind = super::ObjectKind::Root {
+                        child_count: Some(root.albums.len()),
+                    };
 
-                        Selection::Metadata(object)
-                    }
+                    return Ok(metadata(object, ledger.system_update_id));
+                }
 
-                    BrowseMode::DirectChildren {
-                        starting_index,
-                        requested_count,
-                    } => Selection::Children {
-                        rows: Rows::Albums(root),
-                        starting_index,
-                        requested_count,
-                        sort: query.sort,
-                    },
-                };
-
-                (selection, ledger.system_update_id)
+                (Rows::Albums(root), ledger.system_update_id)
             }
 
             ObjectId::Album(id) => {
                 let album = root.albums.get(&id).ok_or(MISSING)?;
                 let revision = ledger.albums.get(&id).ok_or(MISSING)?;
 
-                let selection = match query.mode {
-                    BrowseMode::Metadata => Selection::Metadata(album.metadata.object.clone()),
+                if query.mode == BrowseMode::Metadata {
+                    return Ok(metadata(album.metadata.object.clone(), revision.update_id));
+                }
 
-                    BrowseMode::DirectChildren {
-                        starting_index,
-                        requested_count,
-                    } => Selection::Children {
-                        rows: Rows::Items(self.contents(id)?),
-                        starting_index,
-                        requested_count,
-                        sort: query.sort,
-                    },
-                };
-
-                (selection, revision.update_id)
+                (Rows::Items(self.contents(id)?), revision.update_id)
             }
 
             ObjectId::Item { album, asset } => {
@@ -193,45 +145,53 @@ impl View {
                     return Err(Fault::NoSuchContainer);
                 }
 
-                (
-                    Selection::Metadata(item.object.clone()),
-                    ledger.system_update_id,
-                )
+                return Ok(metadata(item.object.clone(), ledger.system_update_id));
             }
         };
 
-        Ok(ResolvedBrowse {
-            selection,
+        let BrowseMode::DirectChildren {
+            starting_index,
+            requested_count,
+        } = query.mode
+        else {
+            unreachable!("metadata requests return before pagination");
+        };
+
+        Ok(rows.browse(
+            starting_index,
+            requested_count,
+            query.sort,
             update_id,
-        })
+            collator,
+        ))
+    }
+
+    fn contents(&self, album: Uuid) -> Result<&Contents, Fault> {
+        match &self.payload {
+            Payload::Album { id, contents } if *id == album => Ok(contents),
+            _ => Err(FAILED),
+        }
     }
 }
 
-impl ResolvedBrowse<'_> {
-    fn browse(self, collator: &CollatorBorrowed<'_>) -> BrowseResult {
-        let Self {
-            selection,
-            update_id,
-        } = self;
+fn metadata(object: Object, update_id: u32) -> BrowseResult {
+    BrowseResult {
+        objects: vec![object],
+        total_matches: 1,
+        update_id,
+    }
+}
 
-        let (rows, starting_index, requested_count, sort) = match selection {
-            Selection::Metadata(object) => {
-                return BrowseResult {
-                    objects: vec![object],
-                    total_matches: 1,
-                    update_id,
-                };
-            }
-
-            Selection::Children {
-                rows,
-                starting_index,
-                requested_count,
-                sort,
-            } => (rows, starting_index, requested_count, sort),
-        };
-
-        let total_matches = match &rows {
+impl Rows<'_> {
+    fn browse(
+        self,
+        starting_index: u32,
+        requested_count: u32,
+        sort: SortOrder,
+        update_id: u32,
+        collator: &CollatorBorrowed<'_>,
+    ) -> BrowseResult {
+        let total_matches = match &self {
             Rows::Albums(root) => root.albums.len(),
             Rows::Items(contents) => contents.items.len(),
         } as u32;
@@ -244,7 +204,7 @@ impl ResolvedBrowse<'_> {
             };
         }
 
-        let objects = match rows {
+        let objects = match self {
             Rows::Albums(root) => {
                 let mut rows: Vec<_> = root.albums.values().map(|album| &album.metadata).collect();
 
