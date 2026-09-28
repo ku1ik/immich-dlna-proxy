@@ -509,10 +509,18 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
                 })?;
 
                 if filter.resources == ResourceSelection::WithDuration
-                    && let Some(duration) = &resource.duration
+                    && let Some(ms) = resource.duration_ms
                 {
                     xml.raw(" duration=\"")?;
-                    xml.text(duration)?;
+
+                    xml.text(&format!(
+                        "{}:{:02}:{:02}.{:03}",
+                        ms / 3_600_000,
+                        ms / 60_000 % 60,
+                        ms / 1000 % 60,
+                        ms % 1000
+                    ))?;
+
                     xml.raw("\"")?;
                 }
 

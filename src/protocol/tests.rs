@@ -38,13 +38,13 @@ fn object() -> Object {
                 Resource {
                     uri: "http://192.0.2.1/original?a=1&b=2".into(),
                     mime: "video/quicktime".into(),
-                    duration: Some("123:04:05.006".into()),
+                    duration_ms: Some(443_045_006),
                     byte_seek: false,
                 },
                 Resource {
                     uri: "http://192.0.2.1/playback".into(),
                     mime: "video/mp4".into(),
-                    duration: None,
+                    duration_ms: None,
                     byte_seek: false,
                 },
             ],

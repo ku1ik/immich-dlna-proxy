@@ -83,7 +83,7 @@ fn image_resources_follow_mime_and_edit_selection() {
             item.object
                 .resources()
                 .iter()
-                .all(|r| !r.byte_seek && r.duration.is_none())
+                .all(|r| !r.byte_seek && r.duration_ms.is_none())
         );
     }
 }
@@ -100,7 +100,21 @@ fn original_video_duration_is_formatted_from_nonnegative_milliseconds() {
         let mut dto = asset(1, "VIDEO");
         dto["duration"] = json!(duration);
         let item = project(dto);
-        assert_eq!(item.object.resources()[0].duration.as_deref(), expected);
+        assert_eq!(
+            item.object.resources()[0].duration_ms,
+            u64::try_from(duration).ok()
+        );
+
+        let xml = crate::protocol::didl(
+            &[item.object],
+            &crate::protocol::Filter::parse("res@duration").unwrap(),
+        )
+        .unwrap();
+
+        match expected {
+            Some(expected) => assert!(xml.contains(&format!(" duration=\"{expected}\""))),
+            None => assert!(!xml.contains(" duration=")),
+        }
     }
 }
 
@@ -196,7 +210,7 @@ async fn complete_pagination_and_scoped_encoded_intersection_without_probes() {
     assert_eq!(video.resources()[0].mime, "video/quicktime");
     assert_eq!(video.resources()[1].mime, "video/mp4");
     assert!(video.resources().iter().all(|r| r.byte_seek));
-    assert!(video.resources()[1].duration.is_none());
+    assert!(video.resources()[1].duration_ms.is_none());
 
     let requests = fake.api.requests.lock().unwrap();
     assert_eq!(requests.len(), 5);
@@ -732,7 +746,7 @@ async fn playback_append_respects_exact_snapshot_byte_budget() {
         uri: "http://192.0.2.1:8200/media/assets/00000000-0000-0000-0000-000000000001/playback"
             .into(),
         mime: "video/mp4".into(),
-        duration: None,
+        duration_ms: None,
         byte_seek: true,
     });
 

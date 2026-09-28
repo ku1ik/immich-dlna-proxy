@@ -152,8 +152,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             .map(|representation| Resource {
                 uri: media(asset, representation),
                 mime: mime.into(),
-                duration: (asset == VIDEO_ID && representation == Original)
-                    .then(|| "0:00:30.000".into()),
+                duration_ms: (asset == VIDEO_ID && representation == Original).then_some(30_000),
                 byte_seek: asset == VIDEO_ID,
             })
             .collect();
@@ -188,7 +187,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             resources: vec![Resource {
                 uri: media(VIDEO_ID, Playback),
                 mime: "video/mp4".into(),
-                duration: None,
+                duration_ms: None,
                 byte_seek: true,
             }],
         },

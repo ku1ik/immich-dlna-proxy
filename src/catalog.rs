@@ -150,7 +150,7 @@ impl Object {
 pub struct Resource {
     pub uri: String,
     pub mime: String,
-    pub duration: Option<String>,
+    pub duration_ms: Option<u64>,
     /// Explicitly established byte-seek support, not inferred from the MIME.
     pub byte_seek: bool,
 }

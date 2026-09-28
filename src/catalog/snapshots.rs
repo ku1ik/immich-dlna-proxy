@@ -240,7 +240,7 @@ impl Source {
                 let resource = Resource {
                     uri: asset_url(self.http_address, id, Representation::Playback),
                     mime: "video/mp4".into(),
-                    duration: None,
+                    duration_ms: None,
                     byte_seek: true,
                 };
 
@@ -390,13 +390,13 @@ fn project_item(
                     Resource {
                         uri: asset_url(http_address, dto.id, representation),
                         mime,
-                        duration: None,
+                        duration_ms: None,
                         byte_seek: false,
                     },
                     Resource {
                         uri: asset_url(http_address, dto.id, Representation::Preview),
                         mime: "image/jpeg".into(),
-                        duration: None,
+                        duration_ms: None,
                         byte_seek: false,
                     },
                 ],
@@ -404,15 +404,7 @@ fn project_item(
         }
 
         AssetKind::Video => {
-            let duration = dto.duration.filter(|ms| *ms >= 0).map(|ms| {
-                format!(
-                    "{}:{:02}:{:02}.{:03}",
-                    ms / 3_600_000,
-                    ms / 60_000 % 60,
-                    ms / 1000 % 60,
-                    ms % 1000
-                )
-            });
+            let duration_ms = dto.duration.and_then(|ms| u64::try_from(ms).ok());
 
             ObjectKind::Video {
                 album,
@@ -420,7 +412,7 @@ fn project_item(
                 resources: vec![Resource {
                     uri: asset_url(http_address, dto.id, Representation::Original),
                     mime: mime.unwrap_or_else(|| "application/octet-stream".into()),
-                    duration,
+                    duration_ms,
                     byte_seek: true,
                 }],
             }
