@@ -97,19 +97,18 @@ impl Source {
     /// request, admission queue, timeout extension, or publication happens here.
     pub(super) async fn contents(&self, album: Uuid) -> Result<Contents> {
         let mut budget = TraversalBudget::default();
-        let mut count = ByteCount::new(SNAPSHOT_BYTES);
-        count.write_all(b"[]")?;
+        let mut bytes = SequenceBudget::new(SNAPSHOT_BYTES)?;
         let mut bad_dates = 0;
 
         let mut items = self
-            .load_members(album, &mut budget, &mut count, &mut bad_dates)
+            .load_members(album, &mut budget, &mut bytes, &mut bad_dates)
             .await?;
 
         if items
             .values()
             .any(|item| matches!(item.object.kind, ObjectKind::Video { .. }))
         {
-            self.enrich_playback(album, &mut items, &mut budget, &mut count)
+            self.enrich_playback(album, &mut items, &mut budget, &mut bytes)
                 .await?;
         }
 
@@ -133,7 +132,7 @@ impl Source {
         &self,
         album: Uuid,
         budget: &mut TraversalBudget,
-        count: &mut ByteCount,
+        bytes: &mut SequenceBudget,
         bad_dates: &mut usize,
     ) -> Result<BTreeMap<Uuid, Item>> {
         let mut items = BTreeMap::new();
@@ -161,11 +160,7 @@ impl Source {
 
                 ensure!(items.len() < ALBUM_ITEMS, "Immich album exceeds item limit");
 
-                if !items.is_empty() {
-                    count.write_all(b",")?;
-                }
-
-                count.json(&item)?;
+                bytes.push(&item)?;
                 items.insert(id, item);
             }
 
@@ -185,7 +180,7 @@ impl Source {
         album: Uuid,
         items: &mut BTreeMap<Uuid, Item>,
         budget: &mut TraversalBudget,
-        count: &mut ByteCount,
+        bytes: &mut SequenceBudget,
     ) -> Result<()> {
         let mut seen = BTreeSet::new();
         let mut page = NonZeroUsize::MIN;
@@ -209,6 +204,8 @@ impl Source {
                     continue;
                 };
 
+                let previous_size = bytes.size(item)?;
+
                 let ObjectKind::Video { resources, .. } = &mut item.object.kind else {
                     continue;
                 };
@@ -220,9 +217,8 @@ impl Source {
                     byte_seek: true,
                 };
 
-                count.write_all(b",")?;
-                count.json(&resource)?;
                 resources.push(resource);
+                bytes.replace(previous_size, item)?;
             }
 
             let Some(next) = result.next_page else {
@@ -274,8 +270,7 @@ pub(super) fn project_root(
     bad_dates: &mut usize,
 ) -> Result<Root> {
     let mut albums = BTreeMap::new();
-    let mut count = ByteCount::new(SNAPSHOT_BYTES);
-    count.write_all(b"[]")?;
+    let mut bytes = SequenceBudget::new(SNAPSHOT_BYTES)?;
 
     for dto in records {
         if albums.contains_key(&dto.id) {
@@ -304,8 +299,7 @@ pub(super) fn project_root(
 
         ensure!(albums.len() < MAX_ALBUMS, "Immich root exceeds album limit");
 
-        count.write_all(b",")?;
-        count.add(size)?;
+        bytes.push_size(size)?;
 
         albums.insert(dto.id, album);
     }
@@ -318,6 +312,8 @@ pub(super) fn project_root(
         date: None,
         art: None,
     };
+
+    bytes.push(&root_object)?;
 
     let mut projection = Projection::new(SNAPSHOT_BYTES);
     projection.write_all(b"[")?;
@@ -474,6 +470,52 @@ fn title(value: &str, id: Uuid) -> String {
         id.to_string()
     } else {
         xml_text(value)
+    }
+}
+
+// Incremental budget for the canonical JSON sequence. Callers account for whole
+// values; only this type knows about sequence delimiters and separators.
+struct SequenceBudget {
+    count: ByteCount,
+    items: usize,
+}
+
+impl SequenceBudget {
+    fn new(limit: usize) -> Result<Self> {
+        let mut count = ByteCount::new(limit);
+        count.write_all(b"[]")?;
+
+        Ok(Self { count, items: 0 })
+    }
+
+    fn size(&self, value: &impl Serialize) -> Result<usize> {
+        let mut count = ByteCount::new(self.count.limit);
+        count.json(value)?;
+
+        Ok(count.bytes)
+    }
+
+    fn push(&mut self, value: &impl Serialize) -> Result<()> {
+        self.push_size(self.size(value)?)
+    }
+
+    fn push_size(&mut self, size: usize) -> Result<()> {
+        self.count.add(size + usize::from(self.items != 0))?;
+        self.items += 1;
+
+        Ok(())
+    }
+
+    fn replace(&mut self, previous_size: usize, value: &impl Serialize) -> Result<()> {
+        let size = self.size(value)?;
+
+        if size >= previous_size {
+            self.count.add(size - previous_size)?;
+        } else {
+            self.count.bytes -= previous_size - size;
+        }
+
+        Ok(())
     }
 }
 
