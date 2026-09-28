@@ -165,66 +165,66 @@ fn action_arguments(
     }
 
     match name {
-        "GetSearchCapabilities" => return Ok(Action::GetSearchCapabilities),
-        "GetSortCapabilities" => return Ok(Action::GetSortCapabilities),
-        "GetSystemUpdateID" => return Ok(Action::GetSystemUpdateId),
-        "GetProtocolInfo" => return Ok(Action::GetProtocolInfo),
-        "GetCurrentConnectionIDs" => return Ok(Action::GetCurrentConnectionIds),
+        "GetSearchCapabilities" => Ok(Action::GetSearchCapabilities),
+        "GetSortCapabilities" => Ok(Action::GetSortCapabilities),
+        "GetSystemUpdateID" => Ok(Action::GetSystemUpdateId),
+        "GetProtocolInfo" => Ok(Action::GetProtocolInfo),
+        "GetCurrentConnectionIDs" => Ok(Action::GetCurrentConnectionIds),
 
         "GetCurrentConnectionInfo" => {
             let id = arguments["ConnectionID"]
                 .parse::<i32>()
                 .map_err(|_| invalid)?;
 
-            return Ok(Action::GetCurrentConnectionInfo(id));
+            Ok(Action::GetCurrentConnectionInfo(id))
         }
 
-        "Browse" => {}
+        "Browse" => {
+            let number = |name| {
+                let value = &arguments[name];
 
-        _ => return Err(Fault::InvalidAction),
+                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(invalid);
+                }
+
+                value.parse::<u32>().map_err(|_| invalid)
+            };
+
+            let starting_index = number("StartingIndex")?;
+            let requested_count = number("RequestedCount")?;
+
+            let mode = match arguments["BrowseFlag"].as_str() {
+                "BrowseMetadata" if starting_index == 0 => BrowseMode::Metadata,
+
+                "BrowseDirectChildren" => BrowseMode::DirectChildren {
+                    starting_index,
+                    requested_count,
+                },
+
+                _ => return Err(invalid),
+            };
+
+            let sort = match arguments["SortCriteria"].as_str() {
+                "" => SortOrder::Catalog,
+                "+dc:date" => SortOrder::DateAscending,
+                "-dc:date" => SortOrder::DateDescending,
+                _ => return Err(Fault::InvalidSortCriteria),
+            };
+
+            let filter = Filter::parse(&arguments["Filter"])?;
+
+            Ok(Action::Browse {
+                query: BrowseArguments {
+                    object_id: arguments.remove("ObjectID").ok_or(invalid)?,
+                    mode,
+                    sort,
+                },
+                filter,
+            })
+        }
+
+        _ => Err(Fault::InvalidAction),
     }
-
-    let number = |name| {
-        let value = &arguments[name];
-
-        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(invalid);
-        }
-
-        value.parse::<u32>().map_err(|_| invalid)
-    };
-
-    let starting_index = number("StartingIndex")?;
-    let requested_count = number("RequestedCount")?;
-
-    let mode = match arguments["BrowseFlag"].as_str() {
-        "BrowseMetadata" if starting_index == 0 => BrowseMode::Metadata,
-
-        "BrowseDirectChildren" => BrowseMode::DirectChildren {
-            starting_index,
-            requested_count,
-        },
-
-        _ => return Err(invalid),
-    };
-
-    let sort = match arguments["SortCriteria"].as_str() {
-        "" => SortOrder::Catalog,
-        "+dc:date" => SortOrder::DateAscending,
-        "-dc:date" => SortOrder::DateDescending,
-        _ => return Err(Fault::InvalidSortCriteria),
-    };
-
-    let filter = Filter::parse(&arguments["Filter"])?;
-
-    Ok(Action::Browse {
-        query: BrowseArguments {
-            object_id: arguments.remove("ObjectID").ok_or(invalid)?,
-            mode,
-            sort,
-        },
-        filter,
-    })
 }
 
 pub(crate) fn xml_char(c: char) -> bool {
