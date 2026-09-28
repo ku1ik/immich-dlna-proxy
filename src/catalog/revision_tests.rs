@@ -26,18 +26,15 @@ fn seeded_first_observations_and_restarts_are_process_local() {
         assert_eq!(root.system_update_id, seed.wrapping_add(1));
         assert_eq!(root.albums[&id(2)].update_id, seed.wrapping_add(1));
 
-        let contents = root
-            .contents_transition(id(2), &digest(3))
-            .unwrap()
-            .unwrap();
+        let mut contents = root;
+        assert!(contents.update_contents(id(2), &digest(3)).unwrap());
 
         assert_eq!(contents.system_update_id, seed.wrapping_add(2));
         assert_eq!(contents.albums[&id(2)].update_id, seed.wrapping_add(2));
 
-        assert_eq!(
-            contents.contents_transition(id(2), &digest(3)).unwrap(),
-            None
-        );
+        let unchanged = contents.clone();
+        assert!(!contents.update_contents(id(2), &digest(3)).unwrap());
+        assert_eq!(contents, unchanged);
 
         // Repeated or lower seeds are valid; restarting cannot promise uniqueness.
         assert_eq!(Ledger::new(seed), initial);
@@ -65,12 +62,10 @@ fn root_transitions_forget_removals_and_reintroduce_at_the_new_global_revision()
     assert_eq!(projection.system_update_id, 2);
     assert_eq!(projection.albums, ledger.albums);
 
-    let ledger = ledger
-        .contents_transition(id(2), &digest(3))
-        .unwrap()
-        .unwrap();
+    let mut ledger = ledger;
+    assert!(ledger.update_contents(id(2), &digest(3)).unwrap());
 
-    let removed = ledger
+    let mut removed = ledger
         .root_transition(&root, std::iter::empty())
         .unwrap()
         .unwrap();
@@ -83,8 +78,10 @@ fn root_transitions_forget_removals_and_reintroduce_at_the_new_global_revision()
         None
     );
 
-    assert!(removed.contents_transition(id(2), &digest(4)).is_err());
-    assert!(removed.contents_transition(id(100), &digest(4)).is_err());
+    let unchanged = removed.clone();
+    assert!(removed.update_contents(id(2), &digest(4)).is_err());
+    assert!(removed.update_contents(id(100), &digest(4)).is_err());
+    assert_eq!(removed, unchanged);
 
     let reappeared = removed
         .root_transition(&root, [(id(2), digest(4))].into_iter())
@@ -94,15 +91,9 @@ fn root_transitions_forget_removals_and_reintroduce_at_the_new_global_revision()
     assert_eq!(reappeared.albums[&id(2)].update_id, 4);
     assert_eq!(reappeared.albums[&id(2)].contents_digest, None);
 
-    assert_eq!(
-        reappeared
-            .contents_transition(id(2), &digest(3))
-            .unwrap()
-            .unwrap()
-            .albums[&id(2)]
-            .update_id,
-        5
-    );
+    let mut contents = reappeared.clone();
+    assert!(contents.update_contents(id(2), &digest(3)).unwrap());
+    assert_eq!(contents.albums[&id(2)].update_id, 5);
 
     let renamed = reappeared
         .root_transition(&root, [(id(2), digest(5))].into_iter())
@@ -126,10 +117,8 @@ fn root_and_contents_counters_wrap_and_unknown_empty_root_advances() {
     ledger.system_update_id = u32::MAX;
     ledger.albums.get_mut(&id(2)).unwrap().update_id = u32::MAX;
 
-    let contents = ledger
-        .contents_transition(id(2), &digest(1))
-        .unwrap()
-        .unwrap();
+    let mut contents = ledger.clone();
+    assert!(contents.update_contents(id(2), &digest(1)).unwrap());
 
     assert_eq!(contents.system_update_id, 0);
     assert_eq!(contents.albums[&id(2)].update_id, 0);

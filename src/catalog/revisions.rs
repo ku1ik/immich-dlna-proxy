@@ -82,25 +82,21 @@ impl Ledger {
         }))
     }
 
-    pub(super) fn contents_transition(
-        &self,
-        id: Uuid,
-        digest: &Digest,
-    ) -> anyhow::Result<Option<Self>> {
-        let album = self.albums.get(&id);
-        let mut album = *album.context("contents transition requires a present album")?;
+    pub(super) fn update_contents(&mut self, id: Uuid, digest: &Digest) -> anyhow::Result<bool> {
+        let album = self
+            .albums
+            .get_mut(&id)
+            .context("contents transition requires a present album")?;
 
         if album.contents_digest.as_ref() == Some(digest) {
-            return Ok(None);
+            return Ok(false);
         }
 
         album.update_id = album.update_id.wrapping_add(1);
         album.contents_digest = Some(*digest);
-        let mut next = self.clone();
-        next.albums.insert(id, album);
-        next.system_update_id = next.system_update_id.wrapping_add(1);
+        self.system_update_id = self.system_update_id.wrapping_add(1);
 
-        Ok(Some(next))
+        Ok(true)
     }
 }
 

@@ -20,8 +20,8 @@ mod revisions;
 mod snapshots;
 
 use background::Background;
+use browse::View;
 pub use browse::{ObjectId, parse_id};
-use browse::{Payload, View};
 use revisions::Ledger;
 use snapshots::{Contents, Root, Source};
 
@@ -202,7 +202,7 @@ struct Refresh {
 }
 
 struct State {
-    ledger: Arc<Ledger>,
+    ledger: Ledger,
     cache: Cache,
 }
 
@@ -227,20 +227,23 @@ impl State {
         Ok(None)
     }
 
-    fn view(&self, scope: Scope) -> RefreshResult {
-        let payload = match scope {
-            Scope::Root => Payload::Root,
+    fn view(&self, query: BrowseQuery) -> RefreshResult {
+        let contents = match query.scope() {
+            Scope::Root => None,
 
-            Scope::Album(id) => Payload::Album {
-                id,
-                contents: self.cache.albums.get(&id).ok_or(FAILED)?.snapshot.clone(),
-            },
+            Scope::Album(id) => Some(self.cache.albums.get(&id).ok_or(FAILED)?.snapshot.clone()),
+        };
+
+        let update_id = match query.object_id {
+            ObjectId::Album(id) => self.ledger.albums.get(&id).ok_or(MISSING)?.update_id,
+            ObjectId::Root | ObjectId::Item { .. } => self.ledger.system_update_id,
         };
 
         Ok(View {
+            query,
             root: self.cache.root.as_ref().ok_or(FAILED)?.snapshot.clone(),
-            payload,
-            ledger: self.ledger.clone(),
+            contents,
+            update_id,
         })
     }
 }
@@ -402,7 +405,7 @@ impl ImmichCatalog {
                 source: Arc::new(source),
                 events,
                 state: State {
-                    ledger: Arc::new(ledger),
+                    ledger,
                     cache: Cache::new(),
                 },
                 pending: Vec::new(),
@@ -554,7 +557,7 @@ impl CatalogTask {
                     Ok(None) => {
                         self.state.cache.touch(request.query.scope(), now);
 
-                        self.state.view(request.query.scope())
+                        self.state.view(request.query)
                     }
 
                     Err(error) => Err(error),
@@ -601,15 +604,15 @@ impl CatalogTask {
     fn publish(&mut self, candidate: Candidate, deadline: Instant) -> Result<()> {
         let state = &mut self.state;
 
-        let next = match &candidate {
+        // Stage root reconciliation before the deadline check. A contents update
+        // only mutates one existing entry after all fallible checks have passed.
+        let next_root = match &candidate {
             Candidate::Root(root) => state.ledger.root_transition(
                 &root.digest,
                 root.albums.iter().map(|(id, album)| (*id, album.digest)),
             )?,
 
-            Candidate::Album(id, contents) => {
-                state.ledger.contents_transition(*id, &contents.digest)?
-            }
+            Candidate::Album(..) => None,
         };
 
         ensure!(
@@ -617,10 +620,16 @@ impl CatalogTask {
             "catalog refresh deadline exceeded"
         );
 
-        let changed = next.is_some();
+        let changed = match &candidate {
+            Candidate::Root(_) => next_root.is_some(),
 
-        if let Some(next) = next {
-            state.ledger = Arc::new(next);
+            Candidate::Album(id, contents) => {
+                state.ledger.update_contents(*id, &contents.digest)?
+            }
+        };
+
+        if let Some(next) = next_root {
+            state.ledger = next;
         }
 
         state.cache.insert(candidate, Instant::now());
@@ -652,7 +661,7 @@ impl Catalog for ImmichCatalog {
     async fn browse(&self, query: BrowseQuery, deadline: Instant) -> Result<BrowseResult, Fault> {
         let view = self.view(query, deadline).await?;
 
-        view.browse(query, &self.collator)
+        view.browse(&self.collator)
     }
 }
 

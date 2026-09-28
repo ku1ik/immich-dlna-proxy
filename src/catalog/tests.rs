@@ -393,7 +393,7 @@ impl Fixture {
         self.library.control(Control::Expire(scope)).await;
     }
 
-    async fn revisions(&self) -> Arc<Ledger> {
+    async fn revisions(&self) -> Ledger {
         self.library.inspect(|task| task.state.ledger.clone()).await
     }
 
@@ -1195,6 +1195,19 @@ async fn expired_publication_leaves_snapshot_and_revisions_untouched() {
     assert!(task.publish(candidate, Instant::now()).is_err());
     assert!(task.state.cache.root.is_none());
     assert_eq!(task.state.ledger.system_update_id, 1);
+
+    fake.upstream.lock().unwrap().albums.push(album(1, "Album"));
+    let candidate = Candidate::Root(task.source.root().await.unwrap());
+
+    task.publish(candidate, Instant::now() + REFRESH_TIMEOUT)
+        .unwrap();
+
+    let before = task.state.ledger.clone();
+    let id = Uuid::from_u128(1);
+    let candidate = Candidate::Album(id, task.source.contents(id).await.unwrap());
+    assert!(task.publish(candidate, Instant::now()).is_err());
+    assert!(task.state.cache.albums.is_empty());
+    assert_eq!(task.state.ledger, before);
 }
 
 #[tokio::test]
@@ -1495,8 +1508,19 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
 #[tokio::test]
 async fn fresh_hits_and_unchanged_refreshes_pin_coherent_views() {
     let fixture = Fixture::new(2).await;
+
+    fixture
+        .fake
+        .upstream
+        .lock()
+        .unwrap()
+        .contents
+        .insert(Uuid::from_u128(1), vec![item(1, None, None)]);
+
     let task = fixture.run();
     fixture.library.browse(children(1)).await.unwrap();
+    fixture.library.browse(children(2)).await.unwrap();
+
     let root_hit = fixture
         .library
         .catalog
@@ -1511,28 +1535,50 @@ async fn fresh_hits_and_unchanged_refreshes_pin_coherent_views() {
         .await
         .unwrap();
 
-    assert!(Arc::ptr_eq(&root_hit.ledger, &album_hit.ledger));
-    assert!(Arc::ptr_eq(&root_hit.root, &album_hit.root));
-    assert!(matches!(root_hit.payload, Payload::Root));
+    let album_metadata_hit = fixture
+        .library
+        .catalog
+        .view(
+            metadata_query(&format!("album:{}", Uuid::from_u128(1))),
+            Instant::now() + REFRESH_TIMEOUT,
+        )
+        .await
+        .unwrap();
 
-    let Payload::Album { id, contents } = &album_hit.payload else {
-        panic!("expected album payload");
-    };
+    let item_hit = fixture
+        .library
+        .catalog
+        .view(
+            metadata_query(&format!(
+                "album:{}:asset:{}",
+                Uuid::from_u128(1),
+                Uuid::from_u128(1)
+            )),
+            Instant::now() + REFRESH_TIMEOUT,
+        )
+        .await
+        .unwrap();
 
-    assert_eq!(*id, Uuid::from_u128(1));
+    let before = fixture.revisions().await;
 
-    // Resolution rejects a payload from another scope before rendering any rows.
-    for (view, query) in [(&root_hit, children(1)), (&album_hit, children(2))] {
-        assert_eq!(
-            view.browse(query, &fixture.library.catalog.collator).err(),
-            Some(FAILED)
-        );
-    }
+    assert_ne!(
+        before.system_update_id,
+        before.albums[&Uuid::from_u128(1)].update_id
+    );
+
+    assert_eq!(root_hit.update_id, before.system_update_id);
 
     assert_eq!(
-        album_hit.ledger.albums[&Uuid::from_u128(1)]
-            .contents_digest
-            .as_ref(),
+        album_hit.update_id,
+        before.albums[&Uuid::from_u128(1)].update_id
+    );
+
+    assert!(Arc::ptr_eq(&root_hit.root, &album_hit.root));
+    assert!(root_hit.contents.is_none());
+    let contents = album_hit.contents.as_ref().unwrap();
+
+    assert_eq!(
+        before.albums[&Uuid::from_u128(1)].contents_digest.as_ref(),
         Some(&contents.digest)
     );
 
@@ -1571,14 +1617,31 @@ async fn fresh_hits_and_unchanged_refreshes_pin_coherent_views() {
         before.albums[&Uuid::from_u128(1)].update_id
     );
 
+    let pinned_root = root_hit.browse(&fixture.library.catalog.collator).unwrap();
+    assert_eq!(pinned_root.objects[0].child_count(), Some(2));
+    assert_eq!(pinned_root.update_id, before.system_update_id);
+
+    let pinned_album = album_hit.browse(&fixture.library.catalog.collator).unwrap();
+
     assert_eq!(
-        album_hit.ledger.root_digest.as_ref(),
-        Some(&album_hit.root.digest)
+        pinned_album.update_id,
+        before.albums[&Uuid::from_u128(1)].update_id
     );
 
-    assert!(album_hit.ledger.albums.contains_key(&Uuid::from_u128(1)));
+    assert_eq!(pinned_album.objects[0].title, "Photo 1");
+
+    let pinned_metadata = album_metadata_hit
+        .browse(&fixture.library.catalog.collator)
+        .unwrap();
+
+    assert_eq!(pinned_metadata.update_id, pinned_album.update_id);
+    assert_eq!(pinned_metadata.objects[0], old_album.objects[0]);
+
+    let pinned_item = item_hit.browse(&fixture.library.catalog.collator).unwrap();
+    assert_eq!(pinned_item.update_id, before.system_update_id);
+    assert_eq!(pinned_item.objects, pinned_album.objects);
     assert_eq!(fixture.fake.calls("/api/albums"), 3);
-    assert_eq!(fixture.fake.calls("/api/search/metadata"), 1);
+    assert_eq!(fixture.fake.calls("/api/search/metadata"), 2);
 
     fixture
         .library

@@ -513,7 +513,7 @@ async fn ready_reply_is_pinned_before_ordinary_lru_can_evict_its_payload() {
         .await;
 
     assert_eq!(
-        view.browse(children(1), &fixture.library.catalog.collator)
+        view.browse(&fixture.library.catalog.collator)
             .unwrap()
             .total_matches,
         0

@@ -6,7 +6,6 @@ use uuid::Uuid;
 
 use super::{
     BrowseMode, BrowseQuery, BrowseResult, FAILED, MISSING, Object, SortOrder,
-    revisions::Ledger,
     snapshots::{Contents, Root},
 };
 use crate::protocol::Fault;
@@ -14,15 +13,10 @@ use crate::protocol::Fault;
 // A response pins one publication independently of subsequent cache eviction.
 #[derive(Clone)]
 pub(super) struct View {
+    pub(super) query: BrowseQuery,
     pub(super) root: Arc<Root>,
-    pub(super) payload: Payload,
-    pub(super) ledger: Arc<Ledger>,
-}
-
-#[derive(Clone)]
-pub(super) enum Payload {
-    Root,
-    Album { id: Uuid, contents: Arc<Contents> },
+    pub(super) contents: Option<Arc<Contents>>,
+    pub(super) update_id: u32,
 }
 
 enum Rows<'a> {
@@ -100,15 +94,12 @@ fn compare_dates(
 }
 
 impl View {
-    pub(super) fn browse(
-        &self,
-        query: BrowseQuery,
-        collator: &CollatorBorrowed<'_>,
-    ) -> Result<BrowseResult, Fault> {
+    pub(super) fn browse(&self, collator: &CollatorBorrowed<'_>) -> Result<BrowseResult, Fault> {
+        let query = self.query;
         let root = &self.root;
-        let ledger = &self.ledger;
+        let update_id = self.update_id;
 
-        let (rows, update_id) = match query.object_id {
+        let rows = match query.object_id {
             ObjectId::Root => {
                 if query.mode == BrowseMode::Metadata {
                     let mut object = root.object.clone();
@@ -117,21 +108,20 @@ impl View {
                         child_count: Some(root.albums.len()),
                     };
 
-                    return Ok(metadata(object, ledger.system_update_id));
+                    return Ok(metadata(object, update_id));
                 }
 
-                (Rows::Albums(root), ledger.system_update_id)
+                Rows::Albums(root)
             }
 
             ObjectId::Album(id) => {
                 let album = root.albums.get(&id).ok_or(MISSING)?;
-                let revision = ledger.albums.get(&id).ok_or(MISSING)?;
 
                 if query.mode == BrowseMode::Metadata {
-                    return Ok(metadata(album.metadata.object.clone(), revision.update_id));
+                    return Ok(metadata(album.metadata.object.clone(), update_id));
                 }
 
-                (Rows::Items(self.contents(id)?), revision.update_id)
+                Rows::Items(self.contents()?)
             }
 
             ObjectId::Item { album, asset } => {
@@ -139,13 +129,13 @@ impl View {
                     return Err(MISSING);
                 }
 
-                let item = self.contents(album)?.items.get(&asset).ok_or(MISSING)?;
+                let item = self.contents()?.items.get(&asset).ok_or(MISSING)?;
 
                 if matches!(query.mode, BrowseMode::DirectChildren { .. }) {
                     return Err(Fault::NoSuchContainer);
                 }
 
-                return Ok(metadata(item.object.clone(), ledger.system_update_id));
+                return Ok(metadata(item.object.clone(), update_id));
             }
         };
 
@@ -166,11 +156,8 @@ impl View {
         ))
     }
 
-    fn contents(&self, album: Uuid) -> Result<&Contents, Fault> {
-        match &self.payload {
-            Payload::Album { id, contents } if *id == album => Ok(contents),
-            _ => Err(FAILED),
-        }
+    fn contents(&self) -> Result<&Contents, Fault> {
+        self.contents.as_deref().ok_or(FAILED)
     }
 }
 
@@ -343,15 +330,7 @@ mod tests {
             bytes: 0,
         };
 
-        let mut ledger = Ledger::new(42);
-        ledger.root_digest = Some(root.digest);
-
-        let view = View {
-            root: Arc::new(root),
-            payload: Payload::Root,
-            ledger: Arc::new(ledger),
-        };
-
+        let root = Arc::new(root);
         let collator = crate::config::collator("pl").unwrap();
 
         for (sort, expected) in [
@@ -368,7 +347,14 @@ mod tests {
                 sort,
             };
 
-            let full = view.browse(query, &collator).unwrap();
+            let view = View {
+                query,
+                root: root.clone(),
+                contents: None,
+                update_id: 42,
+            };
+
+            let full = view.browse(&collator).unwrap();
 
             let expected: Vec<_> = expected
                 .into_iter()
@@ -387,18 +373,18 @@ mod tests {
             );
 
             for start in [0, 3, 6, 9] {
-                let page = view
-                    .browse(
-                        BrowseQuery {
-                            mode: BrowseMode::DirectChildren {
-                                starting_index: start,
-                                requested_count: 3,
-                            },
-                            ..query
+                let page = View {
+                    query: BrowseQuery {
+                        mode: BrowseMode::DirectChildren {
+                            starting_index: start,
+                            requested_count: 3,
                         },
-                        &collator,
-                    )
-                    .unwrap();
+                        ..query
+                    },
+                    ..view.clone()
+                }
+                .browse(&collator)
+                .unwrap();
 
                 assert_eq!(page.total_matches, 9);
                 assert_eq!(page.update_id, full.update_id);
