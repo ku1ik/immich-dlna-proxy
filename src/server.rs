@@ -340,11 +340,9 @@ async fn execute<C: Catalog>(
     deadline: Instant,
     activity: &Activity,
 ) -> Result<String, Fault> {
-    let service = action.service();
-    let name = action.name();
-    let response = |args: &[(&'static str, &str)]| protocol::action_response(service, name, args);
+    let response = |args: &[(&'static str, &str)]| protocol::action_response(&action, args);
 
-    match action {
+    match &action {
         Action::Browse { query, filter } => {
             let object = crate::catalog::parse_id(&query.object_id);
 
@@ -370,7 +368,7 @@ async fn execute<C: Catalog>(
                 )
                 .await?;
 
-            let didl = protocol::didl(&result.objects, &filter)?;
+            let didl = protocol::didl(&result.objects, filter)?;
 
             let envelope = response(&[
                 ("Result", &didl),
@@ -400,7 +398,7 @@ async fn execute<C: Catalog>(
         Action::GetCurrentConnectionIds => response(&[("ConnectionIDs", "0")]),
 
         Action::GetCurrentConnectionInfo(id) => {
-            if id != 0 {
+            if *id != 0 {
                 return Err(Fault::InvalidConnectionReference);
             }
 

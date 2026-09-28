@@ -334,19 +334,19 @@ impl Xml {
 }
 
 pub(crate) fn action_response(
-    service: Service,
-    action: &'static str,
+    action: &Action,
     args: &[(&'static str, &str)],
 ) -> Result<String, Fault> {
-    action_response_bounded(service, action, args, SOAP_RESPONSE_BYTES)
+    action_response_bounded(action, args, SOAP_RESPONSE_BYTES)
 }
 
 fn action_response_bounded(
-    service: Service,
-    action: &'static str,
+    action: &Action,
     args: &[(&'static str, &str)],
     limit: usize,
 ) -> Result<String, Fault> {
+    let service = action.service();
+    let action = action.name();
     let mut xml = Xml::new(limit, false);
     xml.raw(ENVELOPE_START)?;
     xml.raw("<u:")?;

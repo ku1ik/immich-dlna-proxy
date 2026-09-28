@@ -163,8 +163,7 @@ fn byte_seek_is_explicit_per_resource_and_does_not_add_other_dlna_claims() {
     assert_eq!(xml.matches("DLNA.ORG_").count(), 1);
     assert_xml(&xml);
 
-    let encoded =
-        action_response(Service::ContentDirectory, "Browse", &[("Result", &xml)]).unwrap();
+    let encoded = action_response(&browse(BROWSE_ARGS).unwrap(), &[("Result", &xml)]).unwrap();
 
     assert!(encoded.contains("http-get:*:video/mp4:DLNA.ORG_OP=01"));
     assert_xml(&encoded);
@@ -952,8 +951,7 @@ fn serialization_sanitizes_xml_and_escapes_exactly_two_layers() {
     assert!(xml.contains("video/mp4&quot; bad=&quot;value"));
 
     let response = action_response(
-        Service::ContentDirectory,
-        "Browse",
+        &browse(BROWSE_ARGS).unwrap(),
         &[("Result", &xml), ("NumberReturned", "1")],
     )
     .unwrap();
@@ -990,21 +988,16 @@ fn both_serialization_layers_fail_at_the_bound_without_partial_results() {
     );
 
     let args = [("Result", xml.as_str())];
-    let response = action_response(Service::ContentDirectory, "Browse", &args).unwrap();
+    let action = browse(BROWSE_ARGS).unwrap();
+    let response = action_response(&action, &args).unwrap();
 
     assert_eq!(
-        action_response_bounded(Service::ContentDirectory, "Browse", &args, response.len())
-            .unwrap(),
+        action_response_bounded(&action, &args, response.len()).unwrap(),
         response
     );
 
     assert_eq!(
-        action_response_bounded(
-            Service::ContentDirectory,
-            "Browse",
-            &args,
-            response.len() - 1
-        ),
+        action_response_bounded(&action, &args, response.len() - 1),
         Err(Fault::ActionFailed)
     );
 
