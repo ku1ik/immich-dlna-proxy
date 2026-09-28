@@ -32,54 +32,54 @@ impl Ledger {
     pub(super) fn root_transition(
         &self,
         root_digest: &Digest,
-        albums: &BTreeMap<Uuid, Digest>,
+        albums: impl ExactSizeIterator<Item = (Uuid, Digest)>,
     ) -> anyhow::Result<Option<Self>> {
         ensure!(
             albums.len() <= MAX_ALBUMS,
             "root exceeds 4096 present albums"
         );
 
-        let mut next = self.clone();
-        next.albums.retain(|id, _| albums.contains_key(id));
-
-        let mut changed = self.root_digest.as_ref() != Some(root_digest)
-            || next.albums.len() != self.albums.len();
+        let mut changed =
+            self.root_digest.as_ref() != Some(root_digest) || albums.len() != self.albums.len();
 
         let update_id = self.system_update_id.wrapping_add(1);
-
-        for (id, album) in &mut next.albums {
-            let metadata = albums[id];
-
-            if metadata != album.metadata_digest {
-                album.update_id = album.update_id.wrapping_add(1);
-                album.metadata_digest = metadata;
-                changed = true;
-            }
-        }
+        let mut next = BTreeMap::new();
 
         for (id, metadata_digest) in albums {
-            if !next.albums.contains_key(id) {
-                next.albums.insert(
-                    *id,
+            let revision = match self.albums.get(&id).copied() {
+                Some(mut album) => {
+                    if metadata_digest != album.metadata_digest {
+                        album.update_id = album.update_id.wrapping_add(1);
+                        album.metadata_digest = metadata_digest;
+                        changed = true;
+                    }
+
+                    album
+                }
+
+                None => {
+                    changed = true;
+
                     AlbumRevision {
                         update_id,
-                        metadata_digest: *metadata_digest,
+                        metadata_digest,
                         contents_digest: None,
-                    },
-                );
+                    }
+                }
+            };
 
-                changed = true;
-            }
+            next.insert(id, revision);
         }
 
         if !changed {
             return Ok(None);
         }
 
-        next.root_digest = Some(*root_digest);
-        next.system_update_id = update_id;
-
-        Ok(Some(next))
+        Ok(Some(Self {
+            system_update_id: update_id,
+            root_digest: Some(*root_digest),
+            albums: next,
+        }))
     }
 
     pub(super) fn contents_transition(

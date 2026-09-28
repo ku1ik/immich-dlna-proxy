@@ -10,7 +10,7 @@ fn digest(number: u8) -> Digest {
 
 fn populated(seed: u32) -> Ledger {
     Ledger::new(seed)
-        .root_transition(&digest(1), &BTreeMap::from([(id(2), digest(2))]))
+        .root_transition(&digest(1), [(id(2), digest(2))].into_iter())
         .unwrap()
         .unwrap()
 }
@@ -50,10 +50,15 @@ fn root_transitions_forget_removals_and_reintroduce_at_the_new_global_revision()
     let root = digest(1);
     let albums = BTreeMap::from([(id(2), digest(2))]);
     let ledger = populated(0);
-    assert_eq!(ledger.root_transition(&root, &albums).unwrap(), None);
+    assert_eq!(
+        ledger
+            .root_transition(&root, albums.clone().into_iter())
+            .unwrap(),
+        None
+    );
 
     let projection = ledger
-        .root_transition(&digest(9), &albums)
+        .root_transition(&digest(9), albums.clone().into_iter())
         .unwrap()
         .unwrap();
 
@@ -66,7 +71,7 @@ fn root_transitions_forget_removals_and_reintroduce_at_the_new_global_revision()
         .unwrap();
 
     let removed = ledger
-        .root_transition(&root, &BTreeMap::new())
+        .root_transition(&root, std::iter::empty())
         .unwrap()
         .unwrap();
 
@@ -74,7 +79,7 @@ fn root_transitions_forget_removals_and_reintroduce_at_the_new_global_revision()
     assert!(removed.albums.is_empty());
 
     assert_eq!(
-        removed.root_transition(&root, &BTreeMap::new()).unwrap(),
+        removed.root_transition(&root, std::iter::empty()).unwrap(),
         None
     );
 
@@ -82,7 +87,7 @@ fn root_transitions_forget_removals_and_reintroduce_at_the_new_global_revision()
     assert!(removed.contents_transition(id(100), &digest(4)).is_err());
 
     let reappeared = removed
-        .root_transition(&root, &BTreeMap::from([(id(2), digest(4))]))
+        .root_transition(&root, [(id(2), digest(4))].into_iter())
         .unwrap()
         .unwrap();
 
@@ -100,7 +105,7 @@ fn root_transitions_forget_removals_and_reintroduce_at_the_new_global_revision()
     );
 
     let renamed = reappeared
-        .root_transition(&root, &BTreeMap::from([(id(2), digest(5))]))
+        .root_transition(&root, [(id(2), digest(5))].into_iter())
         .unwrap()
         .unwrap();
 
@@ -111,7 +116,7 @@ fn root_transitions_forget_removals_and_reintroduce_at_the_new_global_revision()
 #[test]
 fn root_and_contents_counters_wrap_and_unknown_empty_root_advances() {
     let initial = Ledger::new(0)
-        .root_transition(&digest(0), &BTreeMap::new())
+        .root_transition(&digest(0), std::iter::empty())
         .unwrap()
         .unwrap();
 
@@ -130,7 +135,7 @@ fn root_and_contents_counters_wrap_and_unknown_empty_root_advances() {
     assert_eq!(contents.albums[&id(2)].update_id, 0);
 
     let removed = ledger
-        .root_transition(&digest(2), &BTreeMap::new())
+        .root_transition(&digest(2), std::iter::empty())
         .unwrap()
         .unwrap();
 
@@ -145,7 +150,7 @@ fn replacement_at_capacity_discards_removed_identities_without_exhaustion() {
         .collect();
 
     let ledger = Ledger::new(0)
-        .root_transition(&digest(1), &albums)
+        .root_transition(&digest(1), albums.clone().into_iter())
         .unwrap()
         .unwrap();
 
@@ -153,7 +158,7 @@ fn replacement_at_capacity_discards_removed_identities_without_exhaustion() {
     albums.insert(id(MAX_ALBUMS as u128 + 1), digest(1));
 
     let replacement = ledger
-        .root_transition(&digest(2), &albums)
+        .root_transition(&digest(2), albums.clone().into_iter())
         .unwrap()
         .unwrap();
 
@@ -162,19 +167,19 @@ fn replacement_at_capacity_discards_removed_identities_without_exhaustion() {
     assert_eq!(replacement.albums[&id(2)].update_id, 1);
     assert_eq!(replacement.albums[&id(MAX_ALBUMS as u128 + 1)].update_id, 2);
     albums.insert(id(MAX_ALBUMS as u128 + 2), digest(1));
-    assert!(replacement.root_transition(&digest(3), &albums).is_err());
+    assert!(
+        replacement
+            .root_transition(&digest(3), albums.into_iter())
+            .is_err()
+    );
     let mut ledger = replacement;
 
     // More unique identities than the former process-lifetime allowance.
     for batch in 2..=6 {
-        let albums = (1..=MAX_ALBUMS)
-            .map(|number| (id((batch * MAX_ALBUMS + number) as u128), digest(1)))
-            .collect();
+        let albums = (1..MAX_ALBUMS + 1)
+            .map(|number| (id((batch * MAX_ALBUMS + number) as u128), digest(1)));
 
-        ledger = ledger
-            .root_transition(&digest(2), &albums)
-            .unwrap()
-            .unwrap();
+        ledger = ledger.root_transition(&digest(2), albums).unwrap().unwrap();
 
         assert_eq!(ledger.albums.len(), MAX_ALBUMS);
 

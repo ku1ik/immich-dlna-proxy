@@ -602,15 +602,10 @@ impl CatalogTask {
         let state = &mut self.state;
 
         let next = match &candidate {
-            Candidate::Root(root) => {
-                let albums = root
-                    .albums
-                    .iter()
-                    .map(|(id, album)| (*id, album.digest))
-                    .collect();
-
-                state.ledger.root_transition(&root.digest, &albums)?
-            }
+            Candidate::Root(root) => state.ledger.root_transition(
+                &root.digest,
+                root.albums.iter().map(|(id, album)| (*id, album.digest)),
+            )?,
 
             Candidate::Album(id, contents) => {
                 state.ledger.contents_transition(*id, &contents.digest)?
