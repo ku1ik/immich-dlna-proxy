@@ -101,8 +101,6 @@ impl Source {
     /// request, admission queue, timeout extension, or publication happens here.
     pub(super) async fn contents(&self, album: Uuid) -> Result<Contents> {
         let mut items = BTreeMap::<Uuid, Item>::new();
-        let mut seen = BTreeSet::new();
-        let mut encoded_ids = BTreeSet::new();
         let mut pages = 0;
         let mut records = 0;
         let mut bytes = 2;
@@ -117,6 +115,7 @@ impl Source {
                 break;
             }
 
+            let mut seen = BTreeSet::new();
             let mut page = NonZeroUsize::MIN;
 
             loop {
@@ -138,11 +137,6 @@ impl Source {
                 let mut advanced = false;
 
                 for dto in result.items {
-                    if encoded {
-                        advanced |= encoded_ids.insert(dto.id);
-                        continue;
-                    }
-
                     let id = dto.id;
 
                     if !seen.insert(id) {
@@ -150,6 +144,33 @@ impl Source {
                     }
 
                     advanced = true;
+
+                    if encoded {
+                        let Some(item) = items.get_mut(&id) else {
+                            continue;
+                        };
+
+                        let ObjectKind::Video { resources, .. } = &mut item.object.kind else {
+                            continue;
+                        };
+
+                        let resource = Resource {
+                            uri: asset_url(self.http_address, id, Representation::Playback),
+                            mime: "video/mp4".into(),
+                            duration: None,
+                            byte_seek: true,
+                        };
+
+                        let separator = usize::from(!resources.is_empty());
+
+                        let remaining = (SNAPSHOT_BYTES - bytes)
+                            .checked_sub(separator)
+                            .ok_or_else(|| anyhow!("catalog projected byte limit exceeded"))?;
+
+                        bytes += separator + encoded_size(&resource, remaining)?;
+                        resources.push(resource);
+                        continue;
+                    }
 
                     let Some(item) = project_item(self.http_address, album, dto, &mut bad_dates)?
                     else {
@@ -175,30 +196,6 @@ impl Source {
 
                 ensure!(advanced, "Immich search continuation made no progress");
                 page = next;
-            }
-        }
-
-        for id in encoded_ids {
-            if let Some(item) = items.get_mut(&id) {
-                let ObjectKind::Video { resources, .. } = &mut item.object.kind else {
-                    continue;
-                };
-
-                let resource = Resource {
-                    uri: asset_url(self.http_address, id, Representation::Playback),
-                    mime: "video/mp4".into(),
-                    duration: None,
-                    byte_seek: true,
-                };
-
-                let separator = usize::from(!resources.is_empty());
-
-                let remaining = (SNAPSHOT_BYTES - bytes)
-                    .checked_sub(separator)
-                    .ok_or_else(|| anyhow!("catalog projected byte limit exceeded"))?;
-
-                bytes += separator + encoded_size(&resource, remaining)?;
-                resources.push(resource);
             }
         }
 

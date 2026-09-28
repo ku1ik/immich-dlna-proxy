@@ -218,6 +218,40 @@ async fn complete_pagination_and_scoped_encoded_intersection_without_probes() {
     }
 }
 
+#[tokio::test]
+async fn encoded_pages_deduplicate_matches_and_track_nonmember_progress() {
+    let fake = SnapshotFixture::new(vec![
+        page(vec![asset(1, "VIDEO"), asset(2, "VIDEO")], None),
+        page(vec![asset(99, "VIDEO")], Some("2")),
+        page(vec![asset(2, "VIDEO"), asset(1, "VIDEO")], Some("3")),
+        page(vec![asset(1, "VIDEO"), asset(2, "VIDEO")], None),
+        page(vec![asset(2, "VIDEO"), asset(1, "VIDEO")], None),
+        page(vec![asset(1, "VIDEO"), asset(2, "VIDEO")], None),
+    ])
+    .await;
+
+    let paginated = fake.source.contents(ALBUM).await.unwrap();
+    let reordered = fake.source.contents(ALBUM).await.unwrap();
+    assert_eq!(paginated.items.len(), 2);
+    assert_eq!(paginated.items, reordered.items);
+    assert_eq!(paginated.digest, reordered.digest);
+    assert_eq!(paginated.bytes, reordered.bytes);
+
+    for item in paginated.items.values() {
+        assert_eq!(item.object.resources().len(), 2);
+    }
+
+    let fake = SnapshotFixture::new(vec![
+        page(vec![asset(1, "VIDEO")], None),
+        page(vec![asset(99, "VIDEO")], Some("2")),
+        page(vec![asset(99, "VIDEO")], Some("3")),
+    ])
+    .await;
+
+    assert!(fake.source.contents(ALBUM).await.is_err());
+    assert_eq!(fake.api.requests.lock().unwrap().len(), 3);
+}
+
 #[test]
 fn eligible_assets_require_original_file_name() {
     for null in [false, true] {
