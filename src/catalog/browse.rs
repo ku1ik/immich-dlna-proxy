@@ -17,7 +17,7 @@ pub(super) struct View {
 }
 
 pub(super) enum Selection {
-    Metadata(Object),
+    Metadata(Box<Object>),
     Children {
         rows: Rows,
         starting_index: u32,
@@ -103,7 +103,7 @@ fn compare_dates(
 impl View {
     pub(super) fn browse(&self, collator: &CollatorBorrowed<'_>) -> BrowseResult {
         match &self.selection {
-            Selection::Metadata(object) => metadata(object.clone(), self.update_id),
+            Selection::Metadata(object) => metadata(object.as_ref().clone(), self.update_id),
 
             Selection::Children {
                 rows,

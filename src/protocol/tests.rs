@@ -34,20 +34,18 @@ fn object() -> Object {
         kind: ObjectKind::Video {
             album: Uuid::from_u128(10),
             asset: Uuid::from_u128(11),
-            resources: vec![
-                Resource {
-                    uri: "http://192.0.2.1/original?a=1&b=2".into(),
-                    mime: "video/quicktime".into(),
-                    duration_ms: Some(443_045_006),
-                    byte_seek: false,
-                },
-                Resource {
-                    uri: "http://192.0.2.1/playback".into(),
-                    mime: "video/mp4".into(),
-                    duration_ms: None,
-                    byte_seek: false,
-                },
-            ],
+            original: Resource {
+                uri: "http://192.0.2.1/original?a=1&b=2".into(),
+                mime: "video/quicktime".into(),
+                duration_ms: Some(443_045_006),
+                byte_seek: false,
+            },
+            playback: Some(Resource {
+                uri: "http://192.0.2.1/playback".into(),
+                mime: "video/mp4".into(),
+                duration_ms: None,
+                byte_seek: false,
+            }),
         },
     }
 }
@@ -151,11 +149,11 @@ fn event_propertyset_namespaces_and_static_values_are_correct() {
 fn byte_seek_is_explicit_per_resource_and_does_not_add_other_dlna_claims() {
     let mut item = object();
 
-    let ObjectKind::Video { resources, .. } = &mut item.kind else {
+    let ObjectKind::Video { playback, .. } = &mut item.kind else {
         panic!("expected video");
     };
 
-    resources[1].byte_seek = true;
+    playback.as_mut().unwrap().byte_seek = true;
 
     let xml = didl(&[item.clone()], &Filter::parse("*").unwrap()).unwrap();
     assert!(xml.contains("http-get:*:video/mp4:DLNA.ORG_OP=01"));
@@ -941,11 +939,11 @@ fn serialization_sanitizes_xml_and_escapes_exactly_two_layers() {
     let mut object = object();
     object.title = "A&B <title> Łódź 東京 𐐀\u{1}".into();
 
-    let ObjectKind::Video { resources, .. } = &mut object.kind else {
+    let ObjectKind::Video { original, .. } = &mut object.kind else {
         panic!("expected video");
     };
 
-    resources[0].mime = "video/mp4\" bad=\"value".into();
+    original.mime = "video/mp4\" bad=\"value".into();
     let xml = didl(&[object], &Filter::parse("*").unwrap()).unwrap();
     assert_xml(&xml);
     assert!(xml.contains("video/mp4&quot; bad=&quot;value"));

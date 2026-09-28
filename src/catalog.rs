@@ -93,12 +93,13 @@ pub enum ObjectKind {
     Photo {
         album: Uuid,
         asset: Uuid,
-        resources: Vec<Resource>,
+        resources: [Resource; 2],
     },
     Video {
         album: Uuid,
         asset: Uuid,
-        resources: Vec<Resource>,
+        original: Resource,
+        playback: Option<Resource>,
     },
 }
 
@@ -138,11 +139,17 @@ impl Object {
         }
     }
 
-    pub fn resources(&self) -> &[Resource] {
-        match &self.kind {
-            ObjectKind::Root { .. } | ObjectKind::Album { .. } => &[],
-            ObjectKind::Photo { resources, .. } | ObjectKind::Video { resources, .. } => resources,
-        }
+    pub fn resources(&self) -> impl Iterator<Item = &Resource> {
+        let resources = match &self.kind {
+            ObjectKind::Root { .. } | ObjectKind::Album { .. } => [None, None],
+            ObjectKind::Photo { resources, .. } => [Some(&resources[0]), Some(&resources[1])],
+
+            ObjectKind::Video {
+                original, playback, ..
+            } => [Some(original), playback.as_ref()],
+        };
+
+        resources.into_iter().flatten()
     }
 }
 
@@ -243,12 +250,12 @@ impl State {
         };
 
         let selection = match (query.object_id, query.mode) {
-            (ObjectId::Root, BrowseMode::Metadata) => Selection::Metadata(root.object()),
+            (ObjectId::Root, BrowseMode::Metadata) => Selection::Metadata(Box::new(root.object())),
 
             (ObjectId::Album(id), BrowseMode::Metadata) => {
                 let album = root.albums.get(&id).ok_or(MISSING)?;
 
-                Selection::Metadata(album.metadata.object.clone())
+                Selection::Metadata(Box::new(album.metadata.object.clone()))
             }
 
             (ObjectId::Item { album, asset }, mode) => {
@@ -262,7 +269,7 @@ impl State {
                     return Err(Fault::NoSuchContainer);
                 }
 
-                Selection::Metadata(item.object.clone())
+                Selection::Metadata(Box::new(item.object.clone()))
             }
 
             (

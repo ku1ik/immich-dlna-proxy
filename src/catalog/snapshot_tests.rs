@@ -74,15 +74,15 @@ fn image_resources_follow_mime_and_edit_selection() {
         dto["originalMimeType"] = json!(mime);
         dto["isEdited"] = json!(edited);
         let item = project(dto);
-        assert_eq!(item.object.resources().len(), 2);
-        assert!(item.object.resources()[0].uri.ends_with(representation));
-        assert_eq!(item.object.resources()[0].mime, expected);
-        assert!(item.object.resources()[1].uri.ends_with("preview"));
+        let resources: Vec<_> = item.object.resources().collect();
+        assert_eq!(resources.len(), 2);
+        assert!(resources[0].uri.ends_with(representation));
+        assert_eq!(resources[0].mime, expected);
+        assert!(resources[1].uri.ends_with("preview"));
 
         assert!(
             item.object
                 .resources()
-                .iter()
                 .all(|r| !r.byte_seek && r.duration_ms.is_none())
         );
     }
@@ -101,7 +101,7 @@ fn original_video_duration_is_formatted_from_nonnegative_milliseconds() {
         dto["duration"] = json!(duration);
         let item = project(dto);
         assert_eq!(
-            item.object.resources()[0].duration_ms,
+            item.object.resources().next().unwrap().duration_ms,
             u64::try_from(duration).ok()
         );
 
@@ -123,8 +123,9 @@ fn original_video_without_mime_remains_seekable_with_preview_artwork() {
     let mut dto = asset(1, "VIDEO");
     dto["originalMimeType"] = Value::Null;
     let item = project(dto);
-    assert_eq!(item.object.resources()[0].mime, "application/octet-stream");
-    assert!(item.object.resources()[0].byte_seek);
+    let original = item.object.resources().next().unwrap();
+    assert_eq!(original.mime, "application/octet-stream");
+    assert!(original.byte_seek);
     assert!(item.object.art.unwrap().ends_with("preview"));
 }
 
@@ -206,11 +207,12 @@ async fn complete_pagination_and_scoped_encoded_intersection_without_probes() {
     let contents = fake.source.contents(ALBUM).await.unwrap();
     assert_eq!(contents.items.len(), 1001);
     let video = &contents.items[&Uuid::from_u128(1001)].object;
-    assert_eq!(video.resources().len(), 2);
-    assert_eq!(video.resources()[0].mime, "video/quicktime");
-    assert_eq!(video.resources()[1].mime, "video/mp4");
-    assert!(video.resources().iter().all(|r| r.byte_seek));
-    assert!(video.resources()[1].duration_ms.is_none());
+    let resources: Vec<_> = video.resources().collect();
+    assert_eq!(resources.len(), 2);
+    assert_eq!(resources[0].mime, "video/quicktime");
+    assert_eq!(resources[1].mime, "video/mp4");
+    assert!(video.resources().all(|r| r.byte_seek));
+    assert!(resources[1].duration_ms.is_none());
 
     let requests = fake.api.requests.lock().unwrap();
     assert_eq!(requests.len(), 5);
@@ -256,7 +258,7 @@ async fn encoded_pages_deduplicate_matches_and_track_nonmember_progress() {
     assert_eq!(paginated.bytes, reordered.bytes);
 
     for item in paginated.items.values() {
-        assert_eq!(item.object.resources().len(), 2);
+        assert_eq!(item.object.resources().count(), 2);
     }
 
     let fake = SnapshotFixture::new(vec![
@@ -731,18 +733,18 @@ fn root_respects_exact_snapshot_byte_budget() {
 }
 
 #[tokio::test]
-async fn playback_append_respects_exact_snapshot_byte_budget() {
+async fn playback_enrichment_respects_exact_snapshot_byte_budget() {
     let mut video = asset(1, "VIDEO");
     let mut photo = asset(2, "IMAGE");
     video["checksum"] = json!("");
     photo["checksum"] = json!("");
     let mut expected = [project(video.clone()), project(photo.clone())];
 
-    let ObjectKind::Video { resources, .. } = &mut expected[0].object.kind else {
+    let ObjectKind::Video { playback, .. } = &mut expected[0].object.kind else {
         panic!("expected video");
     };
 
-    resources.push(Resource {
+    *playback = Some(Resource {
         uri: "http://192.0.2.1:8200/media/assets/00000000-0000-0000-0000-000000000001/playback"
             .into(),
         mime: "video/mp4".into(),
@@ -770,11 +772,13 @@ async fn playback_append_respects_exact_snapshot_byte_budget() {
             let contents = result.unwrap();
             assert_eq!(contents.bytes, SNAPSHOT_BYTES);
             let resources = contents.items[&Uuid::from_u128(1)].object.resources();
-            assert_eq!(resources, expected[0].object.resources());
+            assert!(resources.eq(expected[0].object.resources()));
 
-            assert_eq!(
-                contents.items[&Uuid::from_u128(2)].object.resources(),
-                expected[1].object.resources()
+            assert!(
+                contents.items[&Uuid::from_u128(2)]
+                    .object
+                    .resources()
+                    .eq(expected[1].object.resources())
             );
         } else {
             assert!(result.unwrap_err().to_string().contains("byte limit"));

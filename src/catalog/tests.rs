@@ -487,12 +487,15 @@ async fn shared_asset_keeps_album_identity_and_asset_only_resources() {
         assert_eq!(metadata.objects, result.objects);
     }
 
-    assert_eq!(first.objects[0].resources(), second.objects[0].resources());
+    assert!(
+        first.objects[0]
+            .resources()
+            .eq(second.objects[0].resources())
+    );
 
     assert_eq!(
         first.objects[0]
             .resources()
-            .iter()
             .map(|resource| resource.uri.as_str())
             .collect::<Vec<_>>(),
         [
@@ -538,7 +541,7 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
     assert_eq!(root.objects[0].parent_id(), None);
     assert_eq!(root.objects[0].class(), "object.container");
     assert_eq!(root.objects[0].child_count(), Some(2));
-    assert!(root.objects[0].resources().is_empty());
+    assert!(root.objects[0].resources().next().is_none());
     assert_eq!(root.update_id, 2);
 
     let metadata = fixture

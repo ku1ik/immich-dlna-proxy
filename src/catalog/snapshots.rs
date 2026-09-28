@@ -233,18 +233,17 @@ impl Source {
 
                 let previous_size = bytes.size(item)?;
 
-                let ObjectKind::Video { resources, .. } = &mut item.object.kind else {
+                let ObjectKind::Video { playback, .. } = &mut item.object.kind else {
                     continue;
                 };
 
-                let resource = Resource {
+                *playback = Some(Resource {
                     uri: asset_url(self.http_address, id, Representation::Playback),
                     mime: "video/mp4".into(),
                     duration_ms: None,
                     byte_seek: true,
-                };
+                });
 
-                resources.push(resource);
                 bytes.replace(previous_size, item)?;
             }
 
@@ -386,7 +385,7 @@ fn project_item(
             ObjectKind::Photo {
                 album,
                 asset: dto.id,
-                resources: vec![
+                resources: [
                     Resource {
                         uri: asset_url(http_address, dto.id, representation),
                         mime,
@@ -409,12 +408,13 @@ fn project_item(
             ObjectKind::Video {
                 album,
                 asset: dto.id,
-                resources: vec![Resource {
+                original: Resource {
                     uri: asset_url(http_address, dto.id, Representation::Original),
                     mime: mime.unwrap_or_else(|| "application/octet-stream".into()),
                     duration_ms,
                     byte_seek: true,
-                }],
+                },
+                playback: None,
             }
         }
 

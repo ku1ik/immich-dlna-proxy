@@ -147,22 +147,22 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             [Original, Playback],
         ),
     ] {
-        let resources = representations
-            .into_iter()
-            .map(|representation| Resource {
-                uri: media(asset, representation),
-                mime: mime.into(),
-                duration_ms: (asset == VIDEO_ID && representation == Original).then_some(30_000),
-                byte_seek: asset == VIDEO_ID,
-            })
-            .collect();
+        let resources = representations.map(|representation| Resource {
+            uri: media(asset, representation),
+            mime: mime.into(),
+            duration_ms: (asset == VIDEO_ID && representation == Original).then_some(30_000),
+            byte_seek: asset == VIDEO_ID,
+        });
 
         objects.push(Object {
             kind: if asset == VIDEO_ID {
+                let [original, playback] = resources;
+
                 ObjectKind::Video {
                     album,
                     asset: asset.parse().unwrap(),
-                    resources,
+                    original,
+                    playback: Some(playback),
                 }
             } else {
                 ObjectKind::Photo {
@@ -184,12 +184,14 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
         kind: ObjectKind::Video {
             album,
             asset: "20000000-0000-4000-8000-000000000008".parse().unwrap(),
-            resources: vec![Resource {
+            // This standalone fixture uses the encoded rendition as its original.
+            original: Resource {
                 uri: media(VIDEO_ID, Playback),
                 mime: "video/mp4".into(),
                 duration_ms: None,
                 byte_seek: true,
-            }],
+            },
+            playback: None,
         },
     });
 
