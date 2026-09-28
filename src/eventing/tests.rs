@@ -208,6 +208,16 @@ fn malformed_headers_never_reserve_capacity() {
         ),
         ("UNSUBSCRIBE", vec![], StatusCode::BAD_REQUEST),
         (
+            "SUBSCRIBE",
+            vec![("sid", "bad"), ("timeout", "Second-0")],
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "UNSUBSCRIBE",
+            vec![("sid", "bad"), ("timeout", "Second-0")],
+            StatusCode::BAD_REQUEST,
+        ),
+        (
             "UNSUBSCRIBE",
             vec![("sid", "bad"), ("timeout", "Second-5")],
             StatusCode::PRECONDITION_FAILED,
@@ -261,6 +271,45 @@ fn malformed_headers_never_reserve_capacity() {
     }
 
     assert!(subscriptions.state.lock().unwrap().entries.is_empty());
+}
+
+#[test]
+fn invalid_timeout_does_not_renew_or_unsubscribe_a_live_lease() {
+    let (subscriptions, _) = Subscriptions::new(0).unwrap();
+    let (_, sid) = subscribe(&subscriptions, Some("Second-12"));
+
+    let expires = subscriptions.state.lock().unwrap().entries[0]
+        .lease
+        .as_ref()
+        .unwrap()
+        .expires;
+
+    for method in ["SUBSCRIBE", "UNSUBSCRIBE"] {
+        let response = sid_request(&subscriptions, sid, method, SERVICE, PEER, Some("Second-0"));
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let state = subscriptions.state.lock().unwrap();
+        let lease = state.entries[0].lease.as_ref().unwrap();
+        assert_eq!(lease.duration, Duration::from_secs(12));
+        assert_eq!(lease.expires, expires);
+    }
+
+    let response = sid_request(
+        &subscriptions,
+        sid,
+        "UNSUBSCRIBE",
+        SERVICE,
+        PEER,
+        Some("Second-99"),
+    );
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["timeout"], "Second-12");
+    assert!(
+        subscriptions.state.lock().unwrap().entries[0]
+            .lease
+            .is_none()
+    );
 }
 
 #[test]

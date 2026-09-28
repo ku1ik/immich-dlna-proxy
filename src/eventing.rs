@@ -73,6 +73,65 @@ enum DeliveryOutcome {
     RemoveSubscription,
 }
 
+enum SubscriptionRequest {
+    Subscribe {
+        callbacks: Vec<Url>,
+        lease: Duration,
+    },
+    Renew {
+        sid: Uuid,
+        lease: Duration,
+    },
+    Unsubscribe {
+        sid: Uuid,
+    },
+}
+
+impl SubscriptionRequest {
+    fn parse(method: &Method, headers: &HeaderMap, peer: Ipv4Addr) -> Result<Self, StatusCode> {
+        if !matches!(method.as_str(), "SUBSCRIBE" | "UNSUBSCRIBE") {
+            return Err(StatusCode::METHOD_NOT_ALLOWED);
+        }
+
+        let sid = single_header(headers, "sid")?;
+        let nt = single_header(headers, "nt")?;
+        let callback = single_header(headers, "callback")?;
+        let timeout = single_header(headers, "timeout")?;
+
+        if (sid.is_some() && (nt.is_some() || callback.is_some()))
+            || (method.as_str() == "UNSUBSCRIBE"
+                && (sid.is_none() || nt.is_some() || callback.is_some()))
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        let lease = lease(timeout)?;
+
+        if let Some(sid) = sid {
+            let sid = sid
+                .strip_prefix("uuid:")
+                .filter(|value| value.len() == 36)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or(StatusCode::PRECONDITION_FAILED)?;
+
+            return Ok(if method.as_str() == "UNSUBSCRIBE" {
+                Self::Unsubscribe { sid }
+            } else {
+                Self::Renew { sid, lease }
+            });
+        }
+
+        if nt != Some("upnp:event") {
+            return Err(StatusCode::PRECONDITION_FAILED);
+        }
+
+        let callbacks = callbacks(callback.ok_or(StatusCode::PRECONDITION_FAILED)?, peer)
+            .ok_or(StatusCode::PRECONDITION_FAILED)?;
+
+        Ok(Self::Subscribe { callbacks, lease })
+    }
+}
+
 impl Subscription {
     fn next_delivery(&self) -> Option<(Instant, u32)> {
         let id = match self.delivery {
@@ -88,6 +147,23 @@ impl Subscription {
 }
 
 impl State {
+    fn live_subscription(
+        &mut self,
+        sid: Uuid,
+        service: Service,
+        peer: Ipv4Addr,
+    ) -> Result<&mut Subscription, StatusCode> {
+        self.entries
+            .iter_mut()
+            .find(|entry| {
+                entry.sid == sid
+                    && entry.service == service
+                    && entry.peer == peer
+                    && entry.lease.is_some()
+            })
+            .ok_or(StatusCode::PRECONDITION_FAILED)
+    }
+
     fn expire(&mut self, now: Instant) {
         self.entries.retain_mut(|entry| {
             if entry
@@ -159,7 +235,9 @@ impl Subscriptions {
         method: &Method,
         headers: &HeaderMap,
     ) -> Response {
-        let result = self.apply_request(service, peer, method, headers);
+        let result = SubscriptionRequest::parse(method, headers, peer)
+            .and_then(|request| self.apply(service, peer, request));
+
         let mut response = Response::builder().header(header::CONTENT_LENGTH, "0");
 
         match result {
@@ -201,114 +279,61 @@ impl Subscriptions {
         response
     }
 
-    fn apply_request(
+    fn apply(
         &self,
         service: Service,
         peer: Ipv4Addr,
-        method: &Method,
-        headers: &HeaderMap,
-    ) -> Result<(Uuid, Duration), StatusCode> {
-        if !matches!(method.as_str(), "SUBSCRIBE" | "UNSUBSCRIBE") {
-            return Err(StatusCode::METHOD_NOT_ALLOWED);
-        }
-
-        let sid = single_header(headers, "sid")?;
-        let nt = single_header(headers, "nt")?;
-        let callback = single_header(headers, "callback")?;
-        let timeout = single_header(headers, "timeout")?;
-
-        if (sid.is_some() && (nt.is_some() || callback.is_some()))
-            || (method.as_str() == "UNSUBSCRIBE"
-                && (sid.is_none() || nt.is_some() || callback.is_some()))
-        {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-
-        let lease = lease(timeout)?;
-
-        if let Some(sid) = sid {
-            let sid = sid
-                .strip_prefix("uuid:")
-                .filter(|value| value.len() == 36)
-                .and_then(|value| Uuid::parse_str(value).ok())
-                .ok_or(StatusCode::PRECONDITION_FAILED)?;
-
-            let mut state = self.state.lock().unwrap();
-            let now = Instant::now();
-            state.expire(now);
-
-            let entry = state
-                .entries
-                .iter_mut()
-                .find(|entry| {
-                    entry.sid == sid
-                        && entry.service == service
-                        && entry.peer == peer
-                        && entry.lease.is_some()
-                })
-                .ok_or(StatusCode::PRECONDITION_FAILED)?;
-
-            let granted = if method.as_str() == "UNSUBSCRIBE" {
-                entry.lease.take().unwrap().duration
-            } else {
-                let live = entry.lease.as_mut().unwrap();
-                live.duration = lease;
-                live.expires = now + lease;
-
-                lease
-            };
-
-            state.expire(now);
-
-            return Ok((sid, granted));
-        }
-
-        if nt != Some("upnp:event") {
-            return Err(StatusCode::PRECONDITION_FAILED);
-        }
-
-        let callbacks = callbacks(callback.ok_or(StatusCode::PRECONDITION_FAILED)?, peer)
-            .ok_or(StatusCode::PRECONDITION_FAILED)?;
-
-        self.register(service, peer, callbacks, lease)
-    }
-
-    // Register callbacks after request validation, capturing the current revision.
-    fn register(
-        &self,
-        service: Service,
-        peer: Ipv4Addr,
-        callbacks: Vec<Url>,
-        lease: Duration,
+        request: SubscriptionRequest,
     ) -> Result<(Uuid, Duration), StatusCode> {
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
         state.expire(now);
 
-        if state.entries.len() >= SUBSCRIPTIONS {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        match request {
+            SubscriptionRequest::Subscribe { callbacks, lease } => {
+                if state.entries.len() >= SUBSCRIPTIONS {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+
+                let sid = Uuid::new_v4();
+                let delivery = Delivery::Initial(state.system_update_id);
+
+                // Registration and publication share this lock; older changes are not replayed.
+                state.entries.push(Subscription {
+                    sid,
+                    service,
+                    peer,
+                    callbacks,
+                    lease: Some(LiveLease {
+                        duration: lease,
+                        expires: now + lease,
+                        pending: None,
+                    }),
+                    delivery,
+                    next_seq: 0,
+                    next_attempt: now,
+                });
+
+                Ok((sid, lease))
+            }
+
+            SubscriptionRequest::Renew { sid, lease } => {
+                let entry = state.live_subscription(sid, service, peer)?;
+                let live = entry.lease.as_mut().unwrap();
+                live.duration = lease;
+                live.expires = now + lease;
+
+                Ok((sid, lease))
+            }
+
+            SubscriptionRequest::Unsubscribe { sid } => {
+                let entry = state.live_subscription(sid, service, peer)?;
+                let granted = entry.lease.take().unwrap().duration;
+                state.expire(now);
+
+                Ok((sid, granted))
+            }
         }
-
-        let sid = Uuid::new_v4();
-        let delivery = Delivery::Initial(state.system_update_id);
-
-        // Registration and publication share this lock; older changes are not replayed.
-        state.entries.push(Subscription {
-            sid,
-            service,
-            peer,
-            callbacks,
-            lease: Some(LiveLease {
-                duration: lease,
-                expires: now + lease,
-                pending: None,
-            }),
-            delivery,
-            next_seq: 0,
-            next_attempt: now,
-        });
-
-        Ok((sid, lease))
     }
 }
 

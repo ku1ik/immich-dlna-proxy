@@ -8,7 +8,14 @@ impl Subscriptions {
         callbacks: Vec<Url>,
     ) -> Uuid {
         let (sid, _) = self
-            .register(service, Ipv4Addr::LOCALHOST, callbacks, SUBSCRIPTION_LEASE)
+            .apply(
+                service,
+                Ipv4Addr::LOCALHOST,
+                SubscriptionRequest::Subscribe {
+                    callbacks,
+                    lease: SUBSCRIPTION_LEASE,
+                },
+            )
             .unwrap();
 
         self.wake.notify_one();
