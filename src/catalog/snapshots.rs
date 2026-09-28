@@ -53,10 +53,27 @@ pub(super) struct Item {
 
 #[derive(Debug)]
 pub(super) struct Root {
-    pub(super) object: Object,
+    pub(super) title: String,
     pub(super) albums: BTreeMap<Uuid, Album>,
     pub(super) digest: Digest,
     pub(super) bytes: usize,
+}
+
+impl Root {
+    pub(super) fn object(&self) -> Object {
+        root_object(&self.title, &self.albums)
+    }
+}
+
+fn root_object(title: &str, albums: &BTreeMap<Uuid, Album>) -> Object {
+    Object {
+        kind: ObjectKind::Root {
+            child_count: albums.len(),
+        },
+        title: title.to_owned(),
+        date: None,
+        art: None,
+    }
 }
 
 #[derive(Debug)]
@@ -314,15 +331,7 @@ pub(super) fn project_root(
         albums.insert(dto.id, album);
     }
 
-    let root_object = Object {
-        kind: ObjectKind::Root {
-            child_count: albums.len(),
-        },
-        title: friendly_name.to_owned(),
-        date: None,
-        art: None,
-    };
-
+    let root_object = root_object(friendly_name, &albums);
     bytes.push(&root_object)?;
 
     let mut projection = Projection::new(SNAPSHOT_BYTES);
@@ -338,7 +347,7 @@ pub(super) fn project_root(
     let (digest, bytes) = projection.finish();
 
     Ok(Root {
-        object: root_object,
+        title: root_object.title,
         albums,
         digest,
         bytes,

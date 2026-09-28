@@ -243,7 +243,7 @@ impl State {
         };
 
         let selection = match (query.object_id, query.mode) {
-            (ObjectId::Root, BrowseMode::Metadata) => Selection::Metadata(root.object.clone()),
+            (ObjectId::Root, BrowseMode::Metadata) => Selection::Metadata(root.object()),
 
             (ObjectId::Album(id), BrowseMode::Metadata) => {
                 let album = root.albums.get(&id).ok_or(MISSING)?;

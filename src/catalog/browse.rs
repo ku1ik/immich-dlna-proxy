@@ -242,13 +242,6 @@ mod tests {
 
     #[test]
     fn albums_default_to_latest_date_with_title_ties_and_missing_dates_last() {
-        let root_object = Object {
-            kind: super::super::ObjectKind::Root { child_count: 9 },
-            title: "Photos & videos".into(),
-            date: None,
-            art: None,
-        };
-
         let albums = [
             (1, "Z", "2020-01-01", Some("2025-01-01")),
             (2, "A", "2030-01-01", Some("2024-12-31")),
@@ -270,7 +263,7 @@ mod tests {
                         kind: super::super::ObjectKind::Album { id },
                         title: title.into(),
                         date: Some(created.parse().unwrap()),
-                        ..root_object.clone()
+                        art: None,
                     },
                     created_at: Some(format!("{created}T00:00:00Z").parse().unwrap()),
                     end_date: end.map(|date| format!("{date}T00:00:00Z").parse().unwrap()),
@@ -283,7 +276,7 @@ mod tests {
         .collect();
 
         let root = Root {
-            object: root_object,
+            title: "Photos & videos".into(),
             albums,
             digest: [0xaa; 32],
             bytes: 0,

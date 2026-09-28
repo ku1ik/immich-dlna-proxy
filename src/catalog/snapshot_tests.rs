@@ -380,10 +380,28 @@ fn root_duplicates_titles_covers_and_canonical_digests() {
     let second = root("Photos", vec![other, empty.clone()]).unwrap();
     assert_eq!(first.digest, second.digest);
     assert_eq!(first.bytes, second.bytes);
-    assert_eq!(first.object.child_count(), Some(2));
+    assert_eq!(first.object().child_count(), Some(2));
+
+    let expected_object = Object {
+        kind: ObjectKind::Root { child_count: 2 },
+        title: "Photos".into(),
+        date: None,
+        art: None,
+    };
+
+    let expected = serde_json::to_vec(&(
+        &expected_object,
+        &first.albums[&Uuid::from_u128(2)].metadata,
+        &first.albums[&ALBUM].metadata,
+    ))
+    .unwrap();
+
+    assert_eq!(first.object(), expected_object);
+    assert_eq!(first.bytes, expected.len());
+    assert_eq!(first.digest, <Digest>::from(Sha256::digest(&expected)));
 
     assert_eq!(
-        root("Photos", vec![]).unwrap().object.child_count(),
+        root("Photos", vec![]).unwrap().object().child_count(),
         Some(0)
     );
 
@@ -684,7 +702,7 @@ fn root_respects_exact_snapshot_byte_budget() {
             let root = result.unwrap();
 
             let expected = serde_json::to_vec(&(
-                &root.object,
+                &root.object(),
                 &root.albums[&Uuid::from_u128(2)].metadata,
                 &root.albums[&ALBUM].metadata,
             ))
