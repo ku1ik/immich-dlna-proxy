@@ -38,7 +38,6 @@ pub struct EventTask {
     client: reqwest::Client,
 }
 
-#[derive(Default)]
 struct State {
     entries: Vec<Subscription>,
     system_update_id: u32,
@@ -95,15 +94,18 @@ impl State {
 }
 
 impl Subscriptions {
-    /// Create a shared subscription handle and its single delivery task.
-    pub fn new() -> anyhow::Result<(Self, EventTask)> {
+    /// Create a shared subscription handle and its single delivery task using the catalog's seed.
+    pub fn new(seed: u32) -> anyhow::Result<(Self, EventTask)> {
         let client = crate::outbound_client_builder()
             // Callback-port churn must not accumulate idle sockets across origins.
             .pool_max_idle_per_host(0)
             .build()?;
 
         let subscriptions = Self {
-            state: Arc::new(Mutex::new(State::default())),
+            state: Arc::new(Mutex::new(State {
+                entries: Vec::new(),
+                system_update_id: seed,
+            })),
             wake: Arc::new(Notify::new()),
         };
 
@@ -116,9 +118,8 @@ impl Subscriptions {
         ))
     }
 
-    /// Update pending events synchronously with catalog publication. Initialize
-    /// with the startup ID before discovery or subscription admission. No I/O
-    /// occurs here; registration and publication share only the event-state lock.
+    /// Update pending events synchronously with catalog publication. No I/O occurs
+    /// here; registration and publication share only the event-state lock.
     pub(crate) fn publish(&self, id: u32) {
         let mut state = self.state.lock().unwrap();
 

@@ -277,7 +277,7 @@ impl Bound {
             .await
             .context("bind fixture upstream")?;
 
-        let (subscriptions, event_task) = Subscriptions::new()?;
+        let (subscriptions, event_task) = Subscriptions::new(0)?;
         let address = SocketAddrV4::new(*address.ip(), http.local_addr()?.port());
         let activity = immich_dlna_proxy::Activity::default();
 

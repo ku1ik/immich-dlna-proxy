@@ -273,16 +273,11 @@ impl Control {
 
 impl Library {
     fn new(config: Config, seed: u32) -> (Self, CatalogTask, crate::eventing::EventTask) {
-        let (events, event_task) = Subscriptions::new().unwrap();
+        let (events, event_task) = Subscriptions::new(seed).unwrap();
         let activity = activity::Activity::default();
 
-        let (catalog, task) = ImmichCatalog::from_parts(
-            config,
-            Ledger::new(seed),
-            events.clone(),
-            activity.subscribe(),
-        )
-        .unwrap();
+        let (catalog, task) =
+            ImmichCatalog::new(config, seed, events.clone(), activity.subscribe()).unwrap();
 
         (
             Self {

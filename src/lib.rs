@@ -30,12 +30,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         config.api_key.clone(),
         activity.clone(),
     )?;
-    let (events, event_task) = Subscriptions::new()?;
+    let seed = rand::random();
+    let (events, event_task) = Subscriptions::new(seed)?;
     let address = config.listen_address;
     let uuid = config.server_uuid;
     let name = config.friendly_name.clone();
     let interface_index = config.interface_index;
-    let (catalog, catalog_task) = ImmichCatalog::new(config, events.clone(), activity.subscribe())?;
+    let (catalog, catalog_task) =
+        ImmichCatalog::new(config, seed, events.clone(), activity.subscribe())?;
 
     let http = TcpListener::bind(address)
         .await

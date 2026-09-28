@@ -372,15 +372,7 @@ enum Candidate {
 impl ImmichCatalog {
     pub(crate) fn new(
         config: Config,
-        events: Subscriptions,
-        activity: watch::Receiver<activity::Snapshot>,
-    ) -> Result<(Self, CatalogTask)> {
-        Self::from_parts(config, Ledger::new(rand::random()), events, activity)
-    }
-
-    fn from_parts(
-        config: Config,
-        ledger: Ledger,
+        seed: u32,
         events: Subscriptions,
         activity: watch::Receiver<activity::Snapshot>,
     ) -> Result<(Self, CatalogTask)> {
@@ -389,8 +381,6 @@ impl ImmichCatalog {
             config.listen_address,
             config.friendly_name,
         );
-
-        events.publish(ledger.system_update_id);
 
         let (commands, receiver) = mpsc::channel(REQUESTS);
 
@@ -404,7 +394,7 @@ impl ImmichCatalog {
                 source: Arc::new(source),
                 events,
                 state: State {
-                    ledger,
+                    ledger: Ledger::new(seed),
                     cache: Cache::new(),
                 },
                 pending: Vec::new(),

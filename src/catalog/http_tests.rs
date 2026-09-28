@@ -74,12 +74,11 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
         activity.clone(),
     )
     .unwrap();
-    let (events, event_task) = Subscriptions::new().unwrap();
+    let (events, event_task) = Subscriptions::new(1).unwrap();
     let name = config.friendly_name.clone();
     let uuid = config.server_uuid;
     let (catalog, task) =
-        ImmichCatalog::from_parts(config, Ledger::new(1), events.clone(), activity.subscribe())
-            .unwrap();
+        ImmichCatalog::new(config, 1, events.clone(), activity.subscribe()).unwrap();
     let library = Library {
         catalog,
         events: events.clone(),

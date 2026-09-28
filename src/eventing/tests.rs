@@ -87,7 +87,7 @@ async fn leases_are_bounded_and_responses_are_framed() {
         (Some("Second-1"), 1),
         (Some("Second-0012"), 12),
     ] {
-        let (subscriptions, _) = Subscriptions::new().unwrap();
+        let (subscriptions, _) = Subscriptions::new(0).unwrap();
         subscriptions.publish(42);
         let (response, sid) = subscribe(&subscriptions, requested);
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "0");
@@ -111,7 +111,7 @@ async fn leases_are_bounded_and_responses_are_framed() {
 
 #[test]
 fn publication_and_registration_share_capture_without_old_replay() {
-    let (subscriptions, _) = Subscriptions::new().unwrap();
+    let (subscriptions, _) = Subscriptions::new(17).unwrap();
     let (_, first) = subscribe(&subscriptions, None);
     subscriptions.publish(u32::MAX);
     let (_, second) = subscribe(&subscriptions, None);
@@ -131,7 +131,7 @@ fn publication_and_registration_share_capture_without_old_replay() {
             .iter()
             .find(|entry| entry.sid == second)
             .unwrap();
-        assert_eq!(first.delivery, Delivery::Initial(0));
+        assert_eq!(first.delivery, Delivery::Initial(17));
         assert_eq!(first.pending, Some(u32::MAX));
         assert_eq!(second.delivery, Delivery::Initial(u32::MAX));
         assert_eq!(second.pending, None);
@@ -150,7 +150,7 @@ fn publication_and_registration_share_capture_without_old_replay() {
 #[test]
 fn concurrent_registration_captures_either_side_of_publication_atomically() {
     for _ in 0..64 {
-        let (subscriptions, _) = Subscriptions::new().unwrap();
+        let (subscriptions, _) = Subscriptions::new(0).unwrap();
         subscriptions.publish(7);
         let barrier = std::sync::Barrier::new(2);
 
@@ -179,7 +179,7 @@ fn concurrent_registration_captures_either_side_of_publication_atomically() {
 
 #[test]
 fn malformed_headers_never_reserve_capacity() {
-    let (subscriptions, _) = Subscriptions::new().unwrap();
+    let (subscriptions, _) = Subscriptions::new(0).unwrap();
 
     let cases = [
         ("SUBSCRIBE", vec![], StatusCode::PRECONDITION_FAILED),
@@ -262,7 +262,7 @@ fn malformed_headers_never_reserve_capacity() {
 
 #[test]
 fn subscription_capacity_is_bounded() {
-    let (subscriptions, _) = Subscriptions::new().unwrap();
+    let (subscriptions, _) = Subscriptions::new(0).unwrap();
 
     for _ in 0..SUBSCRIPTIONS {
         subscribe(&subscriptions, None);
@@ -285,7 +285,7 @@ fn subscription_capacity_is_bounded() {
 
 #[test]
 fn duplicate_event_headers_are_rejected_before_admission() {
-    let (subscriptions, _) = Subscriptions::new().unwrap();
+    let (subscriptions, _) = Subscriptions::new(0).unwrap();
     let sid = "uuid:00000000-0000-0000-0000-000000000001";
 
     for values in [
@@ -380,7 +380,7 @@ fn callback_authorities_are_literal_same_peer_and_entire_list_is_validated() {
 
 #[tokio::test(start_paused = true)]
 async fn renewal_and_unsubscribe_require_live_same_peer_same_service_sid() {
-    let (subscriptions, _) = Subscriptions::new().unwrap();
+    let (subscriptions, _) = Subscriptions::new(0).unwrap();
     subscriptions.publish(42);
     let (_, sid) = subscribe(&subscriptions, Some("Second-10"));
 
@@ -607,7 +607,7 @@ async fn finished(subscriptions: &Subscriptions, sid: Uuid) {
 
 #[tokio::test]
 async fn initial_event_is_immediately_eligible_and_renewal_does_not_replay() {
-    let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+    let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
     subscriptions.publish(17);
     let mut callback = Callback::new().await;
     let sid = callback.register(&subscriptions, SERVICE, &["/event?q=a%26b"]);
@@ -664,7 +664,7 @@ async fn initial_event_is_immediately_eligible_and_renewal_does_not_replay() {
 
 #[tokio::test]
 async fn pending_during_initial_coalesces_and_final_event_flushes_on_timer() {
-    let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+    let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
     subscriptions.publish(10);
     let mut callback = Callback::new().await;
     let sid = callback.register(&subscriptions, SERVICE, &["/gated"]);
@@ -769,7 +769,7 @@ async fn pending_during_initial_coalesces_and_final_event_flushes_on_timer() {
 
 #[tokio::test]
 async fn failed_attempts_allocate_sequence_once_wrap_and_preserve_future_pending() {
-    let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+    let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
     let mut callback = Callback::new().await;
     let sid = callback.register(&subscriptions, SERVICE, &["/gated-fail", "/fail"]);
     let task = tokio::spawn(scheduler.run());
@@ -823,7 +823,7 @@ async fn failed_attempts_allocate_sequence_once_wrap_and_preserve_future_pending
 
 #[tokio::test]
 async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
-    let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+    let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
     let mut callback = Callback::new().await;
     callback.release.add_permits(SUBSCRIPTIONS);
     let mut tokens = Vec::new();
@@ -918,7 +918,7 @@ async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
 #[tokio::test]
 async fn inactive_initial_obligations_remain_eligible_behind_bounded_deliveries() {
     for unsubscribe in [false, true] {
-        let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+        let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
         subscriptions.publish(17);
         let mut callback = Callback::new().await;
         let mut expected = std::collections::BTreeSet::new();
@@ -979,7 +979,7 @@ async fn inactive_initial_obligations_remain_eligible_behind_bounded_deliveries(
 async fn inactive_inflight_attempts_finish_but_drop_all_future_changes() {
     for initial in [false, true] {
         for unsubscribe in [false, true] {
-            let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+            let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
             let mut callback = Callback::new().await;
             let sid = callback.register(&subscriptions, SERVICE, &["/gated"]);
             let task = tokio::spawn(scheduler.run());
@@ -1035,7 +1035,7 @@ async fn inactive_inflight_attempts_finish_but_drop_all_future_changes() {
 
 #[tokio::test]
 async fn alternatives_keep_identical_seq_and_body_and_do_not_follow_redirects() {
-    let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+    let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
     let mut callback = Callback::new().await;
 
     let sid = callback.register(
@@ -1068,7 +1068,7 @@ async fn alternatives_keep_identical_seq_and_body_and_do_not_follow_redirects() 
 
 #[tokio::test]
 async fn oversized_bodies_fall_back_and_412_removes_without_trying_alternatives() {
-    let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+    let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
     let mut callback = Callback::new().await;
 
     let sid = callback.register(
@@ -1091,7 +1091,7 @@ async fn oversized_bodies_fall_back_and_412_removes_without_trying_alternatives(
 
 #[tokio::test]
 async fn inactive_initials_finish_and_active_failures_retain_the_lease() {
-    let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+    let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
     let mut callback = Callback::new().await;
     let inactive = callback.register(&subscriptions, SERVICE, &["/ok"]);
     let active = callback.register(&subscriptions, SERVICE, &["/fail"]);
@@ -1141,7 +1141,7 @@ async fn inactive_initials_finish_and_active_failures_retain_the_lease() {
 
 #[tokio::test]
 async fn delivery_concurrency_is_bounded() {
-    let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+    let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
     let mut callback = Callback::new().await;
 
     for _ in 0..SUBSCRIPTIONS {
@@ -1219,7 +1219,7 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
         (false, 200, limit + Duration::from_secs(1)),
         (true, 200, limit + Duration::from_secs(1)),
     ] {
-        let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+        let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let mut callback = Callback::new().await;
@@ -1370,7 +1370,7 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
 
 #[tokio::test]
 async fn callback_port_churn_closes_keep_alive_sockets_after_delivery() {
-    let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+    let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
     let task = tokio::spawn(scheduler.run());
     let mut listeners = Vec::new();
     let mut sockets = Vec::new();
@@ -1438,7 +1438,7 @@ async fn callback_port_churn_closes_keep_alive_sockets_after_delivery() {
 
 #[tokio::test]
 async fn expired_initial_obligations_drain_and_release_all_capacity() {
-    let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+    let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
     let mut callback = Callback::new().await;
     let mut expected = std::collections::BTreeMap::new();
 
@@ -1471,7 +1471,7 @@ async fn expired_initial_obligations_drain_and_release_all_capacity() {
 
 #[tokio::test(start_paused = true)]
 async fn scheduler_expires_idle_leases_without_requests() {
-    let (subscriptions, scheduler) = Subscriptions::new().unwrap();
+    let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
     let (_, sid) = subscribe(&subscriptions, None);
     subscriptions.state.lock().unwrap().entries[0].delivery = Delivery::Idle;
     let task = tokio::spawn(scheduler.run());

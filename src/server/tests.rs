@@ -66,7 +66,7 @@ fn server(catalog: TestCatalog) -> Server<TestCatalog> {
             activity.clone(),
         )
         .unwrap(),
-        Subscriptions::new().unwrap().0,
+        Subscriptions::new(0).unwrap().0,
         activity,
     )
 }
