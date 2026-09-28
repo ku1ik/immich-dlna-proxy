@@ -118,7 +118,7 @@ impl FakeServer {
     fn proxy(&self) -> MediaProxy {
         MediaProxy::new(
             self.base.as_str().parse().unwrap(),
-            HeaderValue::from_static("test-secret"),
+            "test-secret".parse().unwrap(),
             Activity::default(),
         )
         .unwrap()
@@ -163,7 +163,7 @@ fn proxy_for(listener: &TcpListener) -> MediaProxy {
         format!("http://{}/api/", listener.local_addr().unwrap())
             .parse()
             .unwrap(),
-        HeaderValue::from_static("test-secret"),
+        "test-secret".parse().unwrap(),
         Activity::default(),
     )
     .unwrap()
@@ -245,7 +245,7 @@ async fn fixed_routes_normalize_uuids_and_use_only_media_endpoints() {
 async fn forwards_only_conditionals_and_single_range_with_sensitive_key() {
     let mut server = FakeServer::new(vec![Reply::new(JPEG)]).await;
     let proxy = server.proxy();
-    assert!(proxy.api_key.is_sensitive());
+    assert!(proxy.api_key.as_header().is_sensitive());
 
     let input = headers(&[
         ("range", "bytes=2147483648-4294967296"),

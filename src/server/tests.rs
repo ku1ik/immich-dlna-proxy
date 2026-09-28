@@ -62,7 +62,7 @@ fn server(catalog: TestCatalog) -> Server<TestCatalog> {
         catalog,
         MediaProxy::new(
             "http://127.0.0.1:9/api/".parse().unwrap(),
-            HeaderValue::from_static("test-key"),
+            "test-key".parse().unwrap(),
             activity.clone(),
         )
         .unwrap(),

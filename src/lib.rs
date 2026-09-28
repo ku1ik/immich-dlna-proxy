@@ -124,7 +124,6 @@ pub(crate) fn server_header() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use http::HeaderValue;
     use uuid::Uuid;
 
     use super::*;
@@ -140,7 +139,7 @@ mod tests {
 
         let config = Config {
             api_base: "http://127.0.0.1:9/api/".parse().unwrap(),
-            api_key: HeaderValue::from_static("test-key"),
+            api_key: "test-key".parse().unwrap(),
             listen_address: address,
             friendly_name: "Test".into(),
             collator: crate::config::collator("en").unwrap(),

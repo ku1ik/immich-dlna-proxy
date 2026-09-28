@@ -113,7 +113,7 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
 
         let media = MediaProxy::new(
             format!("http://{upstream_address}/api/").parse().unwrap(),
-            HeaderValue::from_static("api-key-secret"),
+            "api-key-secret".parse().unwrap(),
             activity.clone(),
         )
         .unwrap();
@@ -177,7 +177,7 @@ async fn control_and_media_diagnostics_are_bounded_and_exclude_secrets() {
 
         let media = MediaProxy::new(
             format!("http://{overrun_address}/api/").parse().unwrap(),
-            HeaderValue::from_static("api-key-secret"),
+            "api-key-secret".parse().unwrap(),
             immich_dlna_proxy::Activity::default(),
         )
         .unwrap();

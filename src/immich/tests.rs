@@ -130,7 +130,7 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
         assert_eq!(request.headers[header::ACCEPT_ENCODING], "identity");
     }
 
-    assert!(client.api_key.is_sensitive());
+    assert!(client.api_key.as_header().is_sensitive());
 }
 
 #[test]
@@ -453,7 +453,7 @@ fn client_for(listener: &TcpListener) -> Client {
         format!("http://{}/api/", listener.local_addr().unwrap())
             .parse()
             .unwrap(),
-        HeaderValue::from_static("private-test-key"),
+        "private-test-key".parse().unwrap(),
     )
     .unwrap()
 }

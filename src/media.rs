@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     activity::{Activity, MediaActivity},
-    config::ApiBase,
+    config::{ApiBase, ApiKey},
 };
 
 const OPERATIONS: usize = 16;
@@ -81,7 +81,7 @@ pub fn asset_url(address: SocketAddrV4, asset: Uuid, representation: Representat
 pub struct MediaProxy {
     client: reqwest::Client,
     api_base: ApiBase,
-    api_key: HeaderValue,
+    api_key: ApiKey,
     operations: Arc<Semaphore>,
     activity: Activity,
 }
@@ -140,13 +140,7 @@ impl ByteRange {
 }
 
 impl MediaProxy {
-    pub fn new(
-        api_base: ApiBase,
-        mut api_key: HeaderValue,
-        activity: Activity,
-    ) -> anyhow::Result<Self> {
-        api_key.set_sensitive(true);
-
+    pub fn new(api_base: ApiBase, api_key: ApiKey, activity: Activity) -> anyhow::Result<Self> {
         let client = crate::outbound_client_builder().build()?;
 
         Ok(Self {
@@ -412,7 +406,7 @@ impl MediaProxy {
             HeaderValue::from_static("identity"),
         );
 
-        forwarded.insert("x-api-key", self.api_key.clone());
+        forwarded.insert("x-api-key", self.api_key.as_header().clone());
 
         let mut url = self
             .api_base

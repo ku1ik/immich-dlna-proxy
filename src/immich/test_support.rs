@@ -6,7 +6,6 @@ use axum::{
     http::{HeaderMap, Method, Request},
     response::Response,
 };
-use http::HeaderValue;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
 use uuid::Uuid;
@@ -74,11 +73,7 @@ impl Fake {
     }
 
     pub(crate) fn new_client(&self) -> Client {
-        Client::new(
-            self.api_base.clone(),
-            HeaderValue::from_static("private-test-key"),
-        )
-        .unwrap()
+        Client::new(self.api_base.clone(), "private-test-key".parse().unwrap()).unwrap()
     }
 }
 

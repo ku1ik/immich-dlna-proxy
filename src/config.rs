@@ -66,7 +66,7 @@ where
 // Intentionally no Debug: configuration owns the upstream credential.
 pub struct Config {
     pub(crate) api_base: ApiBase,
-    pub(crate) api_key: HeaderValue,
+    pub(crate) api_key: ApiKey,
     pub(crate) listen_address: SocketAddrV4,
     pub(crate) friendly_name: String,
     pub(crate) collator: CollatorBorrowed<'static>,
@@ -191,7 +191,43 @@ pub fn is_non_loopback_unicast(address: Ipv4Addr) -> bool {
     !matches!(address.octets()[0], 0 | 127 | 224..=255)
 }
 
-fn read_key(path: &Path) -> anyhow::Result<HeaderValue> {
+/// A validated, sensitive upstream credential.
+#[derive(Clone)]
+pub struct ApiKey(HeaderValue);
+
+impl ApiKey {
+    fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        ensure!(bytes.len() <= KEY_BYTES as usize, "API key exceeds 8 KiB");
+
+        ensure!(
+            !bytes.is_empty()
+                && !bytes.iter().any(|b| b.is_ascii_control())
+                && !std::str::from_utf8(bytes).is_ok_and(|text| text.chars().any(char::is_control)),
+            "API key must be nonempty without embedded control characters"
+        );
+
+        let mut value =
+            HeaderValue::from_bytes(bytes).context("API key is not a valid HTTP header value")?;
+
+        value.set_sensitive(true);
+
+        Ok(Self(value))
+    }
+
+    pub(crate) fn as_header(&self) -> &HeaderValue {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for ApiKey {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        Self::from_bytes(value.as_bytes())
+    }
+}
+
+fn read_key(path: &Path) -> anyhow::Result<ApiKey> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
@@ -220,19 +256,7 @@ fn read_key(path: &Path) -> anyhow::Result<HeaderValue> {
         bytes.pop();
     }
 
-    ensure!(
-        !bytes.is_empty()
-            && !bytes.iter().any(|b| b.is_ascii_control())
-            && !std::str::from_utf8(&bytes).is_ok_and(|text| text.chars().any(char::is_control)),
-        "API key must be nonempty without embedded control characters"
-    );
-
-    let mut value =
-        HeaderValue::from_bytes(&bytes).context("API key is not a valid HTTP header value")?;
-
-    value.set_sensitive(true);
-
-    Ok(value)
+    ApiKey::from_bytes(&bytes)
 }
 
 pub fn resolve_interface(address: Ipv4Addr) -> anyhow::Result<u32> {
@@ -455,6 +479,7 @@ server_uuid = "7B37DF49-B75D-4BCB-89A6-0C917A934643"
         let path = directory.path().join("key");
         fs::write(&path, b" secret \r\n").unwrap();
         let value = read_key(&path).unwrap();
+        let value = value.as_header();
         assert_eq!(value.as_bytes(), b" secret ");
         assert!(value.is_sensitive());
         assert!(!format!("{value:?}").contains("secret"));
@@ -477,6 +502,33 @@ server_uuid = "7B37DF49-B75D-4BCB-89A6-0C917A934643"
         assert!(read_key(&path).is_err());
         assert!(read_key(&directory.path().join("absent")).is_err());
         assert!(read_key(directory.path()).is_err());
+    }
+
+    #[test]
+    fn directly_parsed_keys_validate_and_keep_clones_sensitive() {
+        let key: ApiKey = " secret ".parse().unwrap();
+        let cloned = key.clone();
+        assert_eq!(cloned.as_header().as_bytes(), b" secret ");
+        assert!(cloned.as_header().is_sensitive());
+        assert!(!format!("{:?}", cloned.as_header()).contains("secret"));
+
+        for value in [
+            "",
+            "bad\nkey",
+            "bad\tkey",
+            "bad\u{7f}key",
+            "bad\u{85}key",
+            "secret\r\n",
+        ] {
+            assert!(value.parse::<ApiKey>().is_err());
+        }
+
+        assert!("x".repeat(KEY_BYTES as usize).parse::<ApiKey>().is_ok());
+        assert!(
+            "x".repeat(KEY_BYTES as usize + 1)
+                .parse::<ApiKey>()
+                .is_err()
+        );
     }
 
     #[test]

@@ -8,12 +8,12 @@ mod tests;
 use std::{num::NonZeroUsize, time::Duration};
 
 use anyhow::{Result, anyhow, ensure};
-use http::{HeaderValue, header};
+use http::header;
 use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned, ser::SerializeMap};
 use tokio::{sync::OnceCell, time::timeout};
 use uuid::Uuid;
 
-use crate::config::ApiBase;
+use crate::config::{ApiBase, ApiKey};
 
 pub(crate) const SEARCH_PAGE_SIZE: usize = 1_000;
 const JSON_BYTES: usize = 16 * 1024 * 1024;
@@ -22,7 +22,7 @@ const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) struct Client {
     client: reqwest::Client,
     api_base: ApiBase,
-    api_key: HeaderValue,
+    api_key: ApiKey,
     version_checked: OnceCell<()>,
 }
 
@@ -174,9 +174,7 @@ impl Serialize for SearchMode {
 }
 
 impl Client {
-    pub(crate) fn new(api_base: ApiBase, mut api_key: HeaderValue) -> Result<Self> {
-        api_key.set_sensitive(true);
-
+    pub(crate) fn new(api_base: ApiBase, api_key: ApiKey) -> Result<Self> {
         let client = crate::outbound_client_builder()
             .build()
             .map_err(|_| anyhow!("cannot initialize Immich HTTP client"))?;
@@ -191,7 +189,7 @@ impl Client {
 
     async fn json<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T> {
         let request = request
-            .header("x-api-key", self.api_key.clone())
+            .header("x-api-key", self.api_key.as_header().clone())
             .header(header::ACCEPT, "application/json")
             .header(header::ACCEPT_ENCODING, "identity");
 

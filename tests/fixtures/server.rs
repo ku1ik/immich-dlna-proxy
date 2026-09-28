@@ -283,7 +283,7 @@ impl Bound {
 
         let media = MediaProxy::new(
             format!("http://{}/api/", upstream.local_addr()?).parse()?,
-            HeaderValue::from_static(API_KEY),
+            API_KEY.parse().unwrap(),
             activity.clone(),
         )?;
 

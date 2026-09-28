@@ -5,7 +5,7 @@ use axum::{
     extract::Request,
     response::Response,
 };
-use http::{HeaderValue, Method};
+use http::Method;
 use serde_json::{Value, json};
 use std::{net::SocketAddr, sync::Mutex};
 use tokio::{
@@ -211,7 +211,7 @@ impl Drop for Fake {
 fn config(address: SocketAddr) -> Config {
     Config {
         api_base: format!("http://{address}/api/").parse().unwrap(),
-        api_key: HeaderValue::from_static("fake-key"),
+        api_key: "fake-key".parse().unwrap(),
         listen_address: "192.0.2.1:8200".parse().unwrap(),
         friendly_name: "Photos & videos".into(),
         collator: crate::config::collator("pl").unwrap(),
