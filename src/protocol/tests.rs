@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use quick_xml::NsReader;
+use quick_xml::{NsReader, events::Event, name::ResolveResult};
 
 use super::*;
 use crate::catalog::{ObjectKind, Resource};
@@ -264,7 +264,6 @@ fn soap_namespace_rejects_reserved_aliases_after_decoding() {
         "xmlns:xml=\"urn:wrong&#49;\"",
         "xmlns:xml=\"http://www.w3.org/2000/xmlns&#47;\"",
         "xmlns:xmlns=\"http://www.w3.org/2000/xmlns&#47;\"",
-        "xmlns:xmlns=\"urn:wrong&#49;\"",
     ] {
         let xml = base.replace("<s:Body>", &format!("<s:Body {declaration}>"));
 
@@ -407,13 +406,11 @@ fn soap_rejects_namespace_spoofing_and_action_ambiguity() {
 }
 
 #[test]
-fn soap_rejects_dtd_entities_bad_characters_attributes_and_declarations() {
+fn soap_rejects_entities_bad_characters_attributes_and_malformed_xml() {
     for text in [
         "&custom;",
         "&#0;",
         "&#xFFFF;",
-        "&#xD800;",
-        "&#x110000;",
         "&#;",
         "&amp",
         "raw & text",
@@ -431,19 +428,19 @@ fn soap_rejects_dtd_entities_bad_characters_attributes_and_declarations() {
     let valid = request("GetSortCapabilities", "");
 
     for xml in [
+        format!("<!DOCTYPE s:Envelope>{valid}"),
+        format!("<!DOCTYPE s:Envelope []>{valid}"),
+        format!("<!DOCTYPE s:Envelope SYSTEM 'file:///unavailable-soap-dtd'>{valid}"),
+        format!("<!DOCTYPE s:Envelope SYSTEM 'http://127.0.0.1:1/unavailable-soap-dtd'>{valid}"),
         format!("<!DOCTYPE s:Envelope [<!ENTITY custom 'expanded'>]>{valid}"),
-        format!("<!DOCTYPE s:Envelope SYSTEM 'file:///etc/passwd'>{valid}"),
         valid.replace("<s:Body>", "<s:Body xmlns:x=\"&custom;\">"),
         valid.replace("<s:Body>", "<s:Body xmlns:x=\"x\" xmlns:x=\"y\">"),
         valid.replace("<s:Body>", "<s:Body xmlns:x=\"<bad\">"),
         valid.replace("<s:Body>", "<s:Body x:a=\"value\">"),
         valid.replace("<s:Body>", &format!("<s:Body xmlns:x=\"{SOAP}\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\" x:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">")),
         valid.replace("<s:Body>", "<s:Body><!-- bad -- comment -->"),
-        format!("<?xml version='1.1'?>{valid}"),
-        format!("<?xml version='1.0' encoding='ISO-8859-1'?>{valid}"),
         format!("<?xml version='1.0' version='1.0'?>{valid}"),
         format!("<?xml version='1.0' nonsense='yes'?>{valid}"),
-        format!("<?xml version='1.0' standalone='maybe'?>{valid}"),
         format!("<?xml version='1.0' standalone='yes' encoding='utf-8'?>{valid}"),
         format!(" <?xml version='1.0'?>{valid}"),
         format!("<!--prolog--><?xml version='1.0'?>{valid}"),
@@ -465,6 +462,99 @@ fn soap_rejects_nested_argument_elements() {
 
         assert_eq!(browse(&args), Err(Fault::InvalidArgs), "{nested}");
     }
+}
+
+#[test]
+fn soap_tree_parser_accepts_inert_markup_and_parser_defined_declarations() {
+    let valid = request("GetSortCapabilities", "");
+
+    for prefix in [
+        "<?instruction data?>",
+        "<?xml version='1.1'?>",
+        "<?xml version='1.0' encoding='ISO-8859-1'?>",
+        "<?xml version='1.0' standalone='maybe'?>",
+    ] {
+        assert!(
+            parse(&format!("{prefix}{valid}"), "GetSortCapabilities").is_ok(),
+            "{prefix}"
+        );
+    }
+
+    for text in ["<!DOCTYPE x>", "&#xD800;", "<?xml version='1.1'?>"] {
+        assert!(parse(&format!("<!--{text}-->{valid}"), "GetSortCapabilities").is_ok());
+
+        let args = BROWSE_ARGS.replace(
+            "<ObjectID>0</ObjectID>",
+            &format!("<ObjectID><![CDATA[{text}]]></ObjectID>"),
+        );
+        let Action::Browse { query, .. } = browse(&args).unwrap() else {
+            panic!("expected Browse");
+        };
+
+        assert_eq!(query.object_id, text);
+    }
+
+    // Structural whitespace has the same meaning regardless of its XML spelling.
+    let xml = valid.replace("<s:Body>", "<s:Body>&#32;<![CDATA[\t]]>");
+    assert!(parse(&xml, "GetSortCapabilities").is_ok());
+
+    let xml = valid.replace(
+        "<s:Body>",
+        "<s:Body xmlns:xmlns='urn:unused'><?ignored value?>",
+    );
+    assert!(parse(&xml, "GetSortCapabilities").is_ok());
+}
+
+#[test]
+fn soap_parser_replacement_characters_and_processing_instructions_preserve_argument_validation() {
+    for text in ["&#xD800;", "&#x110000;"] {
+        let args = BROWSE_ARGS.replace(
+            "<ObjectID>0</ObjectID>",
+            &format!("<ObjectID>{text}<?ignored value?></ObjectID>"),
+        );
+        let Action::Browse { query, .. } = browse(&args).unwrap() else {
+            panic!("expected Browse");
+        };
+
+        assert_eq!(query.object_id, "\u{fffd}");
+        let args = BROWSE_ARGS.replace(
+            "<StartingIndex>0</StartingIndex>",
+            &format!("<StartingIndex>{text}</StartingIndex>"),
+        );
+        assert_eq!(browse(&args), Err(Fault::InvalidArgs));
+    }
+}
+
+#[test]
+fn soap_tree_parser_handles_body_sized_deep_and_wide_input() {
+    for content in [
+        format!("{}{}", "<x>".repeat(8000), "</x>".repeat(8000)),
+        "<x/>".repeat(16000),
+    ] {
+        let xml = request("GetSortCapabilities", &content);
+        assert!(xml.len() < 64 * 1024);
+        assert_eq!(parse(&xml, "GetSortCapabilities"), Err(Fault::InvalidArgs));
+    }
+}
+
+#[test]
+fn soap_node_budget_counts_ignored_markup_and_keeps_large_text_usable() {
+    // Document root, Envelope, Body, and action occupy four of the 64 nodes.
+    for (comments, accepted) in [(60, true), (61, false)] {
+        let xml = request("GetSortCapabilities", &"<!--ignored-->".repeat(comments));
+        assert_eq!(parse(&xml, "GetSortCapabilities").is_ok(), accepted);
+    }
+
+    let text = "x".repeat(60 * 1024);
+    let args = BROWSE_ARGS.replace(
+        "<ObjectID>0</ObjectID>",
+        &format!("<ObjectID>{text}</ObjectID>"),
+    );
+    let Action::Browse { query, .. } = browse(&args).unwrap() else {
+        panic!("expected Browse");
+    };
+
+    assert_eq!(query.object_id, text);
 }
 
 #[test]
