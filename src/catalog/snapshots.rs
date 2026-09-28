@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::{Digest, MAX_ALBUMS, Object, ObjectKind, Resource, SNAPSHOT_BYTES};
 use crate::{
-    immich::{Asset, Client, SearchMode},
+    immich::{Asset, AssetKind, Client, SearchMode, Visibility},
     media::{Representation, asset_url},
     protocol::xml_char,
 };
@@ -360,7 +360,7 @@ fn project_item(
     dto: Asset,
     bad_dates: &mut usize,
 ) -> Result<Option<Item>> {
-    if !matches!(dto.visibility.as_str(), "timeline" | "archive") || dto.is_trashed {
+    if !matches!(dto.visibility, Visibility::Timeline | Visibility::Archive) || dto.is_trashed {
         return Ok(None);
     }
 
@@ -370,8 +370,8 @@ fn project_item(
         .and_then(crate::mime::parse)
         .map(str::to_ascii_lowercase);
 
-    let kind = match dto.kind.as_str() {
-        "IMAGE" => {
+    let kind = match dto.kind {
+        AssetKind::Image => {
             let (representation, mime) = match mime {
                 Some(mime)
                     if !dto.is_edited
@@ -403,7 +403,7 @@ fn project_item(
             }
         }
 
-        "VIDEO" => {
+        AssetKind::Video => {
             let duration = dto.duration.filter(|ms| *ms >= 0).map(|ms| {
                 format!(
                     "{}:{:02}:{:02}.{:03}",
@@ -426,7 +426,7 @@ fn project_item(
             }
         }
 
-        _ => return Ok(None),
+        AssetKind::Other => return Ok(None),
     };
 
     let name = dto

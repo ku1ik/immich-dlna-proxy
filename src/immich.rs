@@ -43,8 +43,8 @@ pub(crate) struct Album {
 pub(crate) struct Asset {
     pub(crate) id: Uuid,
     #[serde(rename = "type")]
-    pub(crate) kind: String,
-    pub(crate) visibility: String,
+    pub(crate) kind: AssetKind,
+    pub(crate) visibility: Visibility,
     pub(crate) is_trashed: bool,
     pub(crate) is_edited: bool,
     pub(crate) original_file_name: Option<String>,
@@ -58,6 +58,42 @@ pub(crate) struct Asset {
     pub(crate) checksum: Option<String>,
     pub(crate) updated_at: Option<String>,
     pub(crate) thumbhash: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(from = "String")]
+pub(crate) enum AssetKind {
+    Image,
+    Video,
+    Other,
+}
+
+impl From<String> for AssetKind {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "IMAGE" => Self::Image,
+            "VIDEO" => Self::Video,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(from = "String")]
+pub(crate) enum Visibility {
+    Timeline,
+    Archive,
+    Other,
+}
+
+impl From<String> for Visibility {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "timeline" => Self::Timeline,
+            "archive" => Self::Archive,
+            _ => Self::Other,
+        }
+    }
 }
 
 #[derive(Debug)]

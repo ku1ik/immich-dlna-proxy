@@ -7,6 +7,45 @@ use tokio::{net::TcpListener, time::Instant};
 
 const ALBUM: Uuid = Uuid::from_u128(100_000);
 
+#[test]
+fn asset_categories_accept_unknown_strings_but_reject_non_strings() {
+    for (value, expected) in [
+        ("IMAGE", AssetKind::Image),
+        ("VIDEO", AssetKind::Video),
+        ("FUTURE_TYPE", AssetKind::Other),
+        ("image", AssetKind::Other),
+    ] {
+        let dto: Asset = serde_json::from_value(asset(1, value)).unwrap();
+        assert_eq!(dto.kind, expected);
+    }
+
+    for (value, expected) in [
+        ("timeline", Visibility::Timeline),
+        ("archive", Visibility::Archive),
+        ("future-visibility", Visibility::Other),
+        ("TIMELINE", Visibility::Other),
+    ] {
+        let mut raw = asset(1, "IMAGE");
+        raw["visibility"] = json!(value);
+        let dto: Asset = serde_json::from_value(raw).unwrap();
+        assert_eq!(dto.visibility, expected);
+    }
+
+    for (field, tag) in [("type", "IMAGE"), ("visibility", "timeline")] {
+        for value in [
+            Value::Null,
+            json!(true),
+            json!(1),
+            json!([]),
+            json!({tag: null}),
+        ] {
+            let mut raw = asset(1, "IMAGE");
+            raw[field] = value;
+            assert!(serde_json::from_value::<Asset>(raw).is_err(), "{field}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
     let mut raw_album = album(ALBUM);
@@ -40,8 +79,8 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
 
     assert_eq!(result.next_page, NonZeroUsize::new(2));
     assert_eq!(result.items.len(), 2);
-    assert_eq!(result.items[0].kind, "FUTURE_TYPE");
-    assert_eq!(result.items[0].visibility, "future-visibility");
+    assert_eq!(result.items[0].kind, AssetKind::Other);
+    assert_eq!(result.items[0].visibility, Visibility::Other);
     assert!(result.items[0].is_trashed);
     assert!(result.items[0].original_file_name.is_none());
 
