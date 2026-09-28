@@ -101,7 +101,7 @@ async fn leases_are_bounded_and_responses_are_framed() {
         assert_eq!(state.entries.len(), 1);
 
         assert_eq!(
-            state.entries[0].expires,
+            state.entries[0].lease.as_ref().map(|lease| lease.expires),
             Some(Instant::now() + Duration::from_secs(expected))
         );
 
@@ -132,9 +132,9 @@ fn publication_and_registration_share_capture_without_old_replay() {
             .find(|entry| entry.sid == second)
             .unwrap();
         assert_eq!(first.delivery, Delivery::Initial(17));
-        assert_eq!(first.pending, Some(u32::MAX));
+        assert_eq!(first.lease.as_ref().unwrap().pending, Some(u32::MAX));
         assert_eq!(second.delivery, Delivery::Initial(u32::MAX));
-        assert_eq!(second.pending, None);
+        assert_eq!(second.lease.as_ref().unwrap().pending, None);
     }
 
     subscriptions.publish(0);
@@ -143,7 +143,10 @@ fn publication_and_registration_share_capture_without_old_replay() {
     assert_eq!(state.system_update_id, 0);
 
     for entry in &state.entries {
-        assert_eq!(entry.pending, (entry.sid != third).then_some(0));
+        assert_eq!(
+            entry.lease.as_ref().unwrap().pending,
+            (entry.sid != third).then_some(0)
+        );
     }
 }
 
@@ -170,7 +173,7 @@ fn concurrent_registration_captures_either_side_of_publication_atomically() {
             let entry = &state.entries[0];
 
             assert!(matches!(
-                (entry.delivery, entry.pending),
+                (entry.delivery, entry.lease.as_ref().unwrap().pending),
                 (Delivery::Initial(7), Some(8)) | (Delivery::Initial(8), None)
             ));
         }
@@ -419,7 +422,7 @@ async fn renewal_and_unsubscribe_require_live_same_peer_same_service_sid() {
         assert_eq!(state.entries[0].delivery, Delivery::Initial(42));
 
         assert_eq!(
-            state.entries[0].expires,
+            state.entries[0].lease.as_ref().map(|lease| lease.expires),
             Some(Instant::now() + Duration::from_secs(20))
         );
     }
@@ -686,6 +689,9 @@ async fn pending_during_initial_coalesces_and_final_event_flushes_on_timer() {
             .iter()
             .find(|entry| entry.sid == sid)
             .unwrap()
+            .lease
+            .as_ref()
+            .unwrap()
             .pending,
         Some(12)
     );
@@ -697,9 +703,9 @@ async fn pending_during_initial_coalesces_and_final_event_flushes_on_timer() {
         let state = subscriptions.state.lock().unwrap();
         let entry = state.entries.iter().find(|entry| entry.sid == sid).unwrap();
         let cm = state.entries.iter().find(|entry| entry.sid == cm).unwrap();
-        assert_eq!(entry.pending, Some(14));
+        assert_eq!(entry.lease.as_ref().unwrap().pending, Some(14));
         assert_eq!(entry.delivery, Delivery::InFlight);
-        assert_eq!(cm.pending, None);
+        assert_eq!(cm.lease.as_ref().unwrap().pending, None);
     }
 
     tokio::time::pause();
@@ -743,9 +749,9 @@ async fn pending_during_initial_coalesces_and_final_event_flushes_on_timer() {
         let state = subscriptions.state.lock().unwrap();
         let entry = state.entries.iter().find(|entry| entry.sid == sid).unwrap();
         let cm = state.entries.iter().find(|entry| entry.sid == cm).unwrap();
-        assert_eq!(entry.pending, None);
+        assert_eq!(entry.lease.as_ref().unwrap().pending, None);
         assert_eq!(entry.next_seq, 3);
-        assert_eq!(cm.pending, None);
+        assert_eq!(cm.lease.as_ref().unwrap().pending, None);
         assert_eq!(cm.next_seq, 1);
     }
 
@@ -782,8 +788,8 @@ async fn failed_attempts_allocate_sequence_once_wrap_and_preserve_future_pending
         {
             let mut state = subscriptions.state.lock().unwrap();
             let entry = &mut state.entries[0];
-            assert!(entry.expires.is_some());
-            assert_eq!(entry.pending, future);
+            assert!(entry.lease.is_some());
+            assert_eq!(entry.lease.as_ref().unwrap().pending, future);
             assert_eq!(entry.next_seq, next_seq);
 
             if seq == 0 {
@@ -868,7 +874,12 @@ async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
             DELIVERIES
         );
 
-        assert!(state.entries.iter().all(|entry| entry.pending == Some(2)));
+        assert!(
+            state
+                .entries
+                .iter()
+                .all(|entry| entry.lease.as_ref().unwrap().pending == Some(2))
+        );
     }
 
     // Every subscriber gets the coalesced change, without a global FIFO contract.
@@ -947,7 +958,7 @@ async fn inactive_initial_obligations_remain_eligible_behind_bounded_deliveries(
                 .find(|entry| entry.sid == target)
                 .unwrap();
 
-            entry.expires = Some(Instant::now());
+            entry.lease.as_mut().unwrap().expires = Instant::now();
             state.expire(Instant::now());
         }
 
@@ -997,7 +1008,11 @@ async fn inactive_inflight_attempts_finish_but_drop_all_future_changes() {
                     StatusCode::OK
                 );
             } else {
-                subscriptions.state.lock().unwrap().entries[0].expires = Some(Instant::now());
+                subscriptions.state.lock().unwrap().entries[0]
+                    .lease
+                    .as_mut()
+                    .unwrap()
+                    .expires = Instant::now();
             }
 
             subscriptions.publish(3);
@@ -1005,9 +1020,8 @@ async fn inactive_inflight_attempts_finish_but_drop_all_future_changes() {
             {
                 let state = subscriptions.state.lock().unwrap();
                 let entry = &state.entries[0];
-                assert!(entry.expires.is_none());
+                assert!(entry.lease.is_none());
                 assert_eq!(entry.delivery, Delivery::InFlight);
-                assert_eq!(entry.pending, None);
             }
 
             callback.release.add_permits(1);
@@ -1045,7 +1059,7 @@ async fn alternatives_keep_identical_seq_and_body_and_do_not_follow_redirects() 
 
     assert!(
         subscriptions.state.lock().unwrap().entries[0]
-            .expires
+            .lease
             .is_some()
     );
 
@@ -1105,7 +1119,7 @@ async fn inactive_initials_finish_and_active_failures_retain_the_lease() {
         let state = subscriptions.state.lock().unwrap();
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.entries[0].sid, active);
-        assert!(state.entries[0].expires.is_some());
+        assert!(state.entries[0].lease.is_some());
     }
 
     assert_eq!(
@@ -1290,7 +1304,7 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
                 .unwrap()
                 .entries
                 .first()
-                .map(|entry| (entry.expires.is_some(), entry.delivery, entry.next_seq));
+                .map(|entry| (entry.lease.is_some(), entry.delivery, entry.next_seq));
 
             let delivery = if expired {
                 Delivery::InFlight
@@ -1344,10 +1358,10 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
 
             let state = subscriptions.state.lock().unwrap();
             let entry = &state.entries[0];
-            assert!(entry.expires.is_some());
+            assert!(entry.lease.is_some());
             assert_eq!(entry.delivery, Delivery::Idle);
             assert_eq!(entry.next_seq, seq + 1);
-            assert_eq!(entry.pending, None);
+            assert_eq!(entry.lease.as_ref().unwrap().pending, None);
         }
     }
 

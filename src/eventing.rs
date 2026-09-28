@@ -48,12 +48,16 @@ struct Subscription {
     service: Service,
     peer: Ipv4Addr,
     callbacks: Vec<Url>,
-    lease: Duration,
-    expires: Option<Instant>,
+    lease: Option<LiveLease>,
     delivery: Delivery,
-    pending: Option<u32>,
     next_seq: u32,
     next_attempt: Instant,
+}
+
+struct LiveLease {
+    duration: Duration,
+    expires: Instant,
+    pending: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,8 +77,8 @@ impl Subscription {
     fn next_delivery(&self) -> Option<(Instant, u32)> {
         let id = match self.delivery {
             Delivery::Initial(id) => id,
-            Delivery::Idle if self.expires.is_some() => self.pending?,
-            Delivery::Idle | Delivery::InFlight => return None,
+            Delivery::Idle => self.lease.as_ref()?.pending?,
+            Delivery::InFlight => return None,
         };
 
         // The initial obligation survives lease expiry. Its next_attempt is the
@@ -86,15 +90,15 @@ impl Subscription {
 impl State {
     fn expire(&mut self, now: Instant) {
         self.entries.retain_mut(|entry| {
-            if entry.expires.is_some_and(|expires| expires <= now) {
-                entry.expires = None;
+            if entry
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.expires <= now)
+            {
+                entry.lease = None;
             }
 
-            if entry.expires.is_none() {
-                entry.pending = None;
-            }
-
-            entry.expires.is_some() || entry.delivery != Delivery::Idle
+            entry.lease.is_some() || entry.delivery != Delivery::Idle
         });
     }
 }
@@ -137,8 +141,10 @@ impl Subscriptions {
         state.expire(Instant::now());
 
         for entry in &mut state.entries {
-            if entry.expires.is_some() && entry.service == Service::ContentDirectory {
-                entry.pending = Some(id);
+            if entry.service == Service::ContentDirectory
+                && let Some(lease) = &mut entry.lease
+            {
+                lease.pending = Some(id);
             }
         }
 
@@ -238,18 +244,20 @@ impl Subscriptions {
                     entry.sid == sid
                         && entry.service == service
                         && entry.peer == peer
-                        && entry.expires.is_some()
+                        && entry.lease.is_some()
                 })
                 .ok_or(StatusCode::PRECONDITION_FAILED)?;
 
-            if method.as_str() == "UNSUBSCRIBE" {
-                entry.expires = None;
+            let granted = if method.as_str() == "UNSUBSCRIBE" {
+                entry.lease.take().unwrap().duration
             } else {
-                entry.lease = lease;
-                entry.expires = Some(now + lease);
-            }
+                let live = entry.lease.as_mut().unwrap();
+                live.duration = lease;
+                live.expires = now + lease;
 
-            let granted = entry.lease;
+                lease
+            };
+
             state.expire(now);
 
             return Ok((sid, granted));
@@ -290,10 +298,12 @@ impl Subscriptions {
             service,
             peer,
             callbacks,
-            lease,
-            expires: Some(now + lease),
+            lease: Some(LiveLease {
+                duration: lease,
+                expires: now + lease,
+                pending: None,
+            }),
             delivery,
-            pending: None,
             next_seq: 0,
             next_attempt: now,
         });
@@ -330,8 +340,10 @@ impl EventTask {
 
                     let mut entry = state.entries.remove(index);
 
-                    if entry.delivery == Delivery::Idle {
-                        entry.pending = None;
+                    if entry.delivery == Delivery::Idle
+                        && let Some(lease) = &mut entry.lease
+                    {
+                        lease.pending = None;
                     }
 
                     // Allocate once at preparation, including failures and the initial attempt.
@@ -363,7 +375,12 @@ impl EventTask {
                             None
                         };
 
-                        entry.expires.into_iter().chain(delivery)
+                        entry
+                            .lease
+                            .as_ref()
+                            .map(|lease| lease.expires)
+                            .into_iter()
+                            .chain(delivery)
                     })
                     .min()
             };
@@ -390,7 +407,7 @@ impl EventTask {
                     entry.delivery = Delivery::Idle;
 
                     if outcome == DeliveryOutcome::RemoveSubscription {
-                        entry.expires = None;
+                        entry.lease = None;
                     }
 
                     state.expire(Instant::now());
