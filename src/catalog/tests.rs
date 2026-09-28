@@ -345,7 +345,7 @@ impl Library {
                 query,
                 deadline,
                 reply,
-                waiting: false,
+                depends_on_active_refresh: false,
             }))
             .unwrap_or_else(|_| panic!("catalog unavailable"));
 

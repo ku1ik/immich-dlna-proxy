@@ -191,7 +191,8 @@ struct Pending {
     query: BrowseQuery,
     deadline: Instant,
     reply: oneshot::Sender<Result<View, Fault>>,
-    waiting: bool,
+    // Latched until this attempt completes, even if root freshness changes meanwhile.
+    depends_on_active_refresh: bool,
 }
 
 struct Refresh {
@@ -425,7 +426,7 @@ impl ImmichCatalog {
                 query,
                 deadline,
                 reply,
-                waiting: false,
+                depends_on_active_refresh: false,
             }))
             .map_err(|_| FAILED)?;
 
@@ -444,19 +445,22 @@ impl CatalogTask {
             let now = Instant::now();
             let activity = *self.activity.borrow_and_update();
             self.background.update(activity, &self.state.cache, now);
-            let needed = self.resolve(active.as_ref().map(|refresh| refresh.scope));
+            self.settle_pending(active.as_ref().map(|refresh| refresh.scope));
 
             if active.is_none() {
-                let next = needed.map(|scope| (scope, false)).or_else(|| {
-                    self.background
-                        .next(&self.state.cache, now)
-                        .map(|scope| (scope, true))
-                });
+                let next = self
+                    .next_refresh_scope()
+                    .map(|scope| (scope, false))
+                    .or_else(|| {
+                        self.background
+                            .next(&self.state.cache, now)
+                            .map(|scope| (scope, true))
+                    });
 
                 if let Some((scope, background)) = next {
                     active = Some(self.start(scope, background));
 
-                    self.resolve(Some(scope));
+                    self.settle_pending(Some(scope));
                 }
             }
 
@@ -481,7 +485,7 @@ impl CatalogTask {
                         Command::Browse(request) => {
                             // Ready views need no waiting slot. Prune cancellations too.
                             self.pending.push(request);
-                            self.resolve(active.as_ref().map(|refresh| refresh.scope));
+                            self.settle_pending(active.as_ref().map(|refresh| refresh.scope));
 
                             if self.pending.len() > REQUESTS {
                                 let request = self.pending.pop().unwrap();
@@ -503,6 +507,12 @@ impl CatalogTask {
 
                     let result = result.and_then(|candidate| self.publish(candidate, refresh.deadline));
 
+                    if result.is_ok() {
+                        // Capture ready views before ordinary eviction can remove their payloads.
+                        self.settle_pending(None);
+                        self.state.cache.evict();
+                    }
+
                     self.background.completed(refresh.scope, result.is_ok(), Instant::now());
 
                     if let Err(error) = &result {
@@ -514,11 +524,11 @@ impl CatalogTask {
                     let mut index = 0;
 
                     while index < self.pending.len() {
-                        if result.is_err() && self.pending[index].waiting {
+                        if result.is_err() && self.pending[index].depends_on_active_refresh {
                             let request = self.pending.remove(index);
                             let _ = request.reply.send(Err(FAILED));
                         } else {
-                            self.pending[index].waiting = false;
+                            self.pending[index].depends_on_active_refresh = false;
                             index += 1;
                         }
                     }
@@ -533,10 +543,21 @@ impl CatalogTask {
         }
     }
 
-    fn resolve(&mut self, active: Option<Scope>) -> Option<Scope> {
+    fn next_refresh_scope(&self) -> Option<Scope> {
+        let now = Instant::now();
+
+        self.pending.iter().find_map(|request| {
+            if request.reply.is_closed() || now >= request.deadline {
+                return None;
+            }
+
+            self.state.needed(request.query, now).ok().flatten()
+        })
+    }
+
+    fn settle_pending(&mut self, active: Option<Scope>) {
         let now = Instant::now();
         let mut index = 0;
-        let mut needed = None;
 
         while index < self.pending.len() {
             let request = &mut self.pending[index];
@@ -546,8 +567,7 @@ impl CatalogTask {
             } else {
                 match self.state.needed(request.query, now) {
                     Ok(Some(scope)) => {
-                        needed.get_or_insert(scope);
-                        request.waiting |= active == Some(scope);
+                        request.depends_on_active_refresh |= active == Some(scope);
                         index += 1;
                         continue;
                     }
@@ -565,8 +585,6 @@ impl CatalogTask {
             let request = self.pending.remove(index);
             let _ = request.reply.send(result);
         }
-
-        needed
     }
 
     fn start(&self, scope: Scope, background: bool) -> Refresh {
@@ -631,11 +649,6 @@ impl CatalogTask {
         if changed {
             self.events.publish(state.ledger.system_update_id);
         }
-
-        // Pin all ready replies before enforcing residency limits. Only serving
-        // demand touches recency; eviction has the same policy for every refresh.
-        self.resolve(None);
-        self.state.cache.evict();
 
         Ok(())
     }
