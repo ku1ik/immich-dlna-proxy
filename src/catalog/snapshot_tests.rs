@@ -662,6 +662,38 @@ fn root_album_limit_is_enforced() {
     );
 }
 
+#[test]
+fn root_respects_exact_snapshot_byte_budget() {
+    let mut first = album(ALBUM);
+    let mut second = album(Uuid::from_u128(2));
+    first["albumName"] = json!("x");
+    second["albumName"] = json!("y");
+    let baseline = root("Photos", vec![first.clone(), second.clone()]).unwrap();
+    let padding = SNAPSHOT_BYTES - baseline.bytes;
+
+    for extra in [0, 1] {
+        first["albumName"] = json!("x".repeat(1 + padding / 2));
+        second["albumName"] = json!("y".repeat(1 + padding - padding / 2 + extra));
+        let result = root("Photos", vec![first.clone(), second.clone()]);
+
+        if extra == 0 {
+            let root = result.unwrap();
+
+            let expected = serde_json::to_vec(&(
+                &root.object,
+                &root.albums[&Uuid::from_u128(2)].metadata,
+                &root.albums[&ALBUM].metadata,
+            ))
+            .unwrap();
+
+            assert_eq!(root.bytes, SNAPSHOT_BYTES);
+            assert_eq!(root.bytes, expected.len());
+        } else {
+            assert!(result.unwrap_err().to_string().contains("byte limit"));
+        }
+    }
+}
+
 #[tokio::test]
 async fn playback_append_respects_exact_snapshot_byte_budget() {
     let mut video = asset(1, "VIDEO");

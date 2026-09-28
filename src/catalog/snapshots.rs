@@ -213,7 +213,8 @@ pub(super) fn project_root(
     bad_dates: &mut usize,
 ) -> Result<Root> {
     let mut albums = BTreeMap::new();
-    let mut bytes = 2;
+    let mut count = ByteCount::new(SNAPSHOT_BYTES);
+    count.write_all(b"[]")?;
 
     for dto in records {
         if albums.contains_key(&dto.id) {
@@ -242,12 +243,8 @@ pub(super) fn project_root(
 
         ensure!(albums.len() < MAX_ALBUMS, "Immich root exceeds album limit");
 
-        bytes += 1 + size;
-
-        ensure!(
-            bytes <= SNAPSHOT_BYTES,
-            "Immich root exceeds projected byte limit"
-        );
+        count.write_all(b",")?;
+        count.add(size)?;
 
         albums.insert(dto.id, album);
     }
@@ -429,6 +426,18 @@ impl ByteCount {
         Self { bytes: 0, limit }
     }
 
+    fn add(&mut self, size: usize) -> std::io::Result<()> {
+        if size > self.limit - self.bytes {
+            return Err(std::io::Error::other(
+                "catalog projected byte limit exceeded",
+            ));
+        }
+
+        self.bytes += size;
+
+        Ok(())
+    }
+
     fn json(&mut self, value: &impl Serialize) -> Result<()> {
         serde_json::to_writer(self, value)
             .map_err(|_| anyhow!("catalog projected byte limit exceeded"))
@@ -437,13 +446,7 @@ impl ByteCount {
 
 impl Write for ByteCount {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > self.limit - self.bytes {
-            return Err(std::io::Error::other(
-                "catalog projected byte limit exceeded",
-            ));
-        }
-
-        self.bytes += bytes.len();
+        self.add(bytes.len())?;
 
         Ok(bytes.len())
     }
