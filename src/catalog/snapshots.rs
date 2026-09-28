@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::{Digest, MAX_ALBUMS, Object, ObjectKind, Resource, SNAPSHOT_BYTES};
 use crate::{
-    immich::{Asset, Client},
+    immich::{Asset, Client, SearchMode},
     media::{Representation, asset_url},
     protocol::xml_char,
 };
@@ -141,7 +141,12 @@ impl Source {
 
         loop {
             budget.start_page()?;
-            let result = self.client.search_album(album, page, false).await?;
+
+            let result = self
+                .client
+                .search_album(album, page, SearchMode::Members)
+                .await?;
+
             budget.add_records(result.items.len())?;
             let mut advanced = false;
 
@@ -187,7 +192,12 @@ impl Source {
 
         loop {
             budget.start_page()?;
-            let result = self.client.search_album(album, page, true).await?;
+
+            let result = self
+                .client
+                .search_album(album, page, SearchMode::EncodedVideos)
+                .await?;
+
             budget.add_records(result.items.len())?;
             let mut advanced = false;
 

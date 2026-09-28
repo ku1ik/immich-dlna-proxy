@@ -9,7 +9,7 @@ use std::{num::NonZeroUsize, time::Duration};
 
 use anyhow::{Result, anyhow, ensure};
 use http::{HeaderValue, header};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, Serializer, de::DeserializeOwned, ser::SerializeMap};
 use tokio::{sync::OnceCell, time::timeout};
 use uuid::Uuid;
 
@@ -114,10 +114,27 @@ struct Search {
     with_deleted: bool,
     with_exif: bool,
     with_people: bool,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
-    kind: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    is_encoded: Option<bool>,
+    #[serde(flatten)]
+    mode: SearchMode,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SearchMode {
+    Members,
+    EncodedVideos,
+}
+
+impl Serialize for SearchMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+
+        if matches!(self, Self::EncodedVideos) {
+            map.serialize_entry("type", "VIDEO")?;
+            map.serialize_entry("isEncoded", &true)?;
+        }
+
+        map.end()
+    }
 }
 
 impl Client {
@@ -214,7 +231,7 @@ impl Client {
         &self,
         album: Uuid,
         page: NonZeroUsize,
-        encoded_videos: bool,
+        mode: SearchMode,
     ) -> Result<AssetPage> {
         let query = Search {
             album_ids: [album],
@@ -223,8 +240,7 @@ impl Client {
             with_deleted: false,
             with_exif: false,
             with_people: false,
-            kind: encoded_videos.then_some("VIDEO"),
-            is_encoded: encoded_videos.then_some(true),
+            mode,
         };
 
         let result: SearchResponse = self

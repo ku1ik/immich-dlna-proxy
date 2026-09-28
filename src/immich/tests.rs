@@ -34,7 +34,7 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
     );
 
     let result = client
-        .search_album(ALBUM, NonZeroUsize::MIN, false)
+        .search_album(ALBUM, NonZeroUsize::MIN, SearchMode::Members)
         .await
         .unwrap();
 
@@ -53,7 +53,11 @@ async fn albums_and_search_return_upstream_metadata_one_page_at_a_time() {
     assert_eq!(fake.requests.lock().unwrap().len(), 2);
 
     let result = client
-        .search_album(ALBUM, NonZeroUsize::new(2).unwrap(), true)
+        .search_album(
+            ALBUM,
+            NonZeroUsize::new(2).unwrap(),
+            SearchMode::EncodedVideos,
+        )
         .await
         .unwrap();
 
@@ -174,7 +178,7 @@ async fn structurally_invalid_responses_return_sanitized_errors() {
     for error in [
         client.albums().await.unwrap_err(),
         client
-            .search_album(ALBUM, NonZeroUsize::MIN, false)
+            .search_album(ALBUM, NonZeroUsize::MIN, SearchMode::Members)
             .await
             .unwrap_err(),
     ] {
@@ -240,7 +244,7 @@ async fn search_validates_page_numbers_and_continuation_tokens() {
 
         assert!(
             client
-                .search_album(ALBUM, NonZeroUsize::MIN, false)
+                .search_album(ALBUM, NonZeroUsize::MIN, SearchMode::Members)
                 .await
                 .is_err(),
             "{next}"
@@ -254,7 +258,7 @@ async fn search_validates_page_numbers_and_continuation_tokens() {
 
     assert!(
         client
-            .search_album(ALBUM, NonZeroUsize::MAX, false)
+            .search_album(ALBUM, NonZeroUsize::MAX, SearchMode::Members)
             .await
             .is_err()
     );
@@ -328,7 +332,7 @@ async fn redirects_are_rejected_at_every_endpoint() {
             1 => client.albums().await.map(|_| ()),
 
             _ => client
-                .search_album(ALBUM, NonZeroUsize::MIN, false)
+                .search_album(ALBUM, NonZeroUsize::MIN, SearchMode::Members)
                 .await
                 .map(|_| ()),
         };
