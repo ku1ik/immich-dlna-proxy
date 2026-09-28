@@ -187,56 +187,60 @@ impl Rows<'_> {
 
         let objects = match self {
             Rows::Albums(root) => {
-                let mut rows: Vec<_> = root.albums.values().map(|album| &album.metadata).collect();
+                let mut rows: Vec<_> = root
+                    .albums
+                    .iter()
+                    .map(|(&id, album)| (id, &album.metadata))
+                    .collect();
 
-                rows.sort_unstable_by(|a, b| match sort {
+                rows.sort_unstable_by(|(a_id, a), (b_id, b)| match sort {
                     SortOrder::Catalog => b
                         .end_date
                         .cmp(&a.end_date)
                         .then_with(|| collator.compare(&a.object.title, &b.object.title))
-                        .then_with(|| a.id.cmp(&b.id)),
+                        .then_with(|| a_id.cmp(b_id)),
 
                     order => compare_dates(
                         a.object.date.as_deref(),
                         a.created_at.as_ref(),
-                        a.id,
+                        *a_id,
                         b.object.date.as_deref(),
                         b.created_at.as_ref(),
-                        b.id,
+                        *b_id,
                         order == SortOrder::DateDescending,
                     ),
                 });
 
                 paginate(
-                    rows.into_iter().map(|album| &album.object),
+                    rows.into_iter().map(|(_, album)| &album.object),
                     starting_index,
                     requested_count,
                 )
             }
 
             Rows::Items(contents) => {
-                let mut rows: Vec<_> = contents.items.values().collect();
+                let mut rows: Vec<_> = contents.items.iter().collect();
 
-                rows.sort_unstable_by(|a, b| {
+                rows.sort_unstable_by(|(a_id, a), (b_id, b)| {
                     compare_dates(
                         a.object
                             .date
                             .as_deref()
                             .filter(|_| sort != SortOrder::Catalog),
                         a.capture.as_ref(),
-                        a.id,
+                        **a_id,
                         b.object
                             .date
                             .as_deref()
                             .filter(|_| sort != SortOrder::Catalog),
                         b.capture.as_ref(),
-                        b.id,
+                        **b_id,
                         sort == SortOrder::DateDescending,
                     )
                 });
 
                 paginate(
-                    rows.into_iter().map(|item| &item.object),
+                    rows.into_iter().map(|(_, item)| &item.object),
                     starting_index,
                     requested_count,
                 )
@@ -297,7 +301,6 @@ mod tests {
 
             let album = Album {
                 metadata: AlbumMetadata {
-                    id,
                     object: Object {
                         kind: super::super::ObjectKind::Album { id },
                         title: title.into(),

@@ -36,7 +36,6 @@ pub(super) struct Album {
 
 #[derive(Debug, Eq, PartialEq, Serialize)]
 pub(super) struct AlbumMetadata {
-    pub(super) id: Uuid,
     pub(super) object: Object,
     pub(super) created_at: Option<DateTime<Utc>>,
     pub(super) end_date: Option<DateTime<Utc>>,
@@ -44,7 +43,6 @@ pub(super) struct AlbumMetadata {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct Item {
-    pub(super) id: Uuid,
     pub(super) object: Object,
     pub(super) capture: Option<DateTime<Utc>>,
     is_edited: bool,
@@ -225,7 +223,6 @@ pub(super) fn project_root(
         let created_at = parse_date(dto.created_at.as_deref(), bad_dates);
 
         let metadata = AlbumMetadata {
-            id: dto.id,
             object: Object {
                 kind: ObjectKind::Album { id: dto.id },
                 title: title(&dto.album_name, dto.id),
@@ -252,7 +249,7 @@ pub(super) fn project_root(
             "Immich root exceeds projected byte limit"
         );
 
-        albums.insert(album.metadata.id, album);
+        albums.insert(dto.id, album);
     }
 
     let root_object = Object {
@@ -374,7 +371,6 @@ fn project_item(
     *bad_dates += usize::from(date.is_none());
 
     Ok(Some(Item {
-        id: dto.id,
         object: Object {
             kind,
             title: title(&name, dto.id),
