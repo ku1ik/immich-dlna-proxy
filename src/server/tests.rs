@@ -558,8 +558,8 @@ async fn browse_admission_is_immediate_and_local_actions_bypass_it() {
 #[tokio::test]
 async fn upgrade_subscribe_is_rejected_before_reserving() {
     let server = server(TestCatalog::default());
-    let peer = ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 12345)));
-    let callback = "<http://127.0.0.1:12345/notify>";
+    let peer = ConnectInfo(SocketAddr::from((Ipv4Addr::new(192, 168, 1, 20), 12345)));
+    let callback = "<http://192.168.1.20:12345/notify>";
 
     let subscribe = || {
         Request::builder()
@@ -627,13 +627,14 @@ async fn run_serves_with_connect_info() {
 async fn accepted_content_directory_subscriptions_and_renewals_extend_activity() {
     let server = server(TestCatalog::default());
     let activity = server.activity.subscribe();
+    let peer = Ipv4Addr::new(192, 168, 1, 20);
 
     let subscribe = |path: &str| {
         Request::builder()
             .method("SUBSCRIBE")
             .uri(path)
             .header("nt", "upnp:event")
-            .header("callback", "<http://127.0.0.1:12345/events>")
+            .header("callback", "<http://192.168.1.20:12345/events>")
             .header("timeout", "Second-300")
             .body(Body::empty())
             .unwrap()
@@ -651,9 +652,7 @@ async fn accepted_content_directory_subscriptions_and_renewals_extend_activity()
 
     let connection_events = "/upnp/connection-manager/events";
 
-    let connection = server
-        .route(subscribe(connection_events), Ipv4Addr::LOCALHOST)
-        .await;
+    let connection = server.route(subscribe(connection_events), peer).await;
 
     assert_eq!(connection.status(), StatusCode::OK);
     let sid = connection.headers()["sid"].clone();
@@ -661,13 +660,13 @@ async fn accepted_content_directory_subscriptions_and_renewals_extend_activity()
     let renewed = server
         .route(
             renew(connection_events, &sid, "SUBSCRIBE", "Second-300"),
-            Ipv4Addr::LOCALHOST,
+            peer,
         )
         .await;
 
     assert_eq!(renewed.status(), StatusCode::OK);
     assert_eq!(activity.borrow().last, None);
-    let response = server.route(subscribe(EVENTS), Ipv4Addr::LOCALHOST).await;
+    let response = server.route(subscribe(EVENTS), peer).await;
     assert_eq!(response.status(), StatusCode::OK);
     let sid = response.headers()["sid"].clone();
     assert_eq!(activity.borrow().last, Some(Instant::now()));
@@ -676,10 +675,7 @@ async fn accepted_content_directory_subscriptions_and_renewals_extend_activity()
         tokio::time::advance(Duration::from_secs(210)).await;
 
         let response = server
-            .route(
-                renew(EVENTS, &sid, "SUBSCRIBE", "Second-300"),
-                Ipv4Addr::LOCALHOST,
-            )
+            .route(renew(EVENTS, &sid, "SUBSCRIBE", "Second-300"), peer)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -687,10 +683,7 @@ async fn accepted_content_directory_subscriptions_and_renewals_extend_activity()
     }
 
     let response = server
-        .route(
-            renew(EVENTS, &sid, "SUBSCRIBE", "Second-1800"),
-            Ipv4Addr::LOCALHOST,
-        )
+        .route(renew(EVENTS, &sid, "SUBSCRIBE", "Second-1800"), peer)
         .await;
 
     assert_eq!(response.status(), StatusCode::OK);
@@ -702,23 +695,17 @@ async fn accepted_content_directory_subscriptions_and_renewals_extend_activity()
     server.subscriptions.publish(43);
 
     server
-        .route(action(CDS, "GetSystemUpdateID", ""), Ipv4Addr::LOCALHOST)
+        .route(action(CDS, "GetSystemUpdateID", ""), peer)
         .await;
 
     let response = server
-        .route(
-            renew(EVENTS, &sid, "UNSUBSCRIBE", "Second-1800"),
-            Ipv4Addr::LOCALHOST,
-        )
+        .route(renew(EVENTS, &sid, "UNSUBSCRIBE", "Second-1800"), peer)
         .await;
 
     assert_eq!(response.status(), StatusCode::OK);
 
     let response = server
-        .route(
-            renew(EVENTS, &sid, "SUBSCRIBE", "Second-300"),
-            Ipv4Addr::LOCALHOST,
-        )
+        .route(renew(EVENTS, &sid, "SUBSCRIBE", "Second-300"), peer)
         .await;
 
     assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);

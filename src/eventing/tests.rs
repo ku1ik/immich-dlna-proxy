@@ -369,6 +369,8 @@ fn callback_authorities_are_literal_same_peer_and_entire_list_is_validated() {
 
     for peer in [
         Ipv4Addr::UNSPECIFIED,
+        Ipv4Addr::LOCALHOST,
+        Ipv4Addr::new(127, 1, 2, 3),
         Ipv4Addr::BROADCAST,
         Ipv4Addr::new(0, 1, 2, 3),
         Ipv4Addr::new(224, 1, 2, 3),
@@ -517,8 +519,10 @@ impl Callback {
         }
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("<http://127.0.0.1:{}{path}>", self.port)
+    fn url(&self, path: &str) -> Url {
+        format!("http://127.0.0.1:{}{path}", self.port)
+            .parse()
+            .unwrap()
     }
 
     async fn next(&mut self) -> (http::request::Parts, String) {
@@ -537,28 +541,10 @@ impl Callback {
     }
 
     fn register(&self, subscriptions: &Subscriptions, service: Service, paths: &[&str]) -> Uuid {
-        let callbacks: String = paths.iter().map(|path| self.url(path)).collect();
+        let callbacks = paths.iter().map(|path| self.url(path)).collect();
 
-        register_callback(subscriptions, service, &callbacks)
+        subscriptions.subscribe_for_delivery_test(service, callbacks)
     }
-}
-
-fn register_callback(subscriptions: &Subscriptions, service: Service, callbacks: &str) -> Uuid {
-    let response = subscriptions.request(
-        service,
-        Ipv4Addr::LOCALHOST,
-        &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-        &headers(&[
-            ("nt", "upnp:event"),
-            ("callback", callbacks),
-            ("cookie", "private"),
-            ("authorization", "private"),
-        ]),
-    );
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    response_sid(&response)
 }
 
 async fn read_notify(socket: &mut BufReader<TcpStream>, expected_body: &str) -> String {
@@ -1224,14 +1210,15 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let mut callback = Callback::new().await;
 
-        let urls = format!(
-            "<http://{}/first>{}{}",
-            listener.local_addr().unwrap(),
+        let urls = vec![
+            format!("http://{}/first", listener.local_addr().unwrap())
+                .parse()
+                .unwrap(),
             callback.url("/ok"),
-            callback.url("/unused")
-        );
+            callback.url("/unused"),
+        ];
 
-        let sid = register_callback(&subscriptions, SERVICE, &urls);
+        let sid = subscriptions.subscribe_for_delivery_test(SERVICE, urls);
         let scheduler = scheduler.run();
         tokio::pin!(scheduler);
         let wake = Arc::new(CallbackWake(Notify::new()));
@@ -1381,9 +1368,11 @@ async fn callback_port_churn_closes_keep_alive_sockets_after_delivery() {
     }
 
     for listener in &listeners {
-        let callback = format!("<http://{}/events>", listener.local_addr().unwrap());
+        let callback = format!("http://{}/events", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
 
-        let sid = register_callback(&subscriptions, SERVICE, &callback);
+        let sid = subscriptions.subscribe_for_delivery_test(SERVICE, vec![callback]);
 
         let socket = tokio::time::timeout(Duration::from_secs(3), async {
             let (socket, _) = listener.accept().await.unwrap();

@@ -143,7 +143,10 @@ async fn browse_resources_and_published_revisions_connect_over_http() {
         .await
         .unwrap();
 
-    assert_eq!(subscription.status(), 200);
+    assert_eq!(subscription.status(), 412);
+
+    // Loopback callbacks are rejected over HTTP; set up notification delivery explicitly.
+    fixture.fake.subscribe(&fixture.library);
     fixture.fake.event(published.system_update_id).await;
 
     fixture

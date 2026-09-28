@@ -262,6 +262,17 @@ impl Subscriptions {
         let callbacks = callbacks(callback.ok_or(StatusCode::PRECONDITION_FAILED)?, peer)
             .ok_or(StatusCode::PRECONDITION_FAILED)?;
 
+        self.register(service, peer, callbacks, lease)
+    }
+
+    // Register callbacks after request validation, capturing the current revision.
+    fn register(
+        &self,
+        service: Service,
+        peer: Ipv4Addr,
+        callbacks: Vec<Url>,
+        lease: Duration,
+    ) -> Result<(Uuid, Duration), StatusCode> {
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
         state.expire(now);
@@ -438,7 +449,7 @@ fn lease(value: Option<&str>) -> Result<Duration, StatusCode> {
 }
 
 fn callbacks(value: &str, peer: Ipv4Addr) -> Option<Vec<Url>> {
-    if matches!(peer.octets()[0], 0 | 224..=255) || (peer.is_loopback() && !cfg!(test)) {
+    if !crate::config::is_non_loopback_unicast(peer) {
         return None;
     }
 
@@ -570,3 +581,6 @@ async fn deliver(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod test_support;

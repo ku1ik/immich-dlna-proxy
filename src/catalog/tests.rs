@@ -5,12 +5,9 @@ use axum::{
     extract::Request,
     response::Response,
 };
-use http::{HeaderMap, HeaderValue, Method};
+use http::{HeaderValue, Method};
 use serde_json::{Value, json};
-use std::{
-    net::{Ipv4Addr, SocketAddr},
-    sync::Mutex,
-};
+use std::{net::SocketAddr, sync::Mutex};
 use tokio::{
     net::TcpListener,
     sync::{Notify, Semaphore, mpsc},
@@ -181,22 +178,11 @@ impl Fake {
     }
 
     fn subscribe(&self, library: &Library) {
-        let mut headers = HeaderMap::new();
-        headers.insert("nt", HeaderValue::from_static("upnp:event"));
-
-        headers.insert(
-            "callback",
-            format!("<http://{}/events>", self.address).parse().unwrap(),
-        );
-
-        let response = library.events.request(
+        library.events.subscribe_for_delivery_test(
             Service::ContentDirectory,
-            Ipv4Addr::LOCALHOST,
-            &Method::from_bytes(b"SUBSCRIBE").unwrap(),
-            &headers,
+            vec![format!("http://{}/events", self.address).parse().unwrap()],
         );
 
-        assert_eq!(response.status(), 200);
         library.activity.touch();
     }
 
