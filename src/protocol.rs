@@ -154,7 +154,7 @@ impl Action {
 fn action_arguments(
     service: Service,
     name: &str,
-    mut arguments: BTreeMap<String, String>,
+    mut arguments: BTreeMap<&str, String>,
 ) -> Result<Action, Fault> {
     let invalid = Fault::InvalidArgs;
     let inputs = service.inputs(name)?;

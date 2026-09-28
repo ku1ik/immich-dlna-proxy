@@ -96,7 +96,7 @@ pub(crate) fn parse_action(
         }
 
         if arguments
-            .insert(argument.tag_name().name().to_owned(), value)
+            .insert(argument.tag_name().name(), value)
             .is_some()
         {
             return Err(invalid);
