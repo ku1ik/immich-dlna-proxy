@@ -29,7 +29,7 @@ const BROWSE_ARGS: &str = "<ObjectID>0</ObjectID><BrowseFlag>BrowseDirectChildre
 fn object() -> Object {
     Object {
         title: "A&B".into(),
-        date: Some("2026-01-02".into()),
+        date: Some("2026-01-02".parse().unwrap()),
         art: Some("http://192.0.2.1/preview?a=1&b=2".into()),
         kind: ObjectKind::Video {
             album: Uuid::from_u128(10),

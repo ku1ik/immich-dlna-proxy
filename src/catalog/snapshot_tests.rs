@@ -117,7 +117,7 @@ fn original_video_without_mime_remains_seekable_with_preview_artwork() {
 #[test]
 fn capture_instants_and_local_dates_are_independent() {
     let item = project(asset(1, "IMAGE"));
-    assert_eq!(item.object.date.as_deref(), Some("2024-01-01"));
+    assert_eq!(item.object.date, Some("2024-01-01".parse().unwrap()));
 
     assert_eq!(
         item.capture.unwrap().to_rfc3339(),
@@ -126,7 +126,11 @@ fn capture_instants_and_local_dates_are_independent() {
 
     let mut dto = asset(1, "VIDEO");
     dto["localDateTime"] = json!("2024-01-01T23:00:00-12:00");
-    assert_eq!(project(dto).object.date.as_deref(), Some("2024-01-01"));
+
+    assert_eq!(
+        project(dto).object.date,
+        Some("2024-01-01".parse().unwrap())
+    );
 
     let mut dto = asset(1, "IMAGE");
     dto["fileCreatedAt"] = json!("2024-01-01T12:00:00");
@@ -434,7 +438,7 @@ fn album_latest_dates_are_optional_and_independent_of_advertised_dates() {
         let root = root("Photos", vec![dto]).unwrap();
         let album = &root.albums[&ALBUM].metadata;
         assert_eq!(album.end_date, expected.map(|date| date.parse().unwrap()));
-        assert_eq!(album.object.date.as_deref(), Some("2023-12-31"));
+        assert_eq!(album.object.date, Some("2023-12-31".parse().unwrap()));
 
         assert_eq!(
             album.created_at,

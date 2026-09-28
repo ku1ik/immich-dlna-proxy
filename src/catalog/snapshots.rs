@@ -283,7 +283,7 @@ pub(super) fn project_root(
             object: Object {
                 kind: ObjectKind::Album { id: dto.id },
                 title: title(&dto.album_name, dto.id),
-                date: created_at.map(|date| date.format("%Y-%m-%d").to_string()),
+                date: created_at.map(|date| date.date_naive()),
                 art: dto
                     .album_thumbnail_asset_id
                     .map(|id| asset_url(http_address, id, Representation::Preview)),
@@ -420,7 +420,7 @@ fn project_item(
         .local_date_time
         .as_deref()
         .and_then(|date| DateTime::parse_from_rfc3339(date).ok())
-        .map(|date| date.format("%Y-%m-%d").to_string());
+        .map(|date| date.date_naive());
 
     *bad_dates += usize::from(date.is_none());
 

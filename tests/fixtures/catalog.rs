@@ -119,7 +119,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
         Object {
             kind: ObjectKind::Album { id: album },
             title: "Mixed JPEG and H264 AAC".into(),
-            date: Some("2024-01-01".into()),
+            date: Some("2024-01-01".parse().unwrap()),
             art: Some(media(ORIGINAL_JPEG_ID, Preview)),
         },
     ];
@@ -173,14 +173,14 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
                 }
             },
             title: title.into(),
-            date: Some(date.into()),
+            date: Some(date.parse().unwrap()),
             art: (mime == "image/jpeg").then(|| media(asset, Preview)),
         });
     }
 
     objects.push(Object {
         title: "Playback Only - H264 AAC.mp4".into(),
-        date: Some("2024-01-03".into()),
+        date: Some("2024-01-03".parse().unwrap()),
         art: None,
         kind: ObjectKind::Video {
             album,

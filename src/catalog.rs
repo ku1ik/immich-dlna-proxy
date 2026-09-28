@@ -78,7 +78,7 @@ pub struct BrowseResult {
 pub struct Object {
     pub kind: ObjectKind,
     pub title: String,
-    pub date: Option<String>,
+    pub date: Option<chrono::NaiveDate>,
     pub art: Option<String>,
 }
 

@@ -488,7 +488,7 @@ fn didl_bounded(objects: &[Object], filter: &Filter, limit: usize) -> Result<Str
         if filter.date
             && let Some(date) = &object.date
         {
-            xml.element("dc:date", date)?;
+            xml.element("dc:date", &date.to_string())?;
         }
 
         if filter.art

@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, sync::Arc};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use icu_collator::CollatorBorrowed;
 use uuid::Uuid;
 
@@ -80,10 +80,10 @@ fn compare_optional<T: Ord>(a: Option<T>, b: Option<T>, descending: bool) -> Ord
 }
 
 fn compare_dates(
-    a_date: Option<&str>,
+    a_date: Option<NaiveDate>,
     a_capture: Option<&DateTime<Utc>>,
     a_id: Uuid,
-    b_date: Option<&str>,
+    b_date: Option<NaiveDate>,
     b_capture: Option<&DateTime<Utc>>,
     b_id: Uuid,
     descending: bool,
@@ -201,10 +201,10 @@ impl Rows<'_> {
                         .then_with(|| a_id.cmp(b_id)),
 
                     order => compare_dates(
-                        a.object.date.as_deref(),
+                        a.object.date,
                         a.created_at.as_ref(),
                         *a_id,
-                        b.object.date.as_deref(),
+                        b.object.date,
                         b.created_at.as_ref(),
                         *b_id,
                         order == SortOrder::DateDescending,
@@ -228,10 +228,10 @@ impl Rows<'_> {
                     }
 
                     SortOrder::DateAscending | SortOrder::DateDescending => compare_dates(
-                        a.object.date.as_deref(),
+                        a.object.date,
                         a.capture.as_ref(),
                         **a_id,
-                        b.object.date.as_deref(),
+                        b.object.date,
                         b.capture.as_ref(),
                         **b_id,
                         sort == SortOrder::DateDescending,
@@ -303,7 +303,7 @@ mod tests {
                     object: Object {
                         kind: super::super::ObjectKind::Album { id },
                         title: title.into(),
-                        date: Some(created.into()),
+                        date: Some(created.parse().unwrap()),
                         ..root_object.clone()
                     },
                     created_at: Some(format!("{created}T00:00:00Z").parse().unwrap()),
@@ -440,7 +440,7 @@ mod tests {
                     None,
                     Some(&early),
                     low,
-                    Some("2024-01-01"),
+                    Some("2024-01-01".parse().unwrap()),
                     None,
                     high,
                     descending
@@ -450,10 +450,10 @@ mod tests {
 
             assert_eq!(
                 compare_dates(
-                    Some("2024-01-01"),
+                    Some("2024-01-01".parse().unwrap()),
                     None,
                     low,
-                    Some("2024-01-01"),
+                    Some("2024-01-01".parse().unwrap()),
                     Some(&late),
                     high,
                     descending
@@ -474,10 +474,10 @@ mod tests {
 
             assert_eq!(
                 compare_dates(
-                    Some("2023-12-31"),
+                    Some("2023-12-31".parse().unwrap()),
                     Some(&late),
                     high,
-                    Some("2024-01-01"),
+                    Some("2024-01-01".parse().unwrap()),
                     Some(&early),
                     low,
                     descending

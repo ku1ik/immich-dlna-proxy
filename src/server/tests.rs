@@ -44,7 +44,7 @@ impl Catalog for TestCatalog {
             objects: vec![Object {
                 kind: crate::catalog::ObjectKind::Root { child_count: 9 },
                 title: "A&B".into(),
-                date: Some("2024-01-01".into()),
+                date: Some("2024-01-01".parse().unwrap()),
                 art: None,
             }],
             total_matches: 9,
