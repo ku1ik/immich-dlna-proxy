@@ -102,7 +102,7 @@ impl Source {
     /// request, admission queue, timeout extension, or publication happens here.
     pub(super) async fn contents(&self, album: Uuid) -> Result<Contents> {
         let mut items = BTreeMap::<Uuid, Item>::new();
-        let mut excluded = BTreeSet::new();
+        let mut seen = BTreeSet::new();
         let mut encoded_ids = BTreeSet::new();
         let mut pages = 0;
         let mut records = 0;
@@ -145,43 +145,29 @@ impl Source {
                     }
 
                     let id = dto.id;
-                    let item = project_item(self.http_address, album, dto, &mut bad_dates)?;
 
-                    match item {
-                        Some(item) => {
-                            ensure!(
-                                !excluded.contains(&id),
-                                "conflicting duplicate Immich asset eligibility"
-                            );
-
-                            if let Some(previous) = items.get(&id) {
-                                ensure!(previous == &item, "conflicting duplicate Immich asset");
-                                continue;
-                            }
-
-                            ensure!(items.len() < ALBUM_ITEMS, "Immich album exceeds item limit");
-
-                            bytes += usize::from(!items.is_empty())
-                                + encoded_size(&item, SNAPSHOT_BYTES - bytes)?;
-
-                            ensure!(
-                                bytes <= SNAPSHOT_BYTES,
-                                "Immich album exceeds projected byte limit"
-                            );
-
-                            items.insert(id, item);
-                            advanced = true;
-                        }
-
-                        None => {
-                            ensure!(
-                                !items.contains_key(&id),
-                                "conflicting duplicate Immich asset eligibility"
-                            );
-
-                            advanced |= excluded.insert(id);
-                        }
+                    if !seen.insert(id) {
+                        continue;
                     }
+
+                    advanced = true;
+
+                    let Some(item) = project_item(self.http_address, album, dto, &mut bad_dates)?
+                    else {
+                        continue;
+                    };
+
+                    ensure!(items.len() < ALBUM_ITEMS, "Immich album exceeds item limit");
+
+                    bytes += usize::from(!items.is_empty())
+                        + encoded_size(&item, SNAPSHOT_BYTES - bytes)?;
+
+                    ensure!(
+                        bytes <= SNAPSHOT_BYTES,
+                        "Immich album exceeds projected byte limit"
+                    );
+
+                    items.insert(id, item);
                 }
 
                 let Some(next) = result.next_page else {
@@ -258,6 +244,10 @@ fn project_root(
     let mut bytes = 2 + encoded_size(&root_object, SNAPSHOT_BYTES - 2)?;
 
     for dto in records {
+        if albums.contains_key(&dto.id) {
+            continue;
+        }
+
         let created_at = parse_date(dto.created_at.as_deref(), bad_dates);
 
         let metadata = AlbumMetadata {
@@ -281,11 +271,6 @@ fn project_root(
         projection.json(&metadata)?;
         let (digest, size) = projection.finish();
         let album = Album { metadata, digest };
-
-        if let Some(previous) = albums.get(&album.metadata.id) {
-            ensure!(previous == &album, "conflicting duplicate Immich album");
-            continue;
-        }
 
         ensure!(albums.len() < MAX_ALBUMS, "Immich root exceeds album limit");
 

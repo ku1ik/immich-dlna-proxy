@@ -244,7 +244,7 @@ fn eligible_assets_require_original_file_name() {
 }
 
 #[tokio::test]
-async fn duplicates_compare_only_normalized_member_data_and_eligibility() {
+async fn duplicate_members_keep_first_metadata_and_eligibility() {
     let first = asset(1, "IMAGE");
 
     for (field, replacement) in [
@@ -269,15 +269,51 @@ async fn duplicates_compare_only_normalized_member_data_and_eligibility() {
                 vec![first.clone(), second.clone()]
             };
 
-            let fake = SnapshotFixture::new(vec![page(records, None)]).await;
+            let expected = project_item(
+                "192.0.2.1:8200".parse().unwrap(),
+                ALBUM,
+                serde_json::from_value(records[0].clone()).unwrap(),
+                &mut 0,
+            )
+            .unwrap();
 
-            assert!(fake.source.contents(ALBUM).await.is_err(), "{field}");
+            for paginated in [false, true] {
+                let mut replies = if paginated {
+                    vec![
+                        page(vec![records[0].clone()], Some("2")),
+                        page(vec![records[1].clone()], None),
+                    ]
+                } else {
+                    vec![page(records.clone(), None)]
+                };
+
+                replies.push(page(vec![], None));
+                let fake = SnapshotFixture::new(replies).await;
+                let result = fake.source.contents(ALBUM).await.unwrap();
+
+                assert_eq!(
+                    result.items.values().collect::<Vec<_>>(),
+                    expected.iter().collect::<Vec<_>>(),
+                    "{field}, reversed={reversed}, paginated={paginated}"
+                );
+
+                let bytes = serde_json::to_vec(&result.items.values().collect::<Vec<_>>()).unwrap();
+                assert_eq!(result.bytes, bytes.len());
+                assert_eq!(
+                    result.digest,
+                    Digest::from_bytes(Sha256::digest(bytes).into())
+                );
+            }
         }
     }
 
     let mut irrelevant = first.clone();
     irrelevant["originalPath"] = json!("private ignored path");
     irrelevant["visibility"] = json!("archive");
+    irrelevant
+        .as_object_mut()
+        .unwrap()
+        .remove("originalFileName");
     let mut excluded = asset(2, "VIDEO");
     excluded["visibility"] = json!("future-visibility");
     excluded.as_object_mut().unwrap().remove("originalFileName");
@@ -316,13 +352,18 @@ fn root_duplicates_titles_covers_and_canonical_digests() {
 
     assert!(first.albums[&ALBUM].metadata.object.art.is_none());
 
-    assert!(
-        root(
-            "Photos",
-            vec![empty.clone(), json!({"id": ALBUM, "albumName": "changed"})]
-        )
-        .is_err()
-    );
+    let duplicate = json!({"id": ALBUM, "albumName": "changed"});
+
+    for records in [
+        vec![empty.clone(), duplicate.clone()],
+        vec![duplicate, empty.clone()],
+    ] {
+        let expected = root("Photos", vec![records[0].clone()]).unwrap();
+        let actual = root("Photos", records).unwrap();
+        assert_eq!(actual.albums, expected.albums);
+        assert_eq!(actual.digest, expected.digest);
+        assert_eq!(actual.bytes, expected.bytes);
+    }
 
     let baseline = root("Photos", vec![empty.clone()]).unwrap();
     let changed = root("Another title", vec![empty]).unwrap();
