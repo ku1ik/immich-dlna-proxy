@@ -5,11 +5,8 @@ use uuid::Uuid;
 
 use super::{MAX_ALBUMS, digest::Digest};
 
-const RETAINED_ALBUMS: usize = 16_384;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Ledger {
-    seed: u32,
     pub(super) system_update_id: u32,
     pub(super) root_digest: Option<Digest>,
     pub(super) albums: BTreeMap<Uuid, AlbumRevision>,
@@ -18,7 +15,6 @@ pub(super) struct Ledger {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct AlbumRevision {
     pub(super) update_id: u32,
-    pub(super) present: bool,
     pub(super) metadata_digest: Digest,
     pub(super) contents_digest: Option<Digest>,
 }
@@ -26,7 +22,6 @@ pub(super) struct AlbumRevision {
 impl Ledger {
     pub(super) fn new(seed: u32) -> Self {
         Self {
-            seed,
             system_update_id: seed,
             root_digest: None,
             albums: BTreeMap::new(),
@@ -44,32 +39,21 @@ impl Ledger {
             "root exceeds 4096 present albums"
         );
 
-        let new_identities = albums
-            .keys()
-            .filter(|id| !self.albums.contains_key(id))
-            .count();
-
-        ensure!(
-            self.albums.len() + new_identities <= RETAINED_ALBUMS,
-            "in-memory revision history exhausted; restart the service to clear history"
-        );
-
         let mut next = self.clone();
-        let mut changed = self.root_digest.as_ref() != Some(root_digest);
+        next.albums.retain(|id, _| albums.contains_key(id));
+
+        let mut changed = self.root_digest.as_ref() != Some(root_digest)
+            || next.albums.len() != self.albums.len();
+
+        let update_id = self.system_update_id.wrapping_add(1);
 
         for (id, album) in &mut next.albums {
-            let metadata = albums.get(id);
-            let present = metadata.is_some();
-            let metadata_changed = metadata.is_some_and(|digest| digest != &album.metadata_digest);
+            let metadata = albums[id];
 
-            if album.present != present || metadata_changed {
+            if metadata != album.metadata_digest {
                 album.update_id = album.update_id.wrapping_add(1);
-                album.present = present;
+                album.metadata_digest = metadata;
                 changed = true;
-
-                if let Some(digest) = metadata {
-                    album.metadata_digest = *digest;
-                }
             }
         }
 
@@ -78,8 +62,7 @@ impl Ledger {
                 next.albums.insert(
                     *id,
                     AlbumRevision {
-                        update_id: self.seed,
-                        present: true,
+                        update_id,
                         metadata_digest: *metadata_digest,
                         contents_digest: None,
                     },
@@ -94,7 +77,7 @@ impl Ledger {
         }
 
         next.root_digest = Some(*root_digest);
-        next.system_update_id = next.system_update_id.wrapping_add(1);
+        next.system_update_id = update_id;
 
         Ok(Some(next))
     }
@@ -104,7 +87,7 @@ impl Ledger {
         id: Uuid,
         digest: &Digest,
     ) -> anyhow::Result<Option<Self>> {
-        let album = self.albums.get(&id).filter(|album| album.present);
+        let album = self.albums.get(&id);
         let mut album = *album.context("contents transition requires a present album")?;
 
         if album.contents_digest.as_ref() == Some(digest) {

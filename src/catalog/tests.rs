@@ -556,7 +556,7 @@ async fn local_id_startup_event_outage_and_metadata_scopes() {
         .await
         .unwrap();
 
-    assert_eq!(metadata.update_id, 1);
+    assert_eq!(metadata.update_id, 2);
     assert_eq!(metadata.total_matches, 1);
     assert!(metadata.objects[0].child_count().is_none());
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 0);
@@ -695,7 +695,7 @@ async fn album_browse_counts_eligible_items_and_sorts_before_pagination() {
     let task = fixture.run();
     let baseline = fixture.library.browse(children(1)).await.unwrap();
     assert_eq!(baseline.total_matches, 3);
-    assert_eq!(baseline.update_id, 2);
+    assert_eq!(baseline.update_id, 3);
 
     assert_eq!(
         baseline
@@ -1035,7 +1035,7 @@ async fn metadata_contents_have_independent_counters_and_restart_forgets_history
     assert_eq!(fixture.library.system_update_id().await, 3);
     assert_eq!(
         fixture.revisions().await.albums[&Uuid::from_u128(1)].update_id,
-        1
+        2
     );
     assert_eq!(fixture.fake.calls("/api/server/version"), 2);
     fixture.abort(task).await;
@@ -1349,7 +1349,15 @@ async fn queued_album_rechecks_root_membership_after_serial_publication() {
     fault(removed, 701).await;
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 2);
     assert_eq!(fixture.fake.calls("/api/albums"), 2);
-    assert!(!fixture.revisions().await.albums[&Uuid::from_u128(2)].present);
+
+    assert!(
+        !fixture
+            .revisions()
+            .await
+            .albums
+            .contains_key(&Uuid::from_u128(2))
+    );
+
     fixture.abort(task).await;
 }
 
@@ -1473,7 +1481,13 @@ async fn completed_browse_pins_rows_and_revision_across_payload_eviction() {
     assert_eq!(metadata.update_id, system_id);
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 2);
 
-    assert!(!fixture.revisions().await.albums[&Uuid::from_u128(1)].present);
+    assert!(
+        !fixture
+            .revisions()
+            .await
+            .albums
+            .contains_key(&Uuid::from_u128(1))
+    );
 
     fixture.abort(task).await;
 }
@@ -1562,7 +1576,7 @@ async fn fresh_hits_and_unchanged_refreshes_pin_coherent_views() {
         Some(&album_hit.root.digest)
     );
 
-    assert!(album_hit.ledger.albums[&Uuid::from_u128(1)].present);
+    assert!(album_hit.ledger.albums.contains_key(&Uuid::from_u128(1)));
     assert_eq!(fixture.fake.calls("/api/albums"), 3);
     assert_eq!(fixture.fake.calls("/api/search/metadata"), 1);
 
@@ -1599,7 +1613,7 @@ async fn failed_album_keeps_successful_root_and_later_requests_recover() {
     fixture.fake.event(2).await;
     fixture.fake.upstream.lock().unwrap().contents.clear();
     let result = fixture.library.browse(children(1)).await.unwrap();
-    assert_eq!(result.update_id, 2);
+    assert_eq!(result.update_id, 3);
     assert_eq!(result.total_matches, 0);
     fixture.fake.event(3).await;
     assert_eq!(fixture.fake.calls("/api/albums"), 1);

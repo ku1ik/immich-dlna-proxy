@@ -215,12 +215,7 @@ impl State {
         }
 
         if let Scope::Album(id) = query.scope() {
-            if !self
-                .ledger
-                .albums
-                .get(&id)
-                .is_some_and(|album| album.present)
-            {
+            if !self.ledger.albums.contains_key(&id) {
                 return Err(MISSING);
             }
 

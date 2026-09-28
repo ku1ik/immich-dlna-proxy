@@ -216,12 +216,13 @@ access does not promote albums in the user-access cache order.
 
 Fixed limits: 4,096 current albums; 20,000 eligible items/16 MiB per album; 50 pages/50,000
 examined records per traversal; 32 resident albums/64 MiB projected cache; 16 media operations.
-Over-limit refreshes fail, never truncate. In-memory history retains **16,384 album identities
-per process lifetime**, including removals, independently of snapshot eviction. If history
-fills, refreshes needing new identities fail; restart to clear it using the same device UUID.
+Over-limit refreshes fail, never truncate. Revision records survive snapshot eviction
+but are discarded when a successful root refresh removes an album. Reappearing albums
+are new observations; revision memory is bounded by the current album limit.
 
 Global and per-album update IDs are wrapping 32-bit counters. One random seed initializes
-each process and its newly observed albums. Full catalog fingerprints detect changes;
+the global counter at startup. Newly observed albums start at the global revision of
+the publication introducing them. Full catalog fingerprints detect changes;
 snapshots, counters, and pending notifications are published together in memory. Each
 refresh has one 25-second budget; a timeout fails the refresh without terminating the service.
 One catalog task serves local reads while refreshing one scope at a time. Up to eight
@@ -254,7 +255,6 @@ issued by the memory-only version.
 - MIME/generation: display/preview must actually return JPEG and playback MP4. Stale encoded records or incompatible old derivatives can fail; check settings/jobs and intentionally regenerate as needed, not by granting admin scopes to the proxy.
 - Mislabeled originals: Immich derives catalog MIME from the original filename and download MIME from the storage-path extension. A file named `.png` can contain JPEG data, leaving both labels wrong while its JPEG preview works. Inspect the actual format before blaming PNG support; metadata or thumbnail regeneration does not repair original extensions. The proxy does not probe or rewrite originals to correct this upstream inconsistency.
 - Failed seek/playback: set TOML `log_level = "debug"`, restart, then use `journalctl -u immich-dlna-proxy`. Compare selected representation, incoming/forwarded range diagnostics, upstream status and 206 evidence using the same clip; test alternatives separately. 504 indicates an upstream deadline; 503 can indicate admission overload.
-- History exhaustion: restart to clear process-local revision history, keeping the same server UUID.
 
 Logging uses TOML, **not `RUST_LOG`**. Diagnostics include IDs/status/resource kind, not keys,
 upstream bodies, EXIF/GPS, storage paths, callback query secrets, or media. Keep reports sanitized.
