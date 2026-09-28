@@ -316,7 +316,7 @@ mod tests {
                     created_at: Some(format!("{created}T00:00:00Z").parse().unwrap()),
                     end_date: end.map(|date| format!("{date}T00:00:00Z").parse().unwrap()),
                 },
-                digest: super::super::digest::Digest::from_bytes([number as u8; 32]),
+                digest: [number as u8; 32],
             };
 
             (id, album)
@@ -326,7 +326,7 @@ mod tests {
         let root = Root {
             object: root_object,
             albums,
-            digest: super::super::digest::Digest::from_bytes([0xaa; 32]),
+            digest: [0xaa; 32],
             bytes: 0,
         };
 

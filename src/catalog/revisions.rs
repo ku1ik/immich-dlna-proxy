@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, ensure};
 use uuid::Uuid;
 
-use super::{MAX_ALBUMS, digest::Digest};
+use super::{Digest, MAX_ALBUMS};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Ledger {

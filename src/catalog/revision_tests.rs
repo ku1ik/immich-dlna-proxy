@@ -5,7 +5,7 @@ fn id(number: u128) -> Uuid {
 }
 
 fn digest(number: u8) -> Digest {
-    Digest::from_bytes([number; 32])
+    [number; 32]
 }
 
 fn populated(seed: u32) -> Ledger {

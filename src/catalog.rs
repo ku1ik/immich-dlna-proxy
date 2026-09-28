@@ -15,7 +15,6 @@ use crate::{activity, config::Config, eventing::Subscriptions, immich, protocol:
 
 mod background;
 mod browse;
-mod digest;
 mod revisions;
 mod snapshots;
 
@@ -32,6 +31,8 @@ const SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ALBUMS: usize = 4_096;
 const REQUESTS: usize = 8;
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(25);
+
+type Digest = [u8; 32];
 
 /// Select, sort and paginate objects, capturing their revision together.
 pub trait Catalog: Send + Sync + 'static {

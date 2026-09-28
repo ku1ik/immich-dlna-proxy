@@ -299,10 +299,8 @@ async fn duplicate_members_keep_first_metadata_and_eligibility() {
 
                 let bytes = serde_json::to_vec(&result.items.values().collect::<Vec<_>>()).unwrap();
                 assert_eq!(result.bytes, bytes.len());
-                assert_eq!(
-                    result.digest,
-                    Digest::from_bytes(Sha256::digest(bytes).into())
-                );
+                let digest: Digest = Sha256::digest(bytes).into();
+                assert_eq!(result.digest, digest);
             }
         }
     }
@@ -424,10 +422,8 @@ async fn contents_hashes_canonical_order_and_exact_bytes() {
     let serialized = serde_json::to_vec(&baseline.items.values().collect::<Vec<_>>()).unwrap();
     assert_eq!(baseline.bytes, serialized.len());
 
-    assert_eq!(
-        baseline.digest,
-        Digest::from_bytes(Sha256::digest(&serialized).into())
-    );
+    let digest: Digest = Sha256::digest(&serialized).into();
+    assert_eq!(baseline.digest, digest);
 }
 
 #[test]

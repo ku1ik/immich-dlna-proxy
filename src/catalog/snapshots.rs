@@ -11,8 +11,7 @@ use serde::Serialize;
 use sha2::{Digest as ShaDigest, Sha256};
 use uuid::Uuid;
 
-use super::digest::Digest;
-use super::{MAX_ALBUMS, Object, ObjectKind, Resource, SNAPSHOT_BYTES};
+use super::{Digest, MAX_ALBUMS, Object, ObjectKind, Resource, SNAPSHOT_BYTES};
 use crate::{
     immich::{Asset, Client},
     media::{Representation, asset_url},
@@ -486,10 +485,7 @@ impl Projection {
     }
 
     fn finish(self) -> (Digest, usize) {
-        (
-            Digest::from_bytes(self.hash.finalize().into()),
-            self.count.bytes,
-        )
+        (self.hash.finalize().into(), self.count.bytes)
     }
 }
 
