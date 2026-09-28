@@ -5,23 +5,30 @@ use icu_collator::CollatorBorrowed;
 use uuid::Uuid;
 
 use super::{
-    BrowseMode, BrowseQuery, BrowseResult, FAILED, MISSING, Object, SortOrder,
+    BrowseResult, Object, SortOrder,
     snapshots::{Contents, Root},
 };
 use crate::protocol::Fault;
 
 // A response pins one publication independently of subsequent cache eviction.
-#[derive(Clone)]
 pub(super) struct View {
-    pub(super) query: BrowseQuery,
-    pub(super) root: Arc<Root>,
-    pub(super) contents: Option<Arc<Contents>>,
+    pub(super) selection: Selection,
     pub(super) update_id: u32,
 }
 
-enum Rows<'a> {
-    Albums(&'a Root),
-    Items(&'a Contents),
+pub(super) enum Selection {
+    Metadata(Object),
+    Children {
+        rows: Rows,
+        starting_index: u32,
+        requested_count: u32,
+        sort: SortOrder,
+    },
+}
+
+pub(super) enum Rows {
+    Albums(Arc<Root>),
+    Items(Arc<Contents>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -94,64 +101,23 @@ fn compare_dates(
 }
 
 impl View {
-    pub(super) fn browse(&self, collator: &CollatorBorrowed<'_>) -> Result<BrowseResult, Fault> {
-        let query = self.query;
-        let root = &self.root;
-        let update_id = self.update_id;
+    pub(super) fn browse(&self, collator: &CollatorBorrowed<'_>) -> BrowseResult {
+        match &self.selection {
+            Selection::Metadata(object) => metadata(object.clone(), self.update_id),
 
-        let rows = match query.object_id {
-            ObjectId::Root => {
-                if query.mode == BrowseMode::Metadata {
-                    return Ok(metadata(root.object.clone(), update_id));
-                }
-
-                Rows::Albums(root)
-            }
-
-            ObjectId::Album(id) => {
-                let album = root.albums.get(&id).ok_or(MISSING)?;
-
-                if query.mode == BrowseMode::Metadata {
-                    return Ok(metadata(album.metadata.object.clone(), update_id));
-                }
-
-                Rows::Items(self.contents()?)
-            }
-
-            ObjectId::Item { album, asset } => {
-                if !root.albums.contains_key(&album) {
-                    return Err(MISSING);
-                }
-
-                let item = self.contents()?.items.get(&asset).ok_or(MISSING)?;
-
-                if matches!(query.mode, BrowseMode::DirectChildren { .. }) {
-                    return Err(Fault::NoSuchContainer);
-                }
-
-                return Ok(metadata(item.object.clone(), update_id));
-            }
-        };
-
-        let BrowseMode::DirectChildren {
-            starting_index,
-            requested_count,
-        } = query.mode
-        else {
-            unreachable!("metadata requests return before pagination");
-        };
-
-        Ok(rows.browse(
-            starting_index,
-            requested_count,
-            query.sort,
-            update_id,
-            collator,
-        ))
-    }
-
-    fn contents(&self) -> Result<&Contents, Fault> {
-        self.contents.as_deref().ok_or(FAILED)
+            Selection::Children {
+                rows,
+                starting_index,
+                requested_count,
+                sort,
+            } => rows.browse(
+                *starting_index,
+                *requested_count,
+                *sort,
+                self.update_id,
+                collator,
+            ),
+        }
     }
 }
 
@@ -163,9 +129,9 @@ fn metadata(object: Object, update_id: u32) -> BrowseResult {
     }
 }
 
-impl Rows<'_> {
+impl Rows {
     fn browse(
-        self,
+        &self,
         starting_index: u32,
         requested_count: u32,
         sort: SortOrder,
@@ -331,23 +297,17 @@ mod tests {
             (SortOrder::DateAscending, [1, 3, 4, 5, 6, 7, 8, 9, 2]),
             (SortOrder::DateDescending, [2, 3, 4, 5, 6, 7, 8, 9, 1]),
         ] {
-            let query = BrowseQuery {
-                object_id: ObjectId::Root,
-                mode: BrowseMode::DirectChildren {
+            let view = View {
+                selection: Selection::Children {
+                    rows: Rows::Albums(root.clone()),
                     starting_index: 0,
                     requested_count: 0,
+                    sort,
                 },
-                sort,
-            };
-
-            let view = View {
-                query,
-                root: root.clone(),
-                contents: None,
                 update_id: 42,
             };
 
-            let full = view.browse(&collator).unwrap();
+            let full = view.browse(&collator);
 
             let expected: Vec<_> = expected
                 .into_iter()
@@ -367,17 +327,15 @@ mod tests {
 
             for start in [0, 3, 6, 9] {
                 let page = View {
-                    query: BrowseQuery {
-                        mode: BrowseMode::DirectChildren {
-                            starting_index: start,
-                            requested_count: 3,
-                        },
-                        ..query
+                    selection: Selection::Children {
+                        rows: Rows::Albums(root.clone()),
+                        starting_index: start,
+                        requested_count: 3,
+                        sort,
                     },
-                    ..view.clone()
+                    update_id: view.update_id,
                 }
-                .browse(&collator)
-                .unwrap();
+                .browse(&collator);
 
                 assert_eq!(page.total_matches, 9);
                 assert_eq!(page.update_id, full.update_id);

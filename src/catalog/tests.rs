@@ -1523,6 +1523,16 @@ async fn fresh_hits_and_unchanged_refreshes_pin_coherent_views() {
         .await
         .unwrap();
 
+    let root_children_hit = fixture
+        .library
+        .catalog
+        .view(
+            page_query("0", 0, 0, SortOrder::Catalog),
+            Instant::now() + REFRESH_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
     let album_hit = fixture
         .library
         .catalog
@@ -1568,9 +1578,13 @@ async fn fresh_hits_and_unchanged_refreshes_pin_coherent_views() {
         before.albums[&Uuid::from_u128(1)].update_id
     );
 
-    assert!(Arc::ptr_eq(&root_hit.root, &album_hit.root));
-    assert!(root_hit.contents.is_none());
-    let contents = album_hit.contents.as_ref().unwrap();
+    let Selection::Children {
+        rows: Rows::Items(contents),
+        ..
+    } = &album_hit.selection
+    else {
+        panic!("album children view must retain its contents");
+    };
 
     assert_eq!(
         before.albums[&Uuid::from_u128(1)].contents_digest.as_ref(),
@@ -1604,7 +1618,9 @@ async fn fresh_hits_and_unchanged_refreshes_pin_coherent_views() {
 
     assert_eq!(
         old_album.objects[0],
-        album_hit.root.albums[&Uuid::from_u128(1)].metadata.object
+        album_metadata_hit
+            .browse(&fixture.library.catalog.collator)
+            .objects[0]
     );
 
     assert_eq!(
@@ -1612,11 +1628,16 @@ async fn fresh_hits_and_unchanged_refreshes_pin_coherent_views() {
         before.albums[&Uuid::from_u128(1)].update_id
     );
 
-    let pinned_root = root_hit.browse(&fixture.library.catalog.collator).unwrap();
+    let pinned_root = root_hit.browse(&fixture.library.catalog.collator);
     assert_eq!(pinned_root.objects[0].child_count(), Some(2));
     assert_eq!(pinned_root.update_id, before.system_update_id);
 
-    let pinned_album = album_hit.browse(&fixture.library.catalog.collator).unwrap();
+    let pinned_root_children = root_children_hit.browse(&fixture.library.catalog.collator);
+    assert_eq!(pinned_root_children.total_matches, 2);
+    assert_eq!(pinned_root_children.update_id, before.system_update_id);
+    assert!(pinned_root_children.objects.contains(&old_album.objects[0]));
+
+    let pinned_album = album_hit.browse(&fixture.library.catalog.collator);
 
     assert_eq!(
         pinned_album.update_id,
@@ -1625,14 +1646,12 @@ async fn fresh_hits_and_unchanged_refreshes_pin_coherent_views() {
 
     assert_eq!(pinned_album.objects[0].title, "Photo 1");
 
-    let pinned_metadata = album_metadata_hit
-        .browse(&fixture.library.catalog.collator)
-        .unwrap();
+    let pinned_metadata = album_metadata_hit.browse(&fixture.library.catalog.collator);
 
     assert_eq!(pinned_metadata.update_id, pinned_album.update_id);
     assert_eq!(pinned_metadata.objects[0], old_album.objects[0]);
 
-    let pinned_item = item_hit.browse(&fixture.library.catalog.collator).unwrap();
+    let pinned_item = item_hit.browse(&fixture.library.catalog.collator);
     assert_eq!(pinned_item.update_id, before.system_update_id);
     assert_eq!(pinned_item.objects, pinned_album.objects);
     assert_eq!(fixture.fake.calls("/api/albums"), 3);

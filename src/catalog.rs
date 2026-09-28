@@ -19,8 +19,8 @@ mod revisions;
 mod snapshots;
 
 use background::Background;
-use browse::View;
 pub use browse::{ObjectId, parse_id};
+use browse::{Rows, Selection, View};
 use revisions::Ledger;
 use snapshots::{Contents, Root, Source};
 
@@ -227,21 +227,79 @@ impl State {
     }
 
     fn view(&self, query: BrowseQuery) -> Result<View, Fault> {
-        let contents = match query.scope() {
-            Scope::Root => None,
-
-            Scope::Album(id) => Some(self.cache.albums.get(&id).ok_or(FAILED)?.snapshot.clone()),
-        };
-
         let update_id = match query.object_id {
             ObjectId::Album(id) => self.ledger.albums.get(&id).ok_or(MISSING)?.update_id,
             ObjectId::Root | ObjectId::Item { .. } => self.ledger.system_update_id,
         };
 
+        let root = &self.cache.root.as_ref().ok_or(FAILED)?.snapshot;
+
+        let contents = |id| {
+            self.cache
+                .albums
+                .get(&id)
+                .map(|cached| &cached.snapshot)
+                .ok_or(FAILED)
+        };
+
+        let selection = match (query.object_id, query.mode) {
+            (ObjectId::Root, BrowseMode::Metadata) => Selection::Metadata(root.object.clone()),
+
+            (ObjectId::Album(id), BrowseMode::Metadata) => {
+                let album = root.albums.get(&id).ok_or(MISSING)?;
+
+                Selection::Metadata(album.metadata.object.clone())
+            }
+
+            (ObjectId::Item { album, asset }, mode) => {
+                if !root.albums.contains_key(&album) {
+                    return Err(MISSING);
+                }
+
+                let item = contents(album)?.items.get(&asset).ok_or(MISSING)?;
+
+                if matches!(mode, BrowseMode::DirectChildren { .. }) {
+                    return Err(Fault::NoSuchContainer);
+                }
+
+                Selection::Metadata(item.object.clone())
+            }
+
+            (
+                ObjectId::Root,
+                BrowseMode::DirectChildren {
+                    starting_index,
+                    requested_count,
+                },
+            ) => Selection::Children {
+                rows: Rows::Albums(root.clone()),
+                starting_index,
+                requested_count,
+                sort: query.sort,
+            },
+
+            (
+                ObjectId::Album(id),
+                BrowseMode::DirectChildren {
+                    starting_index,
+                    requested_count,
+                },
+            ) => {
+                if !root.albums.contains_key(&id) {
+                    return Err(MISSING);
+                }
+
+                Selection::Children {
+                    rows: Rows::Items(contents(id)?.clone()),
+                    starting_index,
+                    requested_count,
+                    sort: query.sort,
+                }
+            }
+        };
+
         Ok(View {
-            query,
-            root: self.cache.root.as_ref().ok_or(FAILED)?.snapshot.clone(),
-            contents,
+            selection,
             update_id,
         })
     }
@@ -662,7 +720,7 @@ impl Catalog for ImmichCatalog {
     async fn browse(&self, query: BrowseQuery, deadline: Instant) -> Result<BrowseResult, Fault> {
         let view = self.view(query, deadline).await?;
 
-        view.browse(&self.collator)
+        Ok(view.browse(&self.collator))
     }
 }
 
