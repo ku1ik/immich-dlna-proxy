@@ -636,7 +636,7 @@ async fn finished(subscriptions: &Subscriptions, sid: Uuid) {
                 .unwrap()
                 .entries
                 .iter()
-                .all(|entry| entry.sid != sid || entry.delivery == Delivery::Idle)
+                .all(|entry| entry.sid != sid || matches!(entry.delivery, Delivery::Idle { .. }))
             {
                 return;
             }
@@ -758,7 +758,7 @@ async fn pending_during_initial_coalesces_and_final_event_flushes_on_timer() {
         let entry = state.entries.iter().find(|entry| entry.sid == sid).unwrap();
         let cm = state.entries.iter().find(|entry| entry.sid == cm).unwrap();
         assert_eq!(entry.lease.as_ref().unwrap().pending, Some(14));
-        assert_eq!(entry.delivery, Delivery::InFlight);
+        assert!(matches!(entry.delivery, Delivery::InFlight { .. }));
         assert_eq!(cm.lease.as_ref().unwrap().pending, None);
     }
 
@@ -804,9 +804,22 @@ async fn pending_during_initial_coalesces_and_final_event_flushes_on_timer() {
         let entry = state.entries.iter().find(|entry| entry.sid == sid).unwrap();
         let cm = state.entries.iter().find(|entry| entry.sid == cm).unwrap();
         assert_eq!(entry.lease.as_ref().unwrap().pending, None);
-        assert_eq!(entry.next_seq, 3);
+
+        assert_eq!(
+            entry.delivery,
+            Delivery::Idle {
+                next_seq: NonZeroU32::new(3).unwrap()
+            }
+        );
+
         assert_eq!(cm.lease.as_ref().unwrap().pending, None);
-        assert_eq!(cm.next_seq, 1);
+
+        assert_eq!(
+            cm.delivery,
+            Delivery::Idle {
+                next_seq: NonZeroU32::MIN
+            }
+        );
     }
 
     assert!(callback.received.try_recv().is_err());
@@ -844,10 +857,18 @@ async fn failed_attempts_allocate_sequence_once_wrap_and_preserve_future_pending
             let entry = &mut state.entries[0];
             assert!(entry.lease.is_some());
             assert_eq!(entry.lease.as_ref().unwrap().pending, future);
-            assert_eq!(entry.next_seq, next_seq);
+
+            assert_eq!(
+                entry.delivery,
+                Delivery::Idle {
+                    next_seq: NonZeroU32::new(next_seq).unwrap()
+                }
+            );
 
             if seq == 0 {
-                entry.next_seq = u32::MAX;
+                entry.delivery = Delivery::Idle {
+                    next_seq: NonZeroU32::MAX,
+                };
             }
         }
 
@@ -923,7 +944,7 @@ async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
             state
                 .entries
                 .iter()
-                .filter(|entry| entry.delivery == Delivery::InFlight)
+                .filter(|entry| matches!(entry.delivery, Delivery::InFlight { .. }))
                 .count(),
             DELIVERIES
         );
@@ -956,7 +977,7 @@ async fn ordinary_deliveries_share_global_bound_and_coalesce_while_saturated() {
                 .unwrap()
                 .entries
                 .iter()
-                .filter(|entry| entry.delivery == Delivery::InFlight)
+                .filter(|entry| matches!(entry.delivery, Delivery::InFlight { .. }))
                 .count(),
             DELIVERIES
         );
@@ -1075,7 +1096,7 @@ async fn inactive_inflight_attempts_finish_but_drop_all_future_changes() {
                 let state = subscriptions.state.lock().unwrap();
                 let entry = &state.entries[0];
                 assert!(entry.lease.is_none());
-                assert_eq!(entry.delivery, Delivery::InFlight);
+                assert!(matches!(entry.delivery, Delivery::InFlight { .. }));
             }
 
             callback.release.add_permits(1);
@@ -1231,7 +1252,7 @@ async fn delivery_concurrency_is_bounded() {
             state
                 .entries
                 .iter()
-                .filter(|entry| entry.delivery == Delivery::InFlight)
+                .filter(|entry| matches!(entry.delivery, Delivery::InFlight { .. }))
                 .count(),
             DELIVERIES
         );
@@ -1358,17 +1379,19 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
                 .unwrap()
                 .entries
                 .first()
-                .map(|entry| (entry.lease.is_some(), entry.delivery, entry.next_seq));
+                .map(|entry| (entry.lease.is_some(), entry.delivery));
+
+            let next_seq = NonZeroU32::new(seq + 1).unwrap();
 
             let delivery = if expired {
-                Delivery::InFlight
+                Delivery::InFlight { next_seq }
             } else {
-                Delivery::Idle
+                Delivery::Idle { next_seq }
             };
 
             assert_eq!(
                 entry,
-                (!rejected).then_some((true, delivery, seq + 1)),
+                (!rejected).then_some((true, delivery)),
                 "body_pending={body_pending}, status={status}, elapsed={elapsed:?}, seq={seq}"
             );
 
@@ -1388,8 +1411,10 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
                 assert_eq!(alternative.headers["seq"], seq.to_string());
                 assert_eq!(body, expected_body);
 
-                while subscriptions.state.lock().unwrap().entries[0].delivery == Delivery::InFlight
-                {
+                while matches!(
+                    subscriptions.state.lock().unwrap().entries[0].delivery,
+                    Delivery::InFlight { .. }
+                ) {
                     assert!(scheduler.as_mut().poll(&mut context).is_pending());
                     tokio::task::yield_now().await;
                 }
@@ -1413,8 +1438,7 @@ async fn stalled_callbacks_fall_back_with_same_sequence_and_keep_the_lease() {
             let state = subscriptions.state.lock().unwrap();
             let entry = &state.entries[0];
             assert!(entry.lease.is_some());
-            assert_eq!(entry.delivery, Delivery::Idle);
-            assert_eq!(entry.next_seq, seq + 1);
+            assert_eq!(entry.delivery, Delivery::Idle { next_seq });
             assert_eq!(entry.lease.as_ref().unwrap().pending, None);
         }
     }
@@ -1530,7 +1554,9 @@ async fn expired_initial_obligations_drain_and_release_all_capacity() {
 async fn scheduler_expires_idle_leases_without_requests() {
     let (subscriptions, scheduler) = Subscriptions::new(0).unwrap();
     let (_, sid) = subscribe(&subscriptions, None);
-    subscriptions.state.lock().unwrap().entries[0].delivery = Delivery::Idle;
+    subscriptions.state.lock().unwrap().entries[0].delivery = Delivery::Idle {
+        next_seq: NonZeroU32::MIN,
+    };
     let task = tokio::spawn(scheduler.run());
     tokio::task::yield_now().await;
 

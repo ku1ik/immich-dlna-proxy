@@ -2,6 +2,7 @@
 
 use std::{
     net::Ipv4Addr,
+    num::NonZeroU32,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -50,7 +51,6 @@ struct Subscription {
     callbacks: Vec<Url>,
     lease: Option<LiveLease>,
     delivery: Delivery,
-    next_seq: u32,
     next_attempt: Instant,
 }
 
@@ -63,8 +63,8 @@ struct LiveLease {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Delivery {
     Initial(u32),
-    Idle,
-    InFlight,
+    Idle { next_seq: NonZeroU32 },
+    InFlight { next_seq: NonZeroU32 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,8 +136,8 @@ impl Subscription {
     fn next_delivery(&self) -> Option<(Instant, u32)> {
         let id = match self.delivery {
             Delivery::Initial(id) => id,
-            Delivery::Idle => self.lease.as_ref()?.pending?,
-            Delivery::InFlight => return None,
+            Delivery::Idle { .. } => self.lease.as_ref()?.pending?,
+            Delivery::InFlight { .. } => return None,
         };
 
         // The initial obligation survives lease expiry. Its next_attempt is the
@@ -174,7 +174,7 @@ impl State {
                 entry.lease = None;
             }
 
-            entry.lease.is_some() || entry.delivery != Delivery::Idle
+            entry.lease.is_some() || !matches!(entry.delivery, Delivery::Idle { .. })
         });
     }
 }
@@ -310,7 +310,6 @@ impl Subscriptions {
                         pending: None,
                     }),
                     delivery,
-                    next_seq: 0,
                     next_attempt: now,
                 });
 
@@ -365,17 +364,26 @@ impl EventTask {
 
                     let mut entry = state.entries.remove(index);
 
-                    if entry.delivery == Delivery::Idle
+                    if matches!(entry.delivery, Delivery::Idle { .. })
                         && let Some(lease) = &mut entry.lease
                     {
                         lease.pending = None;
                     }
 
                     // Allocate once at preparation, including failures and the initial attempt.
-                    let seq = entry.next_seq;
-                    entry.next_seq = seq.wrapping_add(1).max(1);
+                    let seq = match entry.delivery {
+                        Delivery::Initial(_) => 0,
+                        Delivery::Idle { next_seq } => next_seq.get(),
+                        Delivery::InFlight { .. } => {
+                            unreachable!("in-flight delivery is not ready")
+                        }
+                    };
+
                     entry.next_attempt = now + MODERATION;
-                    entry.delivery = Delivery::InFlight;
+
+                    entry.delivery = Delivery::InFlight {
+                        next_seq: NonZeroU32::new(seq.wrapping_add(1)).unwrap_or(NonZeroU32::MIN),
+                    };
 
                     deliveries.push(deliver(
                         &self.client,
@@ -429,7 +437,11 @@ impl EventTask {
                         .find(|entry| entry.sid == sid)
                         .expect("in-flight subscription is retained");
 
-                    entry.delivery = Delivery::Idle;
+                    let Delivery::InFlight { next_seq } = entry.delivery else {
+                        unreachable!("completed delivery is in flight");
+                    };
+
+                    entry.delivery = Delivery::Idle { next_seq };
 
                     if outcome == DeliveryOutcome::RemoveSubscription {
                         entry.lease = None;
