@@ -119,10 +119,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
             art: None,
         },
         Object {
-            kind: ObjectKind::Album {
-                id: album,
-                child_count: None,
-            },
+            kind: ObjectKind::Album { id: album },
             title: "Mixed JPEG and H264 AAC".into(),
             date: Some("2024-01-01".into()),
             art: Some(media(ORIGINAL_JPEG_ID, Preview)),

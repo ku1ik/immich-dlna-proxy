@@ -305,10 +305,7 @@ mod tests {
                 metadata: AlbumMetadata {
                     id,
                     object: Object {
-                        kind: super::super::ObjectKind::Album {
-                            id,
-                            child_count: None,
-                        },
+                        kind: super::super::ObjectKind::Album { id },
                         title: title.into(),
                         date: Some(created.into()),
                         ..root_object.clone()

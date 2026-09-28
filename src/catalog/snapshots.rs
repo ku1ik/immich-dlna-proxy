@@ -249,10 +249,7 @@ fn project_root(
         let metadata = AlbumMetadata {
             id: dto.id,
             object: Object {
-                kind: ObjectKind::Album {
-                    id: dto.id,
-                    child_count: None,
-                },
+                kind: ObjectKind::Album { id: dto.id },
                 title: title(&dto.album_name, dto.id),
                 date: created_at.map(|date| date.format("%Y-%m-%d").to_string()),
                 art: dto

@@ -89,7 +89,6 @@ pub enum ObjectKind {
     },
     Album {
         id: Uuid,
-        child_count: Option<usize>,
     },
     Photo {
         album: Uuid,
@@ -107,7 +106,7 @@ impl Object {
     pub fn id(&self) -> ObjectId {
         match self.kind {
             ObjectKind::Root { .. } => ObjectId::Root,
-            ObjectKind::Album { id, .. } => ObjectId::Album(id),
+            ObjectKind::Album { id } => ObjectId::Album(id),
 
             ObjectKind::Photo { album, asset, .. } | ObjectKind::Video { album, asset, .. } => {
                 ObjectId::Item { album, asset }
@@ -134,8 +133,8 @@ impl Object {
 
     pub fn child_count(&self) -> Option<usize> {
         match self.kind {
-            ObjectKind::Root { child_count } | ObjectKind::Album { child_count, .. } => child_count,
-            ObjectKind::Photo { .. } | ObjectKind::Video { .. } => None,
+            ObjectKind::Root { child_count } => child_count,
+            ObjectKind::Album { .. } | ObjectKind::Photo { .. } | ObjectKind::Video { .. } => None,
         }
     }
 

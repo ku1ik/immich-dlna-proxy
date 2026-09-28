@@ -923,7 +923,6 @@ fn didl_keeps_mandatory_fields_first_and_resource_order_truthful() {
 
     root.kind = ObjectKind::Album {
         id: Uuid::from_u128(10),
-        child_count: None,
     };
 
     root.date = None;
