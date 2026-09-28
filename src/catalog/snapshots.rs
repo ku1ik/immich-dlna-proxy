@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Result, anyhow, ensure};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use sha2::{Digest as ShaDigest, Sha256};
 use uuid::Uuid;
 
@@ -193,17 +193,11 @@ impl Source {
 
         log_dates(bad_dates);
         let mut projection = Projection::new(SNAPSHOT_BYTES);
-        projection.write_all(b"[")?;
 
-        for (index, item) in items.values().enumerate() {
-            if index != 0 {
-                projection.write_all(b",")?;
-            }
+        serde_json::Serializer::new(&mut projection)
+            .collect_seq(items.values())
+            .map_err(|_| anyhow!("catalog projected byte limit exceeded"))?;
 
-            projection.json(item)?;
-        }
-
-        projection.write_all(b"]")?;
         let (digest, bytes) = projection.finish();
 
         Ok(Contents {
