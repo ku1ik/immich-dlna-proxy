@@ -111,9 +111,7 @@ pub fn objects(address: SocketAddrV4) -> Vec<Object> {
 
     let mut objects = vec![
         Object {
-            kind: ObjectKind::Root {
-                child_count: Some(1),
-            },
+            kind: ObjectKind::Root { child_count: 1 },
             title: "DLNA Fixture Baseline".into(),
             date: None,
             art: None,

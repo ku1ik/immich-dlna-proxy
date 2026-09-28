@@ -228,16 +228,8 @@ pub(super) fn project_root(
     records: Vec<crate::immich::Album>,
     bad_dates: &mut usize,
 ) -> Result<Root> {
-    // Canonical snapshots omit child count; Browse metadata supplies the current count.
-    let root_object = Object {
-        kind: ObjectKind::Root { child_count: None },
-        title: friendly_name.to_owned(),
-        date: None,
-        art: None,
-    };
-
     let mut albums = BTreeMap::new();
-    let mut bytes = 2 + encoded_size(&root_object, SNAPSHOT_BYTES - 2)?;
+    let mut bytes = 2;
 
     for dto in records {
         if albums.contains_key(&dto.id) {
@@ -276,6 +268,15 @@ pub(super) fn project_root(
 
         albums.insert(album.metadata.id, album);
     }
+
+    let root_object = Object {
+        kind: ObjectKind::Root {
+            child_count: albums.len(),
+        },
+        title: friendly_name.to_owned(),
+        date: None,
+        art: None,
+    };
 
     let mut projection = Projection::new(SNAPSHOT_BYTES);
     projection.write_all(b"[")?;

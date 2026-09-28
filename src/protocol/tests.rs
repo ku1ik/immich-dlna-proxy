@@ -913,9 +913,7 @@ fn didl_keeps_mandatory_fields_first_and_resource_order_truthful() {
 
     let mut root = object();
 
-    root.kind = ObjectKind::Root {
-        child_count: Some(12),
-    };
+    root.kind = ObjectKind::Root { child_count: 12 };
 
     let xml = didl(&[root.clone()], &Filter::parse("@childCount").unwrap()).unwrap();
     assert!(xml.contains("<container "));

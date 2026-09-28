@@ -85,7 +85,7 @@ pub struct Object {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum ObjectKind {
     Root {
-        child_count: Option<usize>,
+        child_count: usize,
     },
     Album {
         id: Uuid,
@@ -133,7 +133,7 @@ impl Object {
 
     pub fn child_count(&self) -> Option<usize> {
         match self.kind {
-            ObjectKind::Root { child_count } => child_count,
+            ObjectKind::Root { child_count } => Some(child_count),
             ObjectKind::Album { .. } | ObjectKind::Photo { .. } | ObjectKind::Video { .. } => None,
         }
     }

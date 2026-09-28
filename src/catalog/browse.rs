@@ -102,13 +102,7 @@ impl View {
         let rows = match query.object_id {
             ObjectId::Root => {
                 if query.mode == BrowseMode::Metadata {
-                    let mut object = root.object.clone();
-
-                    object.kind = super::ObjectKind::Root {
-                        child_count: Some(root.albums.len()),
-                    };
-
-                    return Ok(metadata(object, update_id));
+                    return Ok(metadata(root.object.clone(), update_id));
                 }
 
                 Rows::Albums(root)
@@ -280,7 +274,7 @@ mod tests {
     #[test]
     fn albums_default_to_latest_date_with_title_ties_and_missing_dates_last() {
         let root_object = Object {
-            kind: super::super::ObjectKind::Root { child_count: None },
+            kind: super::super::ObjectKind::Root { child_count: 9 },
             title: "Photos & videos".into(),
             date: None,
             art: None,

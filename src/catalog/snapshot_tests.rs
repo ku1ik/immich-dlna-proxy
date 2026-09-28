@@ -376,6 +376,12 @@ fn root_duplicates_titles_covers_and_canonical_digests() {
     let second = root("Photos", vec![other, empty.clone()]).unwrap();
     assert_eq!(first.digest, second.digest);
     assert_eq!(first.bytes, second.bytes);
+    assert_eq!(first.object.child_count(), Some(2));
+
+    assert_eq!(
+        root("Photos", vec![]).unwrap().object.child_count(),
+        Some(0)
+    );
 
     assert_eq!(
         first.albums[&ALBUM].metadata.object.title,

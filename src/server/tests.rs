@@ -42,9 +42,7 @@ impl Catalog for TestCatalog {
 
         Ok(BrowseResult {
             objects: vec![Object {
-                kind: crate::catalog::ObjectKind::Root {
-                    child_count: Some(9),
-                },
+                kind: crate::catalog::ObjectKind::Root { child_count: 9 },
                 title: "A&B".into(),
                 date: Some("2024-01-01".into()),
                 art: None,

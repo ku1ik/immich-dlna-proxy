@@ -49,9 +49,7 @@ impl Catalog for TestCatalog {
     async fn browse(&self, _: BrowseQuery, _: tokio::time::Instant) -> Result<BrowseResult, Fault> {
         Ok(BrowseResult {
             objects: vec![Object {
-                kind: immich_dlna_proxy::catalog::ObjectKind::Root {
-                    child_count: Some(9),
-                },
+                kind: immich_dlna_proxy::catalog::ObjectKind::Root { child_count: 9 },
                 title: "A&B".into(),
                 date: None,
                 art: None,
