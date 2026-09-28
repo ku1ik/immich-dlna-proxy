@@ -96,97 +96,21 @@ impl Source {
     /// Requires the caller to establish readable root membership first. No version
     /// request, admission queue, timeout extension, or publication happens here.
     pub(super) async fn contents(&self, album: Uuid) -> Result<Contents> {
-        let mut items = BTreeMap::<Uuid, Item>::new();
-        let mut pages = 0;
-        let mut records = 0;
+        let mut budget = TraversalBudget::default();
         let mut count = ByteCount::new(SNAPSHOT_BYTES);
         count.write_all(b"[]")?;
         let mut bad_dates = 0;
 
-        for encoded in [false, true] {
-            if encoded
-                && !items
-                    .values()
-                    .any(|item| matches!(item.object.kind, ObjectKind::Video { .. }))
-            {
-                break;
-            }
+        let mut items = self
+            .load_members(album, &mut budget, &mut count, &mut bad_dates)
+            .await?;
 
-            let mut seen = BTreeSet::new();
-            let mut page = NonZeroUsize::MIN;
-
-            loop {
-                ensure!(
-                    pages < SEARCH_PAGES && records < SEARCH_RECORDS,
-                    "Immich album traversal limit exceeded"
-                );
-
-                pages += 1;
-
-                let result = self.client.search_album(album, page, encoded).await?;
-
-                ensure!(
-                    result.items.len() <= SEARCH_RECORDS - records,
-                    "Immich album record limit exceeded"
-                );
-
-                records += result.items.len();
-                let mut advanced = false;
-
-                for dto in result.items {
-                    let id = dto.id;
-
-                    if !seen.insert(id) {
-                        continue;
-                    }
-
-                    advanced = true;
-
-                    if encoded {
-                        let Some(item) = items.get_mut(&id) else {
-                            continue;
-                        };
-
-                        let ObjectKind::Video { resources, .. } = &mut item.object.kind else {
-                            continue;
-                        };
-
-                        let resource = Resource {
-                            uri: asset_url(self.http_address, id, Representation::Playback),
-                            mime: "video/mp4".into(),
-                            duration: None,
-                            byte_seek: true,
-                        };
-
-                        count.write_all(b",")?;
-                        count.json(&resource)?;
-                        resources.push(resource);
-                        continue;
-                    }
-
-                    let Some(item) = project_item(self.http_address, album, dto, &mut bad_dates)?
-                    else {
-                        continue;
-                    };
-
-                    ensure!(items.len() < ALBUM_ITEMS, "Immich album exceeds item limit");
-
-                    if !items.is_empty() {
-                        count.write_all(b",")?;
-                    }
-
-                    count.json(&item)?;
-
-                    items.insert(id, item);
-                }
-
-                let Some(next) = result.next_page else {
-                    break;
-                };
-
-                ensure!(advanced, "Immich search continuation made no progress");
-                page = next;
-            }
+        if items
+            .values()
+            .any(|item| matches!(item.object.kind, ObjectKind::Video { .. }))
+        {
+            self.enrich_playback(album, &mut items, &mut budget, &mut count)
+                .await?;
         }
 
         log_dates(bad_dates);
@@ -203,6 +127,143 @@ impl Source {
             digest,
             bytes,
         })
+    }
+
+    async fn load_members(
+        &self,
+        album: Uuid,
+        budget: &mut TraversalBudget,
+        count: &mut ByteCount,
+        bad_dates: &mut usize,
+    ) -> Result<BTreeMap<Uuid, Item>> {
+        let mut items = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        let mut page = NonZeroUsize::MIN;
+
+        loop {
+            budget.start_page()?;
+            let result = self.client.search_album(album, page, false).await?;
+            budget.add_records(result.items.len())?;
+            let mut advanced = false;
+
+            for dto in result.items {
+                let id = dto.id;
+
+                if !seen.insert(id) {
+                    continue;
+                }
+
+                advanced = true;
+
+                let Some(item) = project_item(self.http_address, album, dto, bad_dates)? else {
+                    continue;
+                };
+
+                ensure!(items.len() < ALBUM_ITEMS, "Immich album exceeds item limit");
+
+                if !items.is_empty() {
+                    count.write_all(b",")?;
+                }
+
+                count.json(&item)?;
+                items.insert(id, item);
+            }
+
+            let Some(next) = result.next_page else {
+                break;
+            };
+
+            ensure!(advanced, "Immich search continuation made no progress");
+            page = next;
+        }
+
+        Ok(items)
+    }
+
+    async fn enrich_playback(
+        &self,
+        album: Uuid,
+        items: &mut BTreeMap<Uuid, Item>,
+        budget: &mut TraversalBudget,
+        count: &mut ByteCount,
+    ) -> Result<()> {
+        let mut seen = BTreeSet::new();
+        let mut page = NonZeroUsize::MIN;
+
+        loop {
+            budget.start_page()?;
+            let result = self.client.search_album(album, page, true).await?;
+            budget.add_records(result.items.len())?;
+            let mut advanced = false;
+
+            for dto in result.items {
+                let id = dto.id;
+
+                if !seen.insert(id) {
+                    continue;
+                }
+
+                advanced = true;
+
+                let Some(item) = items.get_mut(&id) else {
+                    continue;
+                };
+
+                let ObjectKind::Video { resources, .. } = &mut item.object.kind else {
+                    continue;
+                };
+
+                let resource = Resource {
+                    uri: asset_url(self.http_address, id, Representation::Playback),
+                    mime: "video/mp4".into(),
+                    duration: None,
+                    byte_seek: true,
+                };
+
+                count.write_all(b",")?;
+                count.json(&resource)?;
+                resources.push(resource);
+            }
+
+            let Some(next) = result.next_page else {
+                break;
+            };
+
+            ensure!(advanced, "Immich search continuation made no progress");
+            page = next;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct TraversalBudget {
+    pages: usize,
+    records: usize,
+}
+
+impl TraversalBudget {
+    fn start_page(&mut self) -> Result<()> {
+        ensure!(
+            self.pages < SEARCH_PAGES && self.records < SEARCH_RECORDS,
+            "Immich album traversal limit exceeded"
+        );
+
+        self.pages += 1;
+
+        Ok(())
+    }
+
+    fn add_records(&mut self, count: usize) -> Result<()> {
+        ensure!(
+            count <= SEARCH_RECORDS - self.records,
+            "Immich album record limit exceeded"
+        );
+
+        self.records += count;
+
+        Ok(())
     }
 }
 
