@@ -29,16 +29,38 @@ struct Settings {
     friendly_name: String,
     sort_locale: String,
     server_uuid: Uuid,
-    #[serde(default = "default_log_level")]
-    log_level: String,
+    #[serde(
+        default = "default_log_level",
+        deserialize_with = "deserialize_log_level"
+    )]
+    log_level: tracing::Level,
 }
 
 fn default_name() -> String {
     "Immich".into()
 }
 
-fn default_log_level() -> String {
-    "info".into()
+fn default_log_level() -> tracing::Level {
+    tracing::Level::INFO
+}
+
+fn deserialize_log_level<'de, D>(deserializer: D) -> Result<tracing::Level, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+
+    match value.as_str() {
+        "error" => Ok(tracing::Level::ERROR),
+        "warn" => Ok(tracing::Level::WARN),
+        "info" => Ok(tracing::Level::INFO),
+        "debug" => Ok(tracing::Level::DEBUG),
+        "trace" => Ok(tracing::Level::TRACE),
+
+        _ => Err(serde::de::Error::custom(
+            "log_level must be error, warn, info, debug or trace",
+        )),
+    }
 }
 
 // Intentionally no Debug: configuration owns the upstream credential.
@@ -69,7 +91,7 @@ impl Config {
             friendly_name: settings.friendly_name,
             collator,
             server_uuid: settings.server_uuid,
-            log_level: settings.log_level.parse().expect("validated log level"),
+            log_level: settings.log_level,
             interface_index,
         })
     }
@@ -104,14 +126,6 @@ fn parse_settings(text: &str) -> anyhow::Result<Settings> {
                 .chars()
                 .all(crate::protocol::xml_char),
         "friendly_name must contain 1-128 UTF-8 bytes of XML-safe text"
-    );
-
-    ensure!(
-        matches!(
-            settings.log_level.as_str(),
-            "error" | "warn" | "info" | "debug" | "trace"
-        ),
-        "log_level must be error, warn, info, debug or trace"
     );
 
     Ok(settings)
@@ -296,7 +310,7 @@ server_uuid = "7B37DF49-B75D-4BCB-89A6-0C917A934643"
     fn defaults_and_canonical_identity() {
         let settings = parse_settings(CONFIG).unwrap();
         assert_eq!(settings.friendly_name, "Immich");
-        assert_eq!(settings.log_level, "info");
+        assert_eq!(settings.log_level, tracing::Level::INFO);
 
         assert_eq!(
             settings.server_uuid.to_string(),
