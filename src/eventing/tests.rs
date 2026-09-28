@@ -370,25 +370,27 @@ fn duplicate_event_headers_are_rejected_before_admission() {
 
 #[test]
 fn callbacks_require_http_same_peer_and_a_bounded_valid_list() {
-    let urls = callbacks(
+    let targets = CallbackTargets::parse(
         " <http://192.168.1.20/path?q=a%26b><HTTP://192.168.1.20:1234/other> ",
         PEER,
     )
     .unwrap();
 
-    assert_eq!(urls.len(), 2);
-    assert_eq!(urls[0].path(), "/path");
-    assert_eq!(urls[0].query(), Some("q=a%26b"));
-    assert_eq!(urls[1].port(), Some(1234));
+    assert_eq!(targets.peer, PEER);
+    assert_eq!(targets.urls.len(), 2);
+    assert_eq!(targets.urls[0].path(), "/path");
+    assert_eq!(targets.urls[0].query(), Some("q=a%26b"));
+    assert_eq!(targets.urls[1].port(), Some(1234));
 
     assert_eq!(
-        callbacks(&"<http://192.168.1.20/>".repeat(4), PEER)
+        CallbackTargets::parse(&"<http://192.168.1.20/>".repeat(4), PEER)
             .unwrap()
+            .urls
             .len(),
         4
     );
 
-    assert!(callbacks(&"<http://192.168.1.20/>".repeat(5), PEER).is_none());
+    assert!(CallbackTargets::parse(&"<http://192.168.1.20/>".repeat(5), PEER).is_none());
 
     for bad in [
         "",
@@ -406,7 +408,7 @@ fn callbacks_require_http_same_peer_and_a_bounded_valid_list() {
         "<http://192.168.1.20:+80/>",
         "<http://192.168.1.20/> <http://elsewhere/>",
     ] {
-        assert!(callbacks(bad, PEER).is_none(), "{bad}");
+        assert!(CallbackTargets::parse(bad, PEER).is_none(), "{bad}");
     }
 
     for peer in [
@@ -418,7 +420,7 @@ fn callbacks_require_http_same_peer_and_a_bounded_valid_list() {
         Ipv4Addr::new(224, 1, 2, 3),
         Ipv4Addr::new(240, 1, 2, 3),
     ] {
-        assert!(callbacks(&format!("<http://{peer}/>"), peer).is_none());
+        assert!(CallbackTargets::parse(&format!("<http://{peer}/>"), peer).is_none());
     }
 }
 
@@ -430,11 +432,12 @@ fn callbacks_use_url_parser_normalization_before_checking_the_peer() {
         ("http://192.168.1.20/a b", "http://192.168.1.20/a%20b"),
         ("http://192.168.1.20/a\nb", "http://192.168.1.20/ab"),
     ] {
-        let urls = callbacks(&format!("<{raw}>"), PEER).unwrap();
-        assert_eq!(urls[0].as_str(), normalized);
+        let targets = CallbackTargets::parse(&format!("<{raw}>"), PEER).unwrap();
+        assert_eq!(targets.peer, PEER);
+        assert_eq!(targets.urls[0].as_str(), normalized);
     }
 
-    assert!(callbacks("<http://3232235797/>", PEER).is_none());
+    assert!(CallbackTargets::parse("<http://3232235797/>", PEER).is_none());
 }
 
 #[tokio::test(start_paused = true)]

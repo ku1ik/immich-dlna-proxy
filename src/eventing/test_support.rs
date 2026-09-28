@@ -12,7 +12,10 @@ impl Subscriptions {
                 service,
                 Ipv4Addr::LOCALHOST,
                 SubscriptionRequest::Subscribe {
-                    callbacks,
+                    callbacks: CallbackTargets {
+                        peer: Ipv4Addr::LOCALHOST,
+                        urls: callbacks,
+                    },
                     lease: SUBSCRIPTION_LEASE,
                 },
             )

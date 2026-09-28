@@ -47,8 +47,7 @@ struct State {
 struct Subscription {
     sid: Uuid,
     service: Service,
-    peer: Ipv4Addr,
-    callbacks: Vec<Url>,
+    callbacks: CallbackTargets,
     lease: Option<LiveLease>,
     delivery: Delivery,
     next_attempt: Instant,
@@ -75,7 +74,7 @@ enum DeliveryOutcome {
 
 enum SubscriptionRequest {
     Subscribe {
-        callbacks: Vec<Url>,
+        callbacks: CallbackTargets,
         lease: Duration,
     },
     Renew {
@@ -125,8 +124,9 @@ impl SubscriptionRequest {
             return Err(StatusCode::PRECONDITION_FAILED);
         }
 
-        let callbacks = callbacks(callback.ok_or(StatusCode::PRECONDITION_FAILED)?, peer)
-            .ok_or(StatusCode::PRECONDITION_FAILED)?;
+        let callbacks =
+            CallbackTargets::parse(callback.ok_or(StatusCode::PRECONDITION_FAILED)?, peer)
+                .ok_or(StatusCode::PRECONDITION_FAILED)?;
 
         Ok(Self::Subscribe { callbacks, lease })
     }
@@ -158,7 +158,7 @@ impl State {
             .find(|entry| {
                 entry.sid == sid
                     && entry.service == service
-                    && entry.peer == peer
+                    && entry.callbacks.peer == peer
                     && entry.lease.is_some()
             })
             .ok_or(StatusCode::PRECONDITION_FAILED)
@@ -302,7 +302,6 @@ impl Subscriptions {
                 state.entries.push(Subscription {
                     sid,
                     service,
-                    peer,
                     callbacks,
                     lease: Some(LiveLease {
                         duration: lease,
@@ -502,46 +501,55 @@ fn lease(value: Option<&str>) -> Result<Duration, StatusCode> {
     Ok(Duration::from_secs(seconds).min(SUBSCRIPTION_LEASE))
 }
 
-fn callbacks(value: &str, peer: Ipv4Addr) -> Option<Vec<Url>> {
-    if !crate::config::is_non_loopback_unicast(peer) {
-        return None;
-    }
+/// Nonempty, bounded HTTP destinations belonging to one subscribing peer.
+#[derive(Clone)]
+struct CallbackTargets {
+    peer: Ipv4Addr,
+    urls: Vec<Url>,
+}
 
-    let mut remaining = value.trim();
-    let mut urls = Vec::new();
-
-    while !remaining.is_empty() {
-        if urls.len() == CALLBACK_URLS {
+impl CallbackTargets {
+    fn parse(value: &str, peer: Ipv4Addr) -> Option<Self> {
+        if !crate::config::is_non_loopback_unicast(peer) {
             return None;
         }
 
-        let (raw, rest) = remaining.strip_prefix('<')?.split_once('>')?;
-        let url = Url::parse(raw).ok()?;
+        let mut remaining = value.trim();
+        let mut urls = Vec::new();
 
-        if url.scheme() != "http"
-            || url.host() != Some(url::Host::Ipv4(peer))
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-        {
-            return None;
+        while !remaining.is_empty() {
+            if urls.len() == CALLBACK_URLS {
+                return None;
+            }
+
+            let (raw, rest) = remaining.strip_prefix('<')?.split_once('>')?;
+            let url = Url::parse(raw).ok()?;
+
+            if url.scheme() != "http"
+                || url.host() != Some(url::Host::Ipv4(peer))
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.fragment().is_some()
+            {
+                return None;
+            }
+
+            urls.push(url);
+            remaining = rest.trim_start();
         }
 
-        urls.push(url);
-        remaining = rest.trim_start();
+        (!urls.is_empty()).then_some(Self { peer, urls })
     }
-
-    (!urls.is_empty()).then_some(urls)
 }
 
 async fn deliver(
     client: &reqwest::Client,
     sid: Uuid,
-    callbacks: Vec<Url>,
+    callbacks: CallbackTargets,
     seq: u32,
     body: String,
 ) -> (Uuid, DeliveryOutcome) {
-    for url in callbacks {
+    for url in callbacks.urls {
         let deadline = Instant::now() + CALLBACK_TIMEOUT;
 
         let attempt = async {
