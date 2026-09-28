@@ -494,34 +494,7 @@ impl CatalogTask {
 
                 result = finished => {
                     let refresh = active.take().unwrap();
-
-                    let result = result.and_then(|candidate| self.publish(candidate, refresh.deadline));
-
-                    if result.is_ok() {
-                        // Capture ready views before ordinary eviction can remove their payloads.
-                        self.settle_pending(None);
-                        self.state.cache.evict();
-                    }
-
-                    self.background.completed(refresh.scope, result.is_ok(), Instant::now());
-
-                    if let Err(error) = &result {
-                        tracing::warn!(scope = ?refresh.scope, background = refresh.background, %error, "catalog refresh failed");
-                    } else {
-                        tracing::debug!(scope = ?refresh.scope, background = refresh.background, update_id = self.state.ledger.system_update_id, "catalog refresh completed");
-                    }
-
-                    let mut index = 0;
-
-                    while index < self.pending.len() {
-                        if result.is_err() && self.pending[index].depends_on_active_refresh {
-                            let request = self.pending.remove(index);
-                            let _ = request.reply.send(Err(FAILED));
-                        } else {
-                            self.pending[index].depends_on_active_refresh = false;
-                            index += 1;
-                        }
-                    }
+                    self.complete_refresh(refresh, result);
                 }
 
                 _ = sleep_until(deadline) => {}
@@ -529,6 +502,37 @@ impl CatalogTask {
                 changed = self.activity.changed() => {
                     changed.map_err(|_| anyhow!("catalog activity channel closed"))?;
                 }
+            }
+        }
+    }
+
+    fn complete_refresh(&mut self, refresh: Refresh, result: Result<Candidate>) {
+        let result = result.and_then(|candidate| self.publish(candidate, refresh.deadline));
+
+        if result.is_ok() {
+            // Pin ready views before eviction can remove the newly published payload.
+            self.settle_pending(None);
+            self.state.cache.evict();
+        }
+
+        self.background
+            .completed(refresh.scope, result.is_ok(), Instant::now());
+
+        if let Err(error) = &result {
+            tracing::warn!(scope = ?refresh.scope, background = refresh.background, %error, "catalog refresh failed");
+        } else {
+            tracing::debug!(scope = ?refresh.scope, background = refresh.background, update_id = self.state.ledger.system_update_id, "catalog refresh completed");
+        }
+
+        let mut index = 0;
+
+        while index < self.pending.len() {
+            if result.is_err() && self.pending[index].depends_on_active_refresh {
+                let request = self.pending.remove(index);
+                let _ = request.reply.send(Err(FAILED));
+            } else {
+                self.pending[index].depends_on_active_refresh = false;
+                index += 1;
             }
         }
     }
