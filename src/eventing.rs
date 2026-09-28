@@ -479,39 +479,14 @@ fn callbacks(value: &str, peer: Ipv4Addr) -> Option<Vec<Url>> {
         }
 
         let (raw, rest) = remaining.strip_prefix('<')?.split_once('>')?;
-
-        if raw
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control() || byte == b'\\')
-        {
-            return None;
-        }
-
-        // Validate the original authority before URL parsing can normalize numeric hosts.
-        let (scheme, location) = raw.split_once("://")?;
-        let authority = location.split(['/', '?', '#']).next()?;
-
-        let host = match authority.split_once(':') {
-            Some((host, port)) => {
-                let port = decimal(port)?;
-
-                if port == 0 || port > u16::MAX.into() {
-                    return None;
-                }
-
-                host
-            }
-
-            None => authority,
-        };
-
-        if !scheme.eq_ignore_ascii_case("http") || host.parse::<Ipv4Addr>().ok()? != peer {
-            return None;
-        }
-
         let url = Url::parse(raw).ok()?;
 
-        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        if url.scheme() != "http"
+            || url.host() != Some(url::Host::Ipv4(peer))
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
             return None;
         }
 
