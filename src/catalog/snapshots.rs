@@ -222,7 +222,7 @@ impl Source {
     }
 }
 
-fn project_root(
+pub(super) fn project_root(
     http_address: SocketAddrV4,
     friendly_name: &str,
     records: Vec<crate::immich::Album>,

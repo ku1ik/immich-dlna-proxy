@@ -605,11 +605,7 @@ impl CatalogTask {
         // Stage root reconciliation before the deadline check. A contents update
         // only mutates one existing entry after all fallible checks have passed.
         let next_root = match &candidate {
-            Candidate::Root(root) => state.ledger.root_transition(
-                &root.digest,
-                root.albums.iter().map(|(id, album)| (*id, album.digest)),
-            )?,
-
+            Candidate::Root(root) => state.ledger.root_transition(root),
             Candidate::Album(..) => None,
         };
 
